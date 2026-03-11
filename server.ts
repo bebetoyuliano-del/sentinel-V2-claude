@@ -509,17 +509,13 @@ async function uploadAnalysisToGCS(analysisData: any, metadata: Record<string, a
       metadata: { cacheControl: "no-store" }
     });
 
-    if (GCS_PUBLIC) {
-      await file.makePublic();
-      url = `https://storage.googleapis.com/${GCS_BUCKET}/${objectName}`;
-    } else {
-      // Signed URL v4 (GET) dengan TTL dari env
-      const [signed] = await file.getSignedUrl({
-        action: "read",
-        expires: Date.now() + (Math.max(60, GCS_SIGNED_URL_TTL) * 1000) // min 60s
-      });
-      url = signed;
-    }
+    // Karena bucket tidak bisa dibuat public (Org Policy), kita SELALU gunakan Signed URL
+    // Signed URL v4 (GET) dengan TTL dari env
+    const [signed] = await file.getSignedUrl({
+      action: "read",
+      expires: Date.now() + (Math.max(60, GCS_SIGNED_URL_TTL) * 1000) // min 60s
+    });
+    url = signed;
 
     console.log("✅ GCS uploaded:", objectName);
     return { objectName, url };
