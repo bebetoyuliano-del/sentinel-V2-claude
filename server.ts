@@ -8,6 +8,9 @@ import cors from 'cors';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { RSI, MACD, EMA } from 'technicalindicators';
+import { Storage } from '@google-cloud/storage';
+import fs from 'fs';
+import path from 'path';
 
 import { rangeFilterPineExact, RFParams } from './range_filter_pine';
 import { mapTfToMs, stripUnclosed, runTfAlignmentUnitTest } from './tf_alignment_guard';
@@ -298,6 +301,11 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim();
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID?.trim();
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
 
+const GCS_BUCKET = process.env.GCS_BUCKET?.trim();              // Wajib untuk upload
+const GCS_PREFIX = (process.env.GCS_PREFIX?.trim()) || "sentinel/alpha"; // Opsional prefix folder
+const GCS_PUBLIC = String(process.env.GCS_PUBLIC || "false") === "true"; // true -> object public-read
+const GCS_SIGNED_URL_TTL = Number(process.env.GCS_SIGNED_URL_TTL || "604800"); // 7 hari (detik)
+
 console.log('--- Environment Variables Debug ---');
 console.log('BINANCE_API_KEY:', BINANCE_API_KEY ? `Set (Length: ${BINANCE_API_KEY.length})` : 'Missing');
 console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_BOT_TOKEN ? 'Set' : 'Missing');
@@ -452,6 +460,72 @@ async function sendTelegramMessage(text: string, reply_markup?: any) {
     console.log(`Successfully sent ${messages.length} Telegram message(s).`);
   } catch (error: any) {
     console.error('Failed to send Telegram message (Final):', error.response?.data || error.message);
+  }
+}
+
+// Helper: upload analysis JSON ke GCS lalu kembalikan URL (public atau signed)
+async function uploadAnalysisToGCS(analysisData: any, metadata: Record<string, any> = {}) {
+  if (!GCS_BUCKET) {
+    console.warn("⚠️ GCS upload skipped: GCS_BUCKET not set.");
+    return null;
+  }
+  try {
+    // Buat nama objek deterministik & mudah dicari
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const sym = Array.isArray(analysisData?.decision_cards) && analysisData.decision_cards[0]?.symbol
+                ? String(analysisData.decision_cards[0].symbol).replace(/[^\w\-./]/g, "_")
+                : "UNSPEC";
+    const objectName = `${GCS_PREFIX.replace(/\/+$/,"")}/${ts}_${sym}.json`;
+
+    const body = JSON.stringify({
+      uploaded_at: new Date().toISOString(),
+      meta: metadata || {},
+      analysis: analysisData
+    }, null, 2);
+
+    let url: string | null = null;
+
+    if (GCS_BUCKET === 'MOCK') {
+      // --- MOCK STORAGE LOGIC (for testing in AI Studio) ---
+      const localPath = path.join(process.cwd(), 'public', objectName);
+      const dir = path.dirname(localPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(localPath, body);
+      
+      const appUrl = process.env.APP_URL || 'http://localhost:3000';
+      url = `${appUrl}/${objectName}`;
+      console.log("✅ MOCK GCS uploaded:", objectName);
+      return { objectName, url };
+    }
+
+    const storage = new Storage(); // gunakan ADC/GOOGLE_APPLICATION_CREDENTIALS
+    const bucket = storage.bucket(GCS_BUCKET);
+
+    const file = bucket.file(objectName);
+
+    await file.save(body, {
+      resumable: false,
+      contentType: "application/json; charset=utf-8",
+      metadata: { cacheControl: "no-store" }
+    });
+
+    if (GCS_PUBLIC) {
+      await file.makePublic();
+      url = `https://storage.googleapis.com/${GCS_BUCKET}/${objectName}`;
+    } else {
+      // Signed URL v4 (GET) dengan TTL dari env
+      const [signed] = await file.getSignedUrl({
+        action: "read",
+        expires: Date.now() + (Math.max(60, GCS_SIGNED_URL_TTL) * 1000) // min 60s
+      });
+      url = signed;
+    }
+
+    console.log("✅ GCS uploaded:", objectName);
+    return { objectName, url };
+  } catch (e: any) {
+    console.error("❌ GCS upload failed:", e.message || e);
+    return null;
   }
 }
 
@@ -751,15 +825,15 @@ async function monitorMarkets() {
             unrealizedPnl: accountRisk ? accountRisk.unrealizedPnl : 0,
             dailyRealizedPnl: accountRisk ? accountRisk.dailyRealizedPnl : 0
         },
-        universe: top20Symbols,
-        marketData,
-        positions: positions.map((p: any) => ({
+        accountPositions: positions.map((p: any) => ({
             symbol: p.symbol,
             side: p.side,
             contracts: p.contracts,
             entryPrice: p.entryPrice,
             unrealizedPnl: p.unrealizedPnl
         })),
+        scannerUniverse: top20Symbols,
+        marketData,
         openOrders: openOrders.map((o: any) => ({
             symbol: o.symbol,
             side: o.side,
@@ -783,11 +857,15 @@ async function monitorMarkets() {
       DATA MASUK:
       ${JSON.stringify(inputPayload, null, 2)}
 
-      TUGAS 1: MONITORING POSISI (EXISTING)
-      Anda mengubah data pasar & portofolio menjadi:
+      TUGAS 1: MONITORING POSISI AKUN (FOKUS UTAMA)
+      Anda mengubah data pasar & portofolio dari 'accountPositions' menjadi:
       (1) DECISION CARD 1-LAYAR per pair (siap lihat → klik),
       (2) SOP skenario (rejection / break&retest up/down / invalidation),
       (3) Paket ENFORCEMENT untuk server (validasi stop‑lock, MR projected per aksi, dan alerts deterministik).
+
+      TUGAS 2: TOP 20 SCANNER (SINYAL TAMBAHAN)
+      HANYA JIKA accountRisk.marginRatio < 25%, pilih 1–2 koin dari 'scannerUniverse' dengan setup PALING SEMPURNA.
+      Jika MR >= 25%, TUGAS 2 DIABAIKAN (kosongkan new_signals).
 
       BAHASA & OUTPUT
       - Gunakan BAHASA INDONESIA.
@@ -795,6 +873,10 @@ async function monitorMarkets() {
       - Urutkan decision_cards A→Z berdasarkan symbol.
 
       ATURAN WAJIB TUGAS 1 (HARUS DIIKUTI TANPA PELANGGARAN):
+      1) FOKUS AKUN:
+         - WAJIB buatkan 1 decision_card untuk SETIAP symbol yang ada di 'accountPositions'.
+         - DILARANG membuat decision_card untuk koin di 'scannerUniverse' yang TIDAK memiliki posisi di 'accountPositions'.
+         - Fokus analisa adalah mengelola risiko dan profitabilitas posisi yang sedang berjalan.
       1) GUARD MODE (MR% > mr_guard_pct):
          - Dilarang: ADD_LONG (AL), ADD_SHORT (AS), HEDGE_ON (HO), ROLE (RR).
          - Diperbolehkan: HOLD, REDUCE_LONG (RL), REDUCE_SHORT (RS), LOCK_NEUTRAL (LN),
@@ -1088,13 +1170,13 @@ async function monitorMarkets() {
       [PRIORITY]: high
       
       SCOPE:
-      - Sinyal yang difilter untuk dianalisa (new_signals) HARUS berasal dari 20 pair dengan volume harian (daily volume) terbesar di Binance Futures.
+      - Sinyal yang difilter untuk dianalisa (new_signals) HARUS berasal dari 20 pair dengan volume harian (daily volume) terbesar di Binance Futures ('scannerUniverse').
       - Ambil HANYA SATU atau beberapa sinyal TERBAIK dari 20 pair tersebut.
       - Sinyal HANYA BOLEH diberikan/dihasilkan JIKA Margin Ratio (MR) saat ini DI BAWAH 25%. Jika MR >= 25%, kosongkan array new_signals.
 
       STRICT OUTPUT:
       - Keluarkan JSON saja sesuai kontrak; TIDAK BOLEH ada teks di luar JSON.
-      - WAJIB buatkan 1 decision_card untuk setiap symbol yang ada di INPUT DATA (baik yang punya posisi maupun tidak). JANGAN LEWATKAN SATUPUN SYMBOL.
+      - WAJIB buatkan 1 decision_card untuk setiap symbol yang ada di 'accountPositions'. JANGAN buatkan decision_card untuk koin scanner kecuali koin tersebut juga ada di posisi akun.
       - new_signals diisi berdasarkan scanning Top 20.
       - Untuk tombol (buttons.show), label WAJIB menyertakan nama pair agar jelas (contoh: "RL BTC", "HOLD ETH").
     `;
@@ -1132,7 +1214,20 @@ async function monitorMarkets() {
     const gg = analysisData.global_guard || { mode:"NORMAL" };
     const new_signals = analysisData.new_signals || null;
 
-    const payloads = renderDecisionCardsToTelegram(cards, se, gg, new_signals);
+    // --- NEW: Upload arsip ke GCS (opsional) ---
+    let archiveUrl: string | null = null;
+    try {
+      const uploaded = await uploadAnalysisToGCS(analysisData, {
+        now_ts: inputPayload?.now_ts || Date.now(),
+        account_mr: analysisData?.global_guard?.mr_pct ?? null,
+        symbols: (cards || []).map((c:any)=>c.symbol).slice(0,5)
+      });
+      if (uploaded?.url) { archiveUrl = uploaded.url; }
+    } catch (e:any) {
+      console.warn("GCS archive skipped:", e.message);
+    }
+
+    const payloads = renderDecisionCardsToTelegram(cards, se, gg, new_signals, archiveUrl);
 
     for (const payload of payloads) {
         await sendTelegramMessage(payload.text, payload.reply_markup);
@@ -1163,7 +1258,7 @@ function escapeHtml(text: any): string {
         .replace(/'/g, '&#039;');
 }
 
-function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global_guard: any, new_signals: any = null) {
+function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global_guard: any, new_signals: any = null, archiveUrl?: string | null) {
     const payloads = [];
     
     for (const card of cards) {
@@ -1295,6 +1390,10 @@ function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global
         
         message += `⏱️ ${timestamp}`;
 
+        if (archiveUrl) {
+          message += `\n🗂️ <b>Archive</b>: ${escapeHtml(archiveUrl)}\n`;
+        }
+
         // 6) Return payload
         const reply_markup = inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined;
         payloads.push({ text: message, reply_markup });
@@ -1343,6 +1442,10 @@ function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global
             }
         }
         
+        if (archiveUrl) {
+          signalMsg += `\n🗂️ <b>Archive</b>: ${escapeHtml(archiveUrl)}\n`;
+        }
+
         // Add as a separate message payload
         payloads.push({
             text: signalMsg,
@@ -1655,6 +1758,9 @@ async function startServer() {
   } else {
     app.use(express.static('dist'));
   }
+
+  // Serve static archives for mock storage
+  app.use('/sentinel', express.static(path.join(process.cwd(), 'public', 'sentinel')));
 
   let lastUpdateId = 0;
   let isPollingActive = false;
