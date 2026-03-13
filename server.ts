@@ -11,6 +11,7 @@ import { RSI, MACD, EMA } from 'technicalindicators';
 import { Storage } from '@google-cloud/storage';
 import fs from 'fs';
 import path from 'path';
+import nodemailer from 'nodemailer';
 
 import { rangeFilterPineExact, RFParams } from './range_filter_pine';
 import { mapTfToMs, stripUnclosed, runTfAlignmentUnitTest } from './tf_alignment_guard';
@@ -306,6 +307,11 @@ const GCS_PREFIX = (process.env.GCS_PREFIX?.trim()) || "sentinel/alpha"; // Opsi
 const GCS_PUBLIC = String(process.env.GCS_PUBLIC || "false") === "true"; // true -> object public-read
 const GCS_SIGNED_URL_TTL = Number(process.env.GCS_SIGNED_URL_TTL || "604800"); // 7 hari (detik)
 
+// Email Settings
+const SMTP_USER = process.env.SMTP_USER?.trim();
+const SMTP_PASS = process.env.SMTP_PASS?.trim();
+const EMAIL_TO = process.env.EMAIL_TO?.trim() || 'bebetoyuliano@gmail.com';
+
 console.log('--- Environment Variables Debug ---');
 console.log('BINANCE_API_KEY:', BINANCE_API_KEY ? `Set (Length: ${BINANCE_API_KEY.length})` : 'Missing');
 console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_BOT_TOKEN ? 'Set' : 'Missing');
@@ -460,6 +466,45 @@ async function sendTelegramMessage(text: string, reply_markup?: any) {
     console.log(`Successfully sent ${messages.length} Telegram message(s).`);
   } catch (error: any) {
     console.error('Failed to send Telegram message (Final):', error.response?.data || error.message);
+  }
+}
+
+// Helper: Send Decision Cards JSON via Email
+async function sendDecisionCardsEmail(cards: any[]) {
+  if (!SMTP_USER || !SMTP_PASS) {
+    console.warn("⚠️ Email not sent: SMTP_USER or SMTP_PASS is not configured in .env");
+    return;
+  }
+  try {
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: SMTP_USER,
+        pass: SMTP_PASS
+      }
+    });
+
+    const jsonContent = JSON.stringify(cards, null, 2);
+    const timestamp = new Date().toISOString();
+    
+    const mailOptions = {
+      from: `"Crypto Sentinel" <${SMTP_USER}>`,
+      to: EMAIL_TO,
+      subject: `Crypto Sentinel - Decision Cards JSON [${timestamp}]`,
+      text: `Terlampir adalah data JSON Decision Cards terbaru.\n\nTotal koin: ${cards.length}\nWaktu: ${timestamp}`,
+      attachments: [
+        {
+          filename: `decision_cards_${Date.now()}.json`,
+          content: jsonContent,
+          contentType: 'application/json'
+        }
+      ]
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+    console.log("✅ Email sent successfully: " + info.messageId);
+  } catch (error: any) {
+    console.error("❌ Failed to send email:", error.message || error);
   }
 }
 
@@ -1208,6 +1253,11 @@ async function monitorMarkets() {
       if (uploaded?.url) { archiveUrl = uploaded.url; }
     } catch (e:any) {
       console.warn("GCS archive skipped:", e.message);
+    }
+
+    // --- NEW: Send Decision Cards JSON to Email ---
+    if (cards && cards.length > 0) {
+        await sendDecisionCardsEmail(cards);
     }
 
     const payloads = renderDecisionCardsToTelegram(cards, se, gg, new_signals, archiveUrl);
