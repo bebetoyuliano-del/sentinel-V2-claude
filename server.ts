@@ -472,7 +472,7 @@ async function uploadAnalysisToGCS(analysisData: any, metadata: Record<string, a
   }
   try {
     // Buat nama objek deterministik & mudah dicari
-    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const ts = new Date().toISOString().replace(/[:.]/g,'-');
     const sym = Array.isArray(analysisData?.decision_cards) && analysisData.decision_cards[0]?.symbol
                 ? String(analysisData.decision_cards[0].symbol).replace(/[^\w\-./]/g, "_")
                 : "UNSPEC";
@@ -508,7 +508,11 @@ async function uploadAnalysisToGCS(analysisData: any, metadata: Record<string, a
     console.log("✅ GCS uploaded:", objectName);
     return { objectName, url };
   } catch (e: any) {
-    console.error("❌ GCS upload failed:", e.message || e);
+    const errorMsg = e.message || e;
+    console.error(`❌ GCS upload failed: ${errorMsg}`);
+    if (errorMsg.includes('storage.objects.create')) {
+      console.error(`💡 ACTION REQUIRED: The service account 'ais-sandbox@ais-asia-southeast1-7ebde40c3e.iam.gserviceaccount.com' does not have permission to create objects in bucket '${GCS_BUCKET}'. Please grant it the 'Storage Object Creator' role in the Google Cloud Console.`);
+    }
     return null;
   }
 }
@@ -548,6 +552,7 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
         const tf4hMs = mapTfToMs('4h');
         const strip4h = stripUnclosed(ohlcv4h, tf4hMs, nowMs);
         const validOhlcv4h = strip4h.strippedOhlcv;
+        const atr14_4h = atr14Last(validOhlcv4h as any);
         
         const closes4h = validOhlcv4h.map(c => c[4] as number);
         const rfParams: RFParams = {
@@ -578,6 +583,7 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
         const tf1hMs = mapTfToMs('1h');
         const strip1h = stripUnclosed(ohlcv1h, tf1hMs, nowMs);
         const validOhlcv1h = strip1h.strippedOhlcv;
+        const atr14_1h = atr14Last(validOhlcv1h as any);
         
         const closes1h = validOhlcv1h.map(c => c[4] as number);
         const rsi1H = RSI.calculate({ values: closes1h, period: 14 });
@@ -609,14 +615,16 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
             WAE: wae4H,
             EMA_50: ema50_4H.length > 0 ? ema50_4H[ema50_4H.length - 1] : null,
             VWAP: vwap4h,
-            VWAP_dist_pct: vwap4h_dist
+            VWAP_dist_pct: vwap4h_dist,
+            ATR14: atr14_4h ?? null
           },
           TF_1H: {
             VWAP: vwap1h,
             VWAP_dist_pct: vwap1h_dist,
             RSI_14: rsi1H.length > 0 ? rsi1H[rsi1H.length - 1] : null,
             MACD: macd1H.length > 0 ? macd1H[macd1H.length - 1] : null,
-            SMC: smc1H
+            SMC: smc1H,
+            ATR14: atr14_1h ?? null
           },
           TF_15m: {
             RSI_14: rsi15m.length > 0 ? rsi15m[rsi15m.length - 1] : null,
@@ -756,6 +764,232 @@ async function generateWithRetry(prompt: string, modelName: string = 'gemini-3.1
   throw new Error(`Failed to get response from Gemini after all attempts.`);
 }
 
+// --- EXCEL ROWS BUILDER (A-D) ---
+type Ohlcv = [number, number, number, number, number, number]; // ts,o,h,l,c,v
+
+function atr14Last(ohlcv: Ohlcv[]): number | null {
+  const n = 14;
+  if (!ohlcv || ohlcv.length < n + 1) return null;
+  const highs = ohlcv.map(c => c[2]);
+  const lows  = ohlcv.map(c => c[3]);
+  const closes= ohlcv.map(c => c[4]);
+
+  const tr: number[] = [0];
+  for (let i = 1; i < ohlcv.length; i++) {
+    const h = highs[i], l = lows[i], pc = closes[i - 1];
+    tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+  }
+  let atr = tr[1];
+  for (let i = 2; i <= n; i++) atr = (atr * (n - 1) + tr[i]) / n;
+  for (let i = n + 1; i < tr.length; i++) atr = (atr * (n - 1) + tr[i]) / n;
+  return atr || null;
+}
+
+function deriveVolatilityRegime(atrPct: number | null | undefined) {
+  if (atrPct == null) return '';
+  if (atrPct < 1.0)  return 'LOW';
+  if (atrPct <= 2.5) return 'NORMAL';
+  return 'HIGH';
+}
+
+type PerSide = { qty: number; entry: number; pnl: number; bep?: number|null; liq?: number|null; marginUsed?: number|null; };
+type PerSymbolPos = {  long: PerSide; short: PerSide;  netQtyUSDT: number | null; netDirection: 'NET_LONG'|'NET_SHORT'|'LOCKED'; netBEP: number | null;};
+
+function mapPositionsForSymbol(allPositions: any[], symbol: string, lastPrice?: number): PerSymbolPos {
+  const same = (p: any) => p.symbol === symbol;
+  const longPos  = allPositions.find((p: any) => same(p) && (p.side === 'long' || (p.side === 'both' && parseFloat(p.info.positionAmt) > 0)));
+  const shortPos = allPositions.find((p: any) => same(p) && (p.side === 'short' || (p.side === 'both' && parseFloat(p.info.positionAmt) < 0)));
+  const long: PerSide = {
+    qty: longPos ? Math.abs(longPos.contracts) : 0,
+    entry: longPos?.entryPrice ?? 0,
+    pnl: longPos?.unrealizedPnl ?? 0,
+    bep: longPos?.entryPrice ?? null,
+    liq: longPos?.liquidationPrice ?? longPos?.info?.liquidationPrice ?? null,
+    marginUsed: longPos?.initialMargin ?? longPos?.info?.initialMargin ?? null
+  };
+  const short: PerSide = {
+    qty: shortPos ? Math.abs(shortPos.contracts) : 0,
+    entry: shortPos?.entryPrice ?? 0,
+    pnl: shortPos?.unrealizedPnl ?? 0,
+    bep: shortPos?.entryPrice ?? null,
+    liq: shortPos?.liquidationPrice ?? shortPos?.info?.liquidationPrice ?? null,
+    marginUsed: shortPos?.initialMargin ?? shortPos?.info?.initialMargin ?? null
+  };
+  let netQtyUSDT: number | null = null;
+  if (lastPrice && (long.qty > 0 || short.qty > 0)) {
+    netQtyUSDT = Math.abs(long.qty - short.qty) * lastPrice;
+  }
+  const netDirection = long.qty === short.qty ? 'LOCKED' : (long.qty > short.qty ? 'NET_LONG' : 'NET_SHORT');
+  let netBEP: number | null = null;
+  if (long.qty === short.qty && long.qty > 0) {
+    netBEP = (long.entry + short.entry) / 2;
+  } else if (long.qty !== short.qty && long.entry && short.entry) {
+    const longNotional  = long.entry  * long.qty;
+    const shortNotional = short.entry * short.qty;
+    const diffContracts = (long.qty - short.qty);
+    if (diffContracts !== 0) netBEP = (longNotional - shortNotional) / diffContracts;
+  }
+  return { long, short, netQtyUSDT, netDirection, netBEP };
+}
+
+function deriveBiasStrength4H(trend4h: string | null | undefined, waeExploding?: boolean | null) {
+  if (!trend4h || trend4h.toUpperCase() === 'NEUTRAL' || trend4h.toUpperCase() === 'NETRAL') return 'RANGE';
+  const strong = !!waeExploding;
+  if (trend4h.toUpperCase() === 'UP')   return strong ? 'STRONG_UP' : 'WEAK_UP';
+  if (trend4h.toUpperCase() === 'DOWN') return strong ? 'STRONG_DOWN' : 'WEAK_DOWN';
+  return 'RANGE';
+}
+
+function deriveBiasStrength1H(structure1h: string | null | undefined) {
+  const s = (structure1h || '').toUpperCase();
+  if (!s) return 'RANGE';
+  if (s.includes('BOS') || s.includes('CHOCH')) {
+    return s.includes('_BULL') ? 'STRONG_UP' : 'STRONG_DOWN';
+  }
+  return 'RANGE';
+}
+
+function deriveActionRiskType(action?: string, mrDelta?: number | null) {
+  if (!action) return 'NEUTRAL';
+  const A = action.toUpperCase();
+  if (A.startsWith('LOCK')) return 'LOCK';
+  if (A.startsWith('TAKE')) return 'DE_RISK';
+  if (A.startsWith('ADD') || A === 'HEDGE_ON' || A === 'ROLE') return 'EXPAND';
+  if (typeof mrDelta === 'number') return mrDelta < 0 ? 'DE_RISK' : (mrDelta > 0 ? 'EXPAND' : 'NEUTRAL');
+  return 'NEUTRAL';
+}
+
+function deriveRiskTag(accountMrDecimal?: number | null, mrDelta?: number | null): 'CRITICAL'|'HIGH'|'NORMAL'|'LOW'|'' {
+  if (accountMrDecimal == null) return '';
+  if (accountMrDecimal >= 0.60) return 'CRITICAL';
+  if (accountMrDecimal >= 0.25) return 'HIGH';
+  if (typeof mrDelta === 'number' && mrDelta > 0) return 'HIGH';
+  if (accountMrDecimal < 0.15) return 'LOW';
+  return 'NORMAL';
+}
+
+type ExcelRow = {
+  Ts: string; Symbol: string; Timeframe: string;
+  Bias4H: string; BiasStrength4H: string; Bias1H: string; BiasStrength1H: string;
+  ATR4H: number | ''; ATR1H: number | ''; VolatilityRegime: string;
+  Pivot: number | ''; StopHedge: number | '';
+  SupplyLow: number | ''; SupplyHigh: number | '';
+  DemandLow: number | ''; DemandHigh: number | '';
+  KeyLevel1: number | ''; KeyLevel2: number | ''; ZoneQuality: string;
+  LongQty: number | ''; LongEntry: number | ''; LongPnL: number | '';
+  LongBEP: number | ''; LongLiqPrice: number | ''; LongMarginUsed: number | '';
+  ShortQty: number | ''; ShortEntry: number | ''; ShortPnL: number | '';
+  ShortBEP: number | ''; ShortLiqPrice: number | ''; ShortMarginUsed: number | '';
+  NetQtyUSDT: number | ''; NetDirection: string; NetBEP: number | ''; RatioHint: string;
+  'AccountMR%': number | ''; 'MR%': string | ''; MRProjected: number | '';
+  MRDeltaIfAction: number | ''; PairRiskWeight: number | ''; RiskTag: string;
+  Action: string; StrategyMode: string; RecoveryPhase: string; ActionRiskType: string;
+  ActionSuggested: string; Status: string; Notes: string;
+  ArchiveKey: string; SourceEmailId: string; FileName: string;
+};
+
+function composeExcelRows(params: {
+  cards: any[]; positions: any[]; marketData: any; accountRisk: any;
+}): ExcelRow[] {
+  const rows: ExcelRow[] = [];
+  const accMrPct = params?.accountRisk?.marginRatio ?? null; // % 0..100
+  const accMrDecimal = accMrPct != null ? accMrPct / 100 : null;
+  const wallet = params?.accountRisk?.walletBalance ?? null;
+  for (const c of (params.cards || [])) {
+    const symbol = (c.symbol || '').split(':')[0]; // "BASE/USDT"
+    const md = params.marketData[symbol] || params.marketData[`${symbol}:USDT`] || {};
+    const md4 = md?.TF_4H || {};
+    const md1 = md?.TF_1H || {};
+    const priceNow = md?.currentPrice ?? null;
+    const per = mapPositionsForSymbol(params.positions, symbol, priceNow);
+    const bias4h = (c?.structure?.trend_4h || 'NETRAL').toString().toUpperCase().replace('NEUTRAL','NETRAL');
+    const bias1h = (c?.structure?.smc_1h?.structure || 'UNKNOWN').toString().toUpperCase();
+    const bs4h   = deriveBiasStrength4H(bias4h, md4?.WAE?.isExploding ?? null);
+    const bs1h   = deriveBiasStrength1H(bias1h);
+    const atr4h = md4?.ATR14 ?? null;
+    const atr1h = md1?.ATR14 ?? null;
+    const atrPct4h = (atr4h && priceNow) ? (atr4h / priceNow) * 100 : null;
+    const volReg = deriveVolatilityRegime(atrPct4h);
+    const pivot   = (c?.levels?.pivot ?? md4?.RQK_Channel?.estimate ?? null);
+    const stopHdg = (c?.levels?.stop_hedge_lock ?? null);
+    const supplyLo = c?.levels?.supply?.zone?.[0] ?? '';
+    const supplyHi = c?.levels?.supply?.zone?.[1] ?? '';
+    const demandLo = c?.levels?.demand?.zone?.[0] ?? '';
+    const demandHi = c?.levels?.demand?.zone?.[1] ?? '';
+    const ratioHint = c?.positions?.ratio_hint ?? 'OTHER';
+    const netQtyUSDT = per.netQtyUSDT ?? '';
+    const netDir = per.netDirection;
+    const netBEP = per.netBEP ?? '';
+    const mrProjectedPct = typeof c?.action_now?.mr_projected_if_action === 'number'
+      ? c.action_now.mr_projected_if_action
+      : '';
+    const mrDelta = (typeof mrProjectedPct === 'number' && accMrPct != null)
+      ? (mrProjectedPct/100 - accMrPct/100)
+      : '';
+    const pairWeight = (wallet && priceNow && (per.long.qty || per.short.qty))
+      ? (((per.long.qty * priceNow) + (per.short.qty * priceNow)) / wallet)
+      : '';
+    const action = c?.action_now?.action || c?.action || 'HOLD';
+    const actRisk = deriveActionRiskType(action, typeof mrDelta === 'number' ? mrDelta : null);
+    const riskTag = deriveRiskTag(accMrDecimal, typeof mrDelta === 'number' ? mrDelta : null);
+    const tsIso = new Date().toISOString();
+    const archiveKey = `${tsIso}|${symbol}|4H`;
+    rows.push({
+      Ts: tsIso,
+      Symbol: symbol,
+      Timeframe: '4H',
+      Bias4H: bias4h,
+      BiasStrength4H: bs4h,
+      Bias1H: bias1h,
+      BiasStrength1H: bs1h,
+      ATR4H: atr4h ?? '',
+      ATR1H: atr1h ?? '',
+      VolatilityRegime: volReg,
+      Pivot: pivot ?? '',
+      StopHedge: stopHdg ?? '',
+      SupplyLow: supplyLo,
+      SupplyHigh: supplyHi,
+      DemandLow: demandLo,
+      DemandHigh: demandHi,
+      KeyLevel1: '', KeyLevel2: '', ZoneQuality: '',
+      LongQty: per.long.qty || '',
+      LongEntry: per.long.entry || '',
+      LongPnL: per.long.pnl || '',
+      LongBEP: per.long.bep ?? '',
+      LongLiqPrice: per.long.liq ?? '',
+      LongMarginUsed: per.long.marginUsed ?? '',
+      ShortQty: per.short.qty || '',
+      ShortEntry: per.short.entry || '',
+      ShortPnL: per.short.pnl || '',
+      ShortBEP: per.short.bep ?? '',
+      ShortLiqPrice: per.short.liq ?? '',
+      ShortMarginUsed: per.short.marginUsed ?? '',
+      NetQtyUSDT: netQtyUSDT,
+      NetDirection: netDir,
+      NetBEP: netBEP,
+      RatioHint: ratioHint,
+      'AccountMR%': accMrDecimal ?? '',
+      'MR%': (accMrPct != null) ? `${accMrPct.toFixed(2)}%` : '',
+      MRProjected: typeof mrProjectedPct === 'number' ? mrProjectedPct : '',
+      MRDeltaIfAction: typeof mrDelta === 'number' ? mrDelta : '',
+      PairRiskWeight: pairWeight || '',
+      RiskTag: riskTag,
+      Action: action,
+      StrategyMode: c?.strategy_mode || 'RECOVERY',
+      RecoveryPhase: c?.recovery_phase || 'PHASE_1',
+      ActionRiskType: actRisk,
+      ActionSuggested: '',
+      Status: '',
+      Notes: '',
+      ArchiveKey: archiveKey,
+      SourceEmailId: '',
+      FileName: ''
+    });
+  }
+  return rows;
+}
+// --- END EXCEL ROWS BUILDER ---
+
 // Core monitoring function
 async function monitorMarkets() {
   try {
@@ -818,6 +1052,7 @@ async function monitorMarkets() {
         })),
         scannerUniverse: top20Symbols,
         marketData,
+        recentHistory: signals.slice(0, 5), // Include last 5 signals for self-supervision
         openOrders: openOrders.map((o: any) => ({
             symbol: o.symbol,
             side: o.side,
@@ -832,12 +1067,17 @@ async function monitorMarkets() {
             hedge_ratio: 2.0,
             mr_guard_pct: 25.0
         },
-        enable_addendum_modules: ["HEDGE_NORMALIZATION_V2"]
+        enable_addendum_modules: ["HEDGE_NORMALIZATION_V2", "HEDGING_RECOVERY_BY_ZONE"]
     };
 
     const prompt = `
-      Anda adalah “Crypto Sentinel V2 – Decision Card, SOP & Server Enforcement Orchestrator” SEKALIGUS “Top20 Scanner”.
+      Anda adalah “Crypto Sentinel V2 – Decision Card, SOP & Server Enforcement Orchestrator” SEKALIGUS “Supervisory Sentinel”.
       
+      KONTEKS SUPERVISI:
+      - Anda memiliki akses ke 'recentHistory' (5 sinyal terakhir) untuk menjaga konsistensi keputusan.
+      - Data Anda diarsipkan secara otomatis ke GCS dan dikirim ke Outlook (tAnalyses).
+      - Fokus utama Anda saat ini adalah: **HEDGING RECOVERY BY ZONE**.
+
       DATA MASUK:
       ${JSON.stringify(inputPayload, null, 2)}
 
@@ -907,6 +1147,12 @@ async function monitorMarkets() {
          - Saat GUARD_NO_ADD → AL/AS/HO/RR WAJIB masuk “buttons.block”.
          - UL “allowed” hanya jika syarat UNLOCK (poin 4) terpenuhi.
          - LN “allowed” hanya jika syarat LN (poin 3) terpenuhi; jika tidak, beri alasan penolakan & sarankan HOLD/TP.
+
+      8) HEDGING RECOVERY BY ZONE (SOP KHUSUS):
+         - Jika posisi dalam status RECOVERY, fokus pada identifikasi zona SUPPLY/DEMAND TF 4H.
+         - Gunakan Pivot RQK sebagai batas netralitas.
+         - Jika harga mendekati zona DEMAND saat Bias 4H DOWN, pertimbangkan LOCK_NEUTRAL untuk mencegah drawdown lebih lanjut jika zona tersebut jebol.
+         - Jika harga memantul dari zona DEMAND dengan konfluensi 1H bullish, pertimbangkan UNLOCK SHORT (jika profit/BE) untuk memulai fase pemulihan LONG.
 
       TUGAS 2: TOP 20 SCANNER (NEW)
       Dari data "universe" (Top 20), pilih 1–2 koin dengan setup PALING SEMPURNA menurut:
@@ -1198,6 +1444,19 @@ async function monitorMarkets() {
     const gg = analysisData.global_guard || { mode:"NORMAL" };
     const new_signals = analysisData.new_signals || null;
 
+    // --- NEW: Generate Excel Rows ---
+    try {
+        const excelRows = composeExcelRows({
+            cards,
+            positions,
+            marketData,
+            accountRisk
+        });
+        analysisData.excel_rows = excelRows;
+    } catch (e) {
+        console.error("Failed to compose excel_rows:", e);
+    }
+
     // --- NEW: Upload arsip ke GCS (opsional) ---
     let archiveUrl: string | null = null;
     try {
@@ -1213,7 +1472,7 @@ async function monitorMarkets() {
 
     // --- NEW: Send Decision Cards JSON to Email ---
     if (cards && cards.length > 0) {
-        await sendDecisionCardsEmail(cards);
+        await sendDecisionCardsEmail(cards, analysisData.excel_rows);
     }
 
     const payloads = renderDecisionCardsToTelegram(cards, se, gg, new_signals, archiveUrl);
@@ -1237,15 +1496,9 @@ async function monitorMarkets() {
   }
 }
 
-function escapeHtml(text: any): string {
-    if (text === null || text === undefined) return '';
-    return text.toString()
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
-}
+function escapeHtml(t:any){ if(t==null) return ''; return t.toString()
+     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+     .replace(/"/g,'&quot;').replace(/'/g,'&#039;'); }
 
 function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global_guard: any, new_signals: any = null, archiveUrl?: string | null) {
     const payloads = [];
@@ -1472,13 +1725,14 @@ app.post('/api/bot/toggle', async (req, res) => {
   }
 });
 
-app.post('/api/bot/force-run', (req, res) => {
-  // Run in background to avoid timeout
-  monitorMarkets()
-    .then(() => console.log('Force run completed successfully'))
-    .catch(err => console.error('Force run failed:', err));
-    
-  res.json({ success: true, message: 'Bot run initiated in background' });
+app.post('/api/bot/force-run', async (req, res) => {
+  try {
+    await monitorMarkets();
+    res.json({ success: true, message: 'Bot run completed successfully' });
+  } catch (err: any) {
+    console.error('Force run failed:', err);
+    res.status(500).json({ success: false, error: err.message || 'Force run failed' });
+  }
 });
 
 app.get('/api/signals', (req, res) => {
@@ -1603,8 +1857,11 @@ async function generateAiReply(userMessage: string) {
   const latestSignal = signals.length > 0 ? signals[signals.length - 1].content : 'Belum ada sinyal.';
 
   const prompt = `
-    Anda adalah asisten trading crypto cerdas (Crypto Sentinel).
+    Anda adalah “Crypto Sentinel V2 – Supervisory Sentinel”.
+    Fokus Utama: HEDGING RECOVERY BY ZONE.
     Gaya Trading Pengguna: HEDGING RECOVERY MODE. Pengguna MEMINIMALKAN CUT LOSS dan lebih memilih melakukan Hedging (membuka posisi Long dan Short bersamaan) untuk melakukan recovery pada posisi yang sedang floating loss.
+    
+    Tugas Anda adalah memberikan saran supervisi yang objektif berdasarkan data akun dan pasar.
 
     Data Akun & Risiko (PENTING):
     - Margin Ratio: ${accountRisk ? accountRisk.marginRatio.toFixed(2) + '%' : 'N/A'} (Maksimal Aman: 25%)

@@ -45,6 +45,7 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState<{role: 'user'|'ai', content: string}[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [isChatting, setIsChatting] = useState(false);
+  const [isForceRunning, setIsForceRunning] = useState(false);
 
   // Helper to format CCXT symbol to TradingView Futures symbol
   const getTVSymbol = (sym: string) => {
@@ -110,15 +111,19 @@ export default function App() {
   };
 
   const forceRun = async () => {
+    if (isForceRunning) return;
+    setIsForceRunning(true);
     try {
       const res = await fetch('/api/bot/force-run', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to force run');
-      fetchData(); // Refresh data after run
+      await fetchData(); // Refresh data after run
       setError(null);
     } catch (err: any) {
       console.error('Failed to force run', err);
       setError(err.message);
+    } finally {
+      setIsForceRunning(false);
     }
   };
 
@@ -205,11 +210,11 @@ export default function App() {
 
             <button
               onClick={forceRun}
-              disabled={!isConfigured}
+              disabled={!isConfigured || isForceRunning}
               className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 transition-all disabled:opacity-50 disabled:cursor-not-allowed border border-zinc-700"
             >
-              <RefreshCw className="w-4 h-4" />
-              Force Run
+              <RefreshCw className={`w-4 h-4 ${isForceRunning ? 'animate-spin text-emerald-400' : ''}`} />
+              {isForceRunning ? 'Running Analysis...' : 'Force Run'}
             </button>
           </div>
         </div>

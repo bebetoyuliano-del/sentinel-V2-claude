@@ -18,7 +18,7 @@ interface MailOptions {
  * @param cardsArray Array of decision card objects
  * @param opts Optional metadata like runId or archiveKey
  */
-export async function sendDecisionCardsEmail(cardsArray: any[], opts: MailOptions = {}): Promise<void> {
+export async function sendDecisionCardsEmail(cardsArray: any[], excelRows?: any[], opts: MailOptions = {}): Promise<void> {
   // 1. Validation
   if (!Array.isArray(cardsArray)) {
     console.error("❌ [Mailer] Validation Error: cardsArray must be an array.");
@@ -61,6 +61,22 @@ export async function sendDecisionCardsEmail(cardsArray: any[], opts: MailOption
     body += `Archive Key: ${opts.archiveKey || process.env.SENTINEL_ARCHIVE_KEY}\n`;
   }
 
+  const attachments: any[] = [
+    {
+      filename: `decision_cards_${timestamp.replace(/[:.]/g, '-')}.json`,
+      content: Buffer.from(JSON.stringify(cardsArray, null, 2), 'utf8'),
+      contentType: 'application/json; charset=utf-8'
+    }
+  ];
+
+  if (Array.isArray(excelRows) && excelRows.length > 0) {
+    attachments.push({
+      filename: `Sentinel_ExcelRows_v2_${timestamp.replace(/[:.]/g, '-')}.json`,
+      content: Buffer.from(JSON.stringify(excelRows, null, 2), 'utf-8'),
+      contentType: 'application/json; charset=utf-8'
+    });
+  }
+
   const mailOptions = {
     from: `"${FROM_NAME}" <${FROM_ADDR}>`,
     to: EMAIL_TO,
@@ -69,13 +85,7 @@ export async function sendDecisionCardsEmail(cardsArray: any[], opts: MailOption
     headers: {
       'X-Sentinel': 'DecisionCards'
     },
-    attachments: [
-      {
-        filename: `decision_cards_${timestamp.replace(/[:.]/g, '-')}.json`,
-        content: Buffer.from(JSON.stringify(cardsArray, null, 2), 'utf8'),
-        contentType: 'application/json; charset=utf-8'
-      }
-    ]
+    attachments
   };
 
   // 4. Send with Light Retry Logic
@@ -96,7 +106,11 @@ export async function sendDecisionCardsEmail(cardsArray: any[], opts: MailOption
         return send(attempt + 1);
       }
 
-      console.error(`❌ [Mailer] Failed to send email:`, error.message || error);
+      const errorMsg = error.message || error;
+      console.error(`❌ [Mailer] Failed to send email:`, errorMsg);
+      if (errorMsg.includes('535-5.7.8')) {
+        console.error("💡 ACTION REQUIRED: Your Gmail login was rejected. Please ensure you are using a 16-character 'App Password' (not your regular password) and that 2FA is enabled on your Google Account.");
+      }
     }
   };
 
