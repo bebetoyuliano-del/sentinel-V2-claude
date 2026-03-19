@@ -1,0 +1,138 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: userId
+    // Fields:
+    //   - name: string (optional)
+    //   - email: string (required, email format)
+    //   - role: string (required, 'admin' or 'user')
+    //   - createdAt: string (optional, date-time)
+    //
+    // Collection: signals
+    // Document ID: auto-generated
+    // Fields:
+    //   - content: string (required)
+    //   - timestamp: string (required, date-time)
+    //   - type: string (optional)
+    //   - symbol: string (optional)
+    //
+    // Collection: chats
+    // Document ID: auto-generated
+    // Fields:
+    //   - role: string (required, 'user' or 'ai')
+    //   - content: string (required)
+    //   - timestamp: string (required, date-time)
+    //
+    // Collection: journal
+    // Document ID: auto-generated
+    // Fields:
+    //   - symbol: string (required)
+    //   - side: string (required)
+    //   - entryPrice: number (optional)
+    //   - exitPrice: number (optional)
+    //   - pnl: number (required)
+    //   - reason: string (optional)
+    //   - timestamp: string (required, date-time)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (
+          (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+           get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+          (request.auth.token.email == "bebetoyuliano@gmail.com" && request.auth.token.email_verified == true)
+        );
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidUser(data) {
+      return hasOnlyAllowedFields(['name', 'email', 'role', 'createdAt']) &&
+             data.email is string && isValidEmail(data.email) &&
+             data.role in ['admin', 'user'] &&
+             (!('name' in data) || (data.name is string && data.name.size() < 100)) &&
+             (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() < 50));
+    }
+
+    function isValidSignal(data) {
+      return hasOnlyAllowedFields(['content', 'timestamp', 'type', 'symbol']) &&
+             data.content is string && data.content.size() > 0 && data.content.size() < 10000 &&
+             data.timestamp is string && data.timestamp.size() < 50 &&
+             (!('type' in data) || (data.type is string && data.type.size() < 50)) &&
+             (!('symbol' in data) || (data.symbol is string && data.symbol.size() < 50));
+    }
+
+    function isValidChat(data) {
+      return hasOnlyAllowedFields(['role', 'content', 'timestamp']) &&
+             data.role in ['user', 'ai'] &&
+             data.content is string && data.content.size() > 0 && data.content.size() < 10000 &&
+             data.timestamp is string && data.timestamp.size() < 50;
+    }
+
+    function isValidJournal(data) {
+      return hasOnlyAllowedFields(['symbol', 'side', 'entryPrice', 'exitPrice', 'pnl', 'reason', 'timestamp']) &&
+             data.symbol is string && data.symbol.size() > 0 && data.symbol.size() < 50 &&
+             data.side is string && data.side.size() > 0 && data.side.size() < 50 &&
+             data.pnl is number &&
+             data.timestamp is string && data.timestamp.size() < 50 &&
+             (!('entryPrice' in data) || data.entryPrice is number) &&
+             (!('exitPrice' in data) || data.exitPrice is number) &&
+             (!('reason' in data) || (data.reason is string && data.reason.size() < 10000));
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
+      allow create: if isAuthenticated() && isValidUser(request.resource.data) && 
+                    ((request.auth.uid == userId && request.resource.data.role == 'user') || isAdmin());
+      allow update: if isAuthenticated() && isValidUser(request.resource.data) && 
+                    ((request.auth.uid == userId && request.resource.data.role == resource.data.role) || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    match /signals/{signalId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && isValidSignal(request.resource.data);
+      allow update: if isAdmin() && isValidSignal(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /chats/{chatId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && isValidChat(request.resource.data);
+      allow update: if isAdmin() && isValidChat(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /journal/{journalId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && isValidJournal(request.resource.data);
+      allow update: if isAdmin() && isValidJournal(request.resource.data);
+      allow delete: if isAdmin();
+    }
+  }
+}

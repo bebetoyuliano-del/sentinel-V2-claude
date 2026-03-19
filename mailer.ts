@@ -25,14 +25,17 @@ export async function sendDecisionCardsEmail(cardsArray: any[], excelRows?: any[
     return;
   }
 
-  const SMTP_USER = process.env.SMTP_USER?.trim();
+  const SMTP_USER = process.env.SMTP_USER?.trim() || (process.env.EMAIL_FROM_ADDR || process.env.EMAIL_FROM_ADDRESS)?.trim();
   const SMTP_PASS = process.env.SMTP_PASS?.trim();
   const EMAIL_TO = process.env.EMAIL_TO?.trim();
+  const ALERT_TO_EMAIL = process.env.ALERT_TO_EMAIL?.trim();
+  const TO_ADDRESSES = [EMAIL_TO, ALERT_TO_EMAIL].filter(Boolean).join(', ');
   const FROM_NAME = process.env.EMAIL_FROM_NAME?.trim() || "Crypto Sentinel";
-  const FROM_ADDR = process.env.EMAIL_FROM_ADDR?.trim() || SMTP_USER;
+  const FROM_ADDR = (process.env.EMAIL_FROM_ADDR || process.env.EMAIL_FROM_ADDRESS)?.trim() || SMTP_USER;
   const SUBJECT_PREFIX = process.env.EMAIL_SUBJECT_PREFIX?.trim() || "Crypto Sentinel - Decision Cards JSON";
+  const SMTP_PORT = process.env.SMTP_PORT ? parseInt(process.env.SMTP_PORT, 10) : undefined;
 
-  if (!SMTP_USER || !SMTP_PASS || !EMAIL_TO) {
+  if (!SMTP_USER || !SMTP_PASS || !TO_ADDRESSES) {
     console.warn("⚠️ [Mailer] Email skipped: SMTP_USER, SMTP_PASS, or EMAIL_TO not configured in .env");
     return;
   }
@@ -41,13 +44,17 @@ export async function sendDecisionCardsEmail(cardsArray: any[], excelRows?: any[
   const subject = `${SUBJECT_PREFIX} [${timestamp}]`;
   
   // 2. Transporter Setup (Gmail App Password)
-  const transporter = nodemailer.createTransport({
+  const transporterOptions: any = {
     service: 'gmail',
     auth: {
       user: SMTP_USER,
       pass: SMTP_PASS
     }
-  });
+  };
+  if (SMTP_PORT) {
+    transporterOptions.port = SMTP_PORT;
+  }
+  const transporter = nodemailer.createTransport(transporterOptions);
 
   // 3. Email Content Construction
   let body = `Terlampir Decision Cards terbaru.\n\n`;
@@ -79,7 +86,7 @@ export async function sendDecisionCardsEmail(cardsArray: any[], excelRows?: any[
 
   const mailOptions = {
     from: `"${FROM_NAME}" <${FROM_ADDR}>`,
-    to: EMAIL_TO,
+    to: TO_ADDRESSES,
     subject: subject,
     text: body,
     headers: {
@@ -94,7 +101,7 @@ export async function sendDecisionCardsEmail(cardsArray: any[], excelRows?: any[
       const info = await transporter.sendMail(mailOptions);
       console.log(`✅ [Mailer] Email sent successfully (Attempt ${attempt}): ${info.messageId}`);
       console.log(`   Subject: ${subject}`);
-      console.log(`   Recipients: ${EMAIL_TO}`);
+      console.log(`   Recipients: ${TO_ADDRESSES}`);
       console.log(`   Payload: ${cardsArray.length} pairs`);
     } catch (error: any) {
       const retryableErrors = ['ECONNRESET', 'ETIMEDOUT', 'ESOCKET'];

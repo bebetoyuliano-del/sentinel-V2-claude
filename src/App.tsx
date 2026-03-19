@@ -1,13 +1,18 @@
 import { useEffect, useState } from 'react';
-import { Activity, Play, Square, TrendingUp, AlertCircle, RefreshCw, MessageSquare, Target, BarChart2, X, Bot, User, Send } from 'lucide-react';
+import { Activity, Play, Square, TrendingUp, AlertCircle, RefreshCw, MessageSquare, Target, BarChart2, X, Bot, User, Send, LogOut, CheckCircle2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { AdvancedRealTimeChart } from 'react-ts-tradingview-widgets';
+import { auth, db, loginWithGoogle, logout } from './firebase';
+import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import { collection, query, orderBy, limit, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore';
 
 interface Status {
   isBotRunning: boolean;
   apiKeysConfigured: {
     binance: boolean;
     telegram: boolean;
+    email?: boolean;
+    webhook?: boolean;
   };
 }
 
@@ -46,6 +51,49 @@ export default function App() {
   const [chatInput, setChatInput] = useState('');
   const [isChatting, setIsChatting] = useState(false);
   const [isForceRunning, setIsForceRunning] = useState(false);
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    
+    // Listen to signals from Firestore
+    const qSignals = query(collection(db, 'signals'), orderBy('timestamp', 'desc'), limit(50));
+    const unsubSignals = onSnapshot(qSignals, (snapshot) => {
+      const fetchedSignals = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as Signal[];
+      setSignals(fetchedSignals);
+    }, (err) => {
+      console.error("Error fetching signals from Firestore:", err);
+    });
+
+    // Listen to chat messages
+    const qChats = query(collection(db, 'chats'), orderBy('timestamp', 'asc'), limit(100));
+    const unsubChats = onSnapshot(qChats, (snapshot) => {
+      const fetchedChats = snapshot.docs.map(doc => ({
+        role: doc.data().role,
+        content: doc.data().content
+      }));
+      setChatMessages(fetchedChats as any);
+    }, (err) => {
+      console.error("Error fetching chats from Firestore:", err);
+    });
+
+    return () => {
+      unsubSignals();
+      unsubChats();
+    };
+  }, [user]);
 
   // Helper to format CCXT symbol to TradingView Futures symbol
   const getTVSymbol = (sym: string) => {
@@ -56,36 +104,51 @@ export default function App() {
 
   const fetchData = async () => {
     try {
-      setError(null);
-      const [statusRes, marketRes, positionsRes, signalsRes, ordersRes, accountRes] = await Promise.all([
-        fetch('/api/status'),
-        fetch('/api/market'),
-        fetch('/api/positions'),
-        fetch('/api/signals'),
-        fetch('/api/orders'),
-        fetch('/api/account')
+      // Don't clear error immediately to avoid flickering, only clear on success
+      const fetchWithTimeout = (url: string, ms = 10000) => {
+        const controller = new AbortController();
+        const id = setTimeout(() => controller.abort(), ms);
+        return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(id));
+      };
+
+      const [statusRes, marketRes, positionsRes, ordersRes, accountRes] = await Promise.all([
+        fetchWithTimeout('/api/status').catch(() => ({ ok: false, json: async () => ({}) })),
+        fetchWithTimeout('/api/market').catch(() => ({ ok: false, json: async () => ({}) })),
+        fetchWithTimeout('/api/positions').catch(() => ({ ok: false, json: async () => ([]) })),
+        fetchWithTimeout('/api/orders').catch(() => ({ ok: false, json: async () => ([]) })),
+        fetchWithTimeout('/api/account').catch(() => ({ ok: false, json: async () => null }))
       ]);
 
-      if (!statusRes.ok) throw new Error('Failed to fetch status');
+      if (statusRes.ok) {
+        setStatus(await statusRes.json());
+        setError(null); // Clear error on successful status fetch
+      }
       
-      setStatus(await statusRes.json());
+      if (marketRes.ok) {
+        const marketData = await marketRes.json().catch(() => ({}));
+        setMarket(marketData.error ? {} : marketData);
+      }
       
-      const marketData = await marketRes.json().catch(() => ({}));
-      setMarket(marketData.error ? {} : marketData);
+      if (positionsRes.ok) {
+        const posData = await positionsRes.json().catch(() => []);
+        setPositions(Array.isArray(posData) ? posData : []);
+      }
       
-      const posData = await positionsRes.json().catch(() => []);
-      setPositions(Array.isArray(posData) ? posData : []);
-      
-      const sigData = await signalsRes.json().catch(() => []);
-      setSignals(Array.isArray(sigData) ? sigData : []);
-      
-      const ordData = await ordersRes.json().catch(() => []);
-      setOrders(Array.isArray(ordData) ? ordData : []);
+      if (ordersRes.ok) {
+        const ordData = await ordersRes.json().catch(() => []);
+        setOrders(Array.isArray(ordData) ? ordData : []);
+      }
 
-      const accData = await accountRes.json().catch(() => null);
-      setAccount(accData && !accData.error ? accData : null);
+      if (accountRes.ok) {
+        const accData = await accountRes.json().catch(() => null);
+        setAccount(accData && !accData.error ? accData : null);
+      }
     } catch (err: any) {
-      setError(err.message);
+      console.error('Fetch data error:', err);
+      // Only set error if it's not an abort/timeout to avoid spamming the user
+      if (err.name !== 'AbortError') {
+        setError('Failed to fetch data from server. Retrying...');
+      }
     } finally {
       setLoading(false);
     }
@@ -110,6 +173,8 @@ export default function App() {
     }
   };
 
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+
   const forceRun = async () => {
     if (isForceRunning) return;
     setIsForceRunning(true);
@@ -117,6 +182,8 @@ export default function App() {
       const res = await fetch('/api/bot/force-run', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to force run');
+      setSuccessMsg('Bot run started in background. Check Telegram for updates.');
+      setTimeout(() => setSuccessMsg(null), 5000);
       await fetchData(); // Refresh data after run
       setError(null);
     } catch (err: any) {
@@ -133,10 +200,16 @@ export default function App() {
     
     const userMsg = chatInput.trim();
     setChatInput('');
-    setChatMessages(prev => [...prev, { role: 'user', content: userMsg }]);
     setIsChatting(true);
     
     try {
+      // Save user message to Firestore
+      await addDoc(collection(db, 'chats'), {
+        role: 'user',
+        content: userMsg,
+        timestamp: new Date().toISOString()
+      });
+
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -144,7 +217,12 @@ export default function App() {
       });
       const data = await res.json();
       if (data.reply) {
-        setChatMessages(prev => [...prev, { role: 'ai', content: data.reply }]);
+        // Save AI reply to Firestore
+        await addDoc(collection(db, 'chats'), {
+          role: 'ai',
+          content: data.reply,
+          timestamp: new Date().toISOString()
+        });
       }
     } catch (err) {
       console.error('Failed to send message:', err);
@@ -153,7 +231,7 @@ export default function App() {
     }
   };
 
-  if (loading) {
+  if (authLoading || loading) {
     return (
       <div className="min-h-screen bg-zinc-950 flex items-center justify-center text-zinc-400">
         <RefreshCw className="w-6 h-6 animate-spin" />
@@ -161,7 +239,33 @@ export default function App() {
     );
   }
 
-  const isConfigured = status?.apiKeysConfigured.binance && status?.apiKeysConfigured.telegram;
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-zinc-950 flex items-center justify-center text-zinc-100 p-4">
+        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-8 max-w-md w-full text-center shadow-2xl">
+          <div className="w-16 h-16 rounded-2xl bg-emerald-500/10 flex items-center justify-center border border-emerald-500/20 mx-auto mb-6">
+            <Activity className="w-8 h-8 text-emerald-400" />
+          </div>
+          <h1 className="text-2xl font-bold mb-2">Crypto Sentinel</h1>
+          <p className="text-zinc-400 mb-8">Login to access your trading dashboard and AI assistant.</p>
+          <button 
+            onClick={loginWithGoogle}
+            className="w-full flex items-center justify-center gap-3 bg-white text-zinc-900 hover:bg-zinc-100 font-medium py-3 px-4 rounded-xl transition-colors"
+          >
+            <svg className="w-5 h-5" viewBox="0 0 24 24">
+              <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4" />
+              <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853" />
+              <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05" />
+              <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335" />
+            </svg>
+            Sign in with Google
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const isConfigured = status?.apiKeysConfigured.binance;
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans selection:bg-emerald-500/30">
@@ -216,6 +320,14 @@ export default function App() {
               <RefreshCw className={`w-4 h-4 ${isForceRunning ? 'animate-spin text-emerald-400' : ''}`} />
               {isForceRunning ? 'Running Analysis...' : 'Force Run'}
             </button>
+
+            <button
+              onClick={logout}
+              className="flex items-center justify-center w-10 h-10 rounded-lg bg-zinc-800 text-zinc-400 hover:bg-red-500/10 hover:text-red-400 transition-all border border-zinc-700 hover:border-red-500/20"
+              title="Logout"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
           </div>
         </div>
       </header>
@@ -261,6 +373,13 @@ export default function App() {
           <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-4 flex items-start gap-3 text-red-400">
             <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
             <p className="text-sm">{error}</p>
+          </div>
+        )}
+
+        {successMsg && (
+          <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-xl p-4 flex items-start gap-3 text-emerald-400">
+            <CheckCircle2 className="w-5 h-5 shrink-0 mt-0.5" />
+            <p className="text-sm">{successMsg}</p>
           </div>
         )}
 

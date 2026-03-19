@@ -9,8 +9,24 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { RSI, MACD, EMA } from 'technicalindicators';
 import { Storage } from '@google-cloud/storage';
+import { initializeApp, applicationDefault } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
 import fs from 'fs';
 import path from 'path';
+
+// Initialize Firebase Admin
+let db: any = null;
+try {
+  const firebaseConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf8'));
+  const app = initializeApp({
+    credential: applicationDefault(),
+    projectId: firebaseConfig.projectId,
+  });
+  db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+} catch (e) {
+  console.error("Failed to initialize Firebase Admin:", e);
+}
+
 import { sendDecisionCardsEmail } from './mailer';
 
 import { rangeFilterPineExact, RFParams } from './range_filter_pine';
@@ -298,31 +314,70 @@ const PORT = 3000;
 // API Keys
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY?.trim();
 const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET?.trim();
+const BINANCE_DEMO_API_KEY = (process.env.BINANCE_DEMO_API_KEY || process.env.BINANCE_TESTNET_API_KEY)?.trim();
+const BINANCE_DEMO_API_SECRET = (process.env.BINANCE_DEMO_API_SECRET || process.env.BINANCE_TESTNET_SECRET)?.trim();
+
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim();
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID?.trim();
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
+const PA_WEBHOOK_URL = process.env.PA_WEBHOOK_URL?.trim();
+
+let envMode = process.env.VALIDATION_MODE?.trim() || "LIVE_TRADING";
+if (envMode === "TESTNET") envMode = "DEMO_TRADING"; // Alias TESTNET to DEMO_TRADING
+
+// Force LIVE_TRADING as requested by user
+envMode = "LIVE_TRADING";
+
+const VALIDATION_MODE = envMode as "DRY_RUN" | "TEST_ORDER" | "DEMO_TRADING" | "LIVE_TRADING";
+
+if (!["DRY_RUN", "TEST_ORDER", "DEMO_TRADING", "LIVE_TRADING"].includes(VALIDATION_MODE)) {
+  throw new Error(`CRITICAL CONFIG ERROR: Invalid VALIDATION_MODE: ${VALIDATION_MODE}. Must be DRY_RUN, TEST_ORDER, DEMO_TRADING, or LIVE_TRADING.`);
+}
 
 const GCS_BUCKET = process.env.GCS_BUCKET?.trim();              // Wajib untuk upload
 const GCS_PREFIX = (process.env.GCS_PREFIX?.trim()) || "sentinel/alpha"; // Opsional prefix folder
 const GCS_PUBLIC = String(process.env.GCS_PUBLIC || "false") === "true"; // true -> object public-read
+
+const REDUCE_POLICY = "STRICT_PARTIAL"; // "STRICT_PARTIAL" | "FORCE_MIN_EXEC"
 const GCS_SIGNED_URL_TTL = Number(process.env.GCS_SIGNED_URL_TTL || "604800"); // 7 hari (detik)
 
 console.log('--- Environment Variables Debug ---');
+console.log('VALIDATION_MODE:', VALIDATION_MODE);
 console.log('BINANCE_API_KEY:', BINANCE_API_KEY ? `Set (Length: ${BINANCE_API_KEY.length})` : 'Missing');
+console.log('BINANCE_DEMO_API_KEY:', BINANCE_DEMO_API_KEY ? `Set (Length: ${BINANCE_DEMO_API_KEY.length})` : 'Missing');
 console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_BOT_TOKEN ? 'Set' : 'Missing');
 console.log('GEMINI_API_KEY:', GEMINI_API_KEY ? 'Set' : 'Missing');
 console.log('-----------------------------------');
 
 // Initialize clients
+const binanceOptions = {
+  defaultType: 'future', // Assuming futures for long/short positions
+  warnOnFetchOpenOrdersWithoutSymbol: false, // Suppress strict rate limit warning
+};
+
 const binance = new ccxt.binance({
   apiKey: BINANCE_API_KEY,
   secret: BINANCE_API_SECRET,
   enableRateLimit: true,
-  options: {
-    defaultType: 'future', // Assuming futures for long/short positions
-    warnOnFetchOpenOrdersWithoutSymbol: false, // Suppress strict rate limit warning
-  },
+  options: binanceOptions,
 });
+
+const binanceDemo = new ccxt.binance({
+  apiKey: BINANCE_DEMO_API_KEY,
+  secret: BINANCE_DEMO_API_SECRET,
+  enableRateLimit: true,
+  options: binanceOptions,
+});
+
+// Guard against deprecated sandbox mode for futures
+if ((binance as any).sandboxMode || (binanceDemo as any).sandboxMode) {
+    throw new Error("CRITICAL CONFIG ERROR: setSandboxMode(true) is deprecated for Binance Futures. Use enableDemoTrading(true) instead.");
+}
+
+if (VALIDATION_MODE === "DEMO_TRADING") {
+    binanceDemo.enableDemoTrading(true);
+    console.log("✅ Binance Demo Trading enabled.");
+}
 
 // Diagnostic: Check Binance Connection on Startup
 async function checkBinanceConnection() {
@@ -461,6 +516,17 @@ async function sendTelegramMessage(text: string, reply_markup?: any) {
     console.log(`Successfully sent ${messages.length} Telegram message(s).`);
   } catch (error: any) {
     console.error('Failed to send Telegram message (Final):', error.response?.data || error.message);
+  }
+}
+
+// Helper to send data to Power Automate Webhook
+async function sendPowerAutomateWebhook(data: any) {
+  if (!PA_WEBHOOK_URL) return;
+  try {
+    await axios.post(PA_WEBHOOK_URL, data);
+    console.log('✅ Successfully sent data to Power Automate Webhook.');
+  } catch (error: any) {
+    console.error('❌ Failed to send to Power Automate Webhook:', error.response?.data || error.message);
   }
 }
 
@@ -1148,11 +1214,16 @@ async function monitorMarkets() {
          - UL “allowed” hanya jika syarat UNLOCK (poin 4) terpenuhi.
          - LN “allowed” hanya jika syarat LN (poin 3) terpenuhi; jika tidak, beri alasan penolakan & sarankan HOLD/TP.
 
-      8) HEDGING RECOVERY BY ZONE (SOP KHUSUS):
-         - Jika posisi dalam status RECOVERY, fokus pada identifikasi zona SUPPLY/DEMAND TF 4H.
-         - Gunakan Pivot RQK sebagai batas netralitas.
-         - Jika harga mendekati zona DEMAND saat Bias 4H DOWN, pertimbangkan LOCK_NEUTRAL untuk mencegah drawdown lebih lanjut jika zona tersebut jebol.
-         - Jika harga memantul dari zona DEMAND dengan konfluensi 1H bullish, pertimbangkan UNLOCK SHORT (jika profit/BE) untuk memulai fase pemulihan LONG.
+      8) RECOVERY BY ZONE SEBAGAI SOP UTAMA & ADVANCED TECHNIQUES:
+         - Strategi Recovery ini menggunakan konsep "Recovery by Zone (Supply–Demand–Pivot–StopHedge)" sebagai SOP utama.
+         - Menyesuaikan strategi: SupplyHigh/Low → zona jual ideal, DemandHigh/Low → zona beli ideal, Pivot → equilibrium untuk reduce, StopHedge → invalidasi lock.
+         - Pola Zone Strategy: Lock at Extremes, Release at Pivot, Reduce di Mid-Range, Add di Edge, Hold Lock jika harga di tengah, Recovery mode jika harga kembali ke Demand/Supply.
+         - Terapkan juga keahlian inti berikut jika posisi dalam status RECOVERY:
+         - A. LOCKING STANDARD: Gunakan Full/Partial Lock untuk menetralisir risiko. Evaluasi apakah lock menurunkan MR atau mencegah kerusakan lebih dalam. Hindari over-hedging.
+         - B. HEDGING STEP: Gunakan Step-by-Step Recovery. Susun urutan step yang aman (misal: Reduce dulu → Add kecil → Lock → Unlock di zone tertentu). Perhatikan efek pada MR Projected.
+         - C. EXPOSURE BALANCING & MR GUARD: Netralkan posisi yang terlalu berat ke satu sisi berdasarkan zona. TOLAK aksi yang menaikkan MR ≥ 25%.
+         - D. DYNAMIC UNLOCK: Buka lock secara bertahap di zone aman, hindari panic unlock.
+         - E. SECOND OPINION: Selalu evaluasi aksi dari sudut Risiko, Zona, Bias trend, MR, dan Floating structure.
 
       TUGAS 2: TOP 20 SCANNER (NEW)
       Dari data "universe" (Top 20), pilih 1–2 koin dengan setup PALING SEMPURNA menurut:
@@ -1216,7 +1287,7 @@ async function monitorMarkets() {
             "positions": {
               "long":  { "qty": number, "entry": number, "pnl": number, "status": "HIJAU"|"MERAH"|"NONE" },
               "short": { "qty": number, "entry": number, "pnl": number, "status": "HIJAU"|"MERAH"|"NONE" },
-              "ratio_hint": "1:1" | "2:1 NET LONG" | "2:1 NET SHORT" | "OTHER"
+              "ratio_hint": "1:1" | "UNBALANCED LONG" | "UNBALANCED SHORT" | "OTHER"
             },
             "structure": {
               "bias_d1": "BULLISH"|"BEARISH"|"NETRAL",
@@ -1470,9 +1541,10 @@ async function monitorMarkets() {
       console.warn("GCS archive skipped:", e.message);
     }
 
-    // --- NEW: Send Decision Cards JSON to Email ---
+    // --- NEW: Send Decision Cards JSON to Email and Webhook ---
     if (cards && cards.length > 0) {
         await sendDecisionCardsEmail(cards, analysisData.excel_rows);
+        await sendPowerAutomateWebhook(analysisData);
     }
 
     const payloads = renderDecisionCardsToTelegram(cards, se, gg, new_signals, archiveUrl);
@@ -1484,8 +1556,18 @@ async function monitorMarkets() {
           id: Date.now().toString() + Math.random().toString(36).substring(7),
           timestamp: new Date().toISOString(),
           content: payload.text.replace(STRIP_TAGS, ''),
+          type: 'telegram',
+          symbol: new_signals?.signals?.[0]?.symbol || 'GENERAL'
         };
         signals.unshift(newSignal);
+        
+        if (db) {
+          try {
+            await db.collection('signals').doc(newSignal.id).set(newSignal);
+          } catch (dbErr) {
+            console.error("Failed to save signal to Firestore:", dbErr);
+          }
+        }
     }
     
     if (signals.length > 50) signals.splice(50);
@@ -1494,6 +1576,150 @@ async function monitorMarkets() {
     console.error('Error in monitorMarkets:', error);
     throw error;
   }
+}
+
+// =========================================================
+// TELEGRAM HELPERS
+// =========================================================
+
+export function normalizeSymbolInput(rawSymbol?: string): string {
+    if (!rawSymbol) return "";
+    let s = rawSymbol.toUpperCase().trim();
+    // Remove any existing /USDT or USDT suffix to get the base
+    s = s.replace(/\/USDT$/, '').replace(/USDT$/, '').replace(/:USDT$/, '');
+    return `${s}/USDT`;
+}
+
+export function normalizeActionInput(rawAction: string): { action: string, extractedSymbol?: string, extractedPercentage?: number, extractedTargetPrice?: number } {
+    let s = rawAction.toUpperCase().trim();
+    
+    // 1. Extract percentage (e.g. "50%")
+    let extractedPercentage: number | undefined = undefined;
+    const pctMatch = s.match(/(\d+)%/);
+    if (pctMatch) {
+        extractedPercentage = parseInt(pctMatch[1], 10);
+        s = s.replace(/(\d+)%/, ' ').trim();
+    }
+
+    // 2. Extract targetPrice (decimal or 4+ digits)
+    let extractedTargetPrice: number | undefined = undefined;
+    const priceRegex = /(?:UP TO|AT|@|:)?\s*(\d+\.\d+|\d{4,})(?:\s|[:!,;]|$)?/i;
+    const priceMatch = s.match(priceRegex);
+    if (priceMatch) {
+        extractedTargetPrice = parseFloat(priceMatch[1]);
+        s = s.replace(priceRegex, ' ').trim();
+    }
+
+    // 3. Find Action
+    const aliasMap: Record<string, string> = {
+        'TAKE PROFIT': 'TP',
+        'TAKE_PROFIT': 'TP',
+        'REDUCE LONG': 'RL',
+        'REDUCE_LONG': 'RL',
+        'REDUCE SHORT': 'RS',
+        'REDUCE_SHORT': 'RS',
+        'ADD LONG': 'AL',
+        'ADD_LONG': 'AL',
+        'ADD SHORT': 'AS',
+        'ADD_SHORT': 'AS',
+        'HEDGE ON': 'HO',
+        'HEDGE_ON': 'HO',
+        'LOCK NEUTRAL': 'LN',
+        'LOCK_NEUTRAL': 'LN',
+        'UNLOCK': 'UL',
+        'ROLE': 'RR',
+        'HOLD': 'HOLD',
+        'BUY': 'AL',
+        'SELL': 'AS',
+        'TP': 'TP',
+        'RL': 'RL',
+        'RS': 'RS',
+        'AL': 'AL',
+        'AS': 'AS',
+        'HO': 'HO',
+        'LN': 'LN',
+        'UL': 'UL',
+        'RR': 'RR'
+    };
+
+    let action = "";
+    const sortedAliases = Object.keys(aliasMap).sort((a, b) => b.length - a.length);
+    for (const alias of sortedAliases) {
+        if (s.includes(alias)) {
+            action = aliasMap[alias];
+            s = s.replace(alias, ' ').trim();
+            break;
+        }
+    }
+
+    // 4. Find Symbol (look for something like BTC/USDT or BTCUSDT)
+    let extractedSymbol: string | undefined = undefined;
+    const symbolMatch = s.match(/([A-Z0-9]{2,10}\/[A-Z0-9]{2,10}|[A-Z0-9]{5,15}USDT|[A-Z0-9]{2,10}:[A-Z0-9]{2,10})/);
+    if (symbolMatch) {
+        extractedSymbol = normalizeSymbolInput(symbolMatch[0]);
+        s = s.replace(symbolMatch[0], ' ').trim();
+    }
+
+    // 5. If still no percentage, check if any remaining number looks like one
+    if (!extractedPercentage) {
+        const numMatch = s.match(/(\d+)/);
+        if (numMatch) {
+            const val = parseInt(numMatch[1], 10);
+            if ([10, 15, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100].includes(val)) {
+                extractedPercentage = val;
+            }
+        }
+    }
+
+    return { action, extractedSymbol, extractedPercentage, extractedTargetPrice };
+}
+
+export function buildCallbackData(params: { action: string, symbol: string, percentage?: number, targetPrice?: number, stopHedgePrice?: number }): string {
+    const a = params.action;
+    const s = normalizeSymbolInput(params.symbol); // Use full format
+    const pct = params.percentage || 100;
+    const tp = params.targetPrice ? params.targetPrice.toString() : '';
+    const sh = params.stopHedgePrice ? params.stopHedgePrice.toString() : '';
+    
+    return `a=${a}|s=${s}|pct=${pct}|tp=${tp}|sh=${sh}`;
+}
+
+export function parseTelegramCallbackData(data: string): { action?: string, symbol?: string, percentage?: number, targetPrice?: number, stopHedgePrice?: number } {
+    // Check if it's the new structured format
+    if (data.startsWith('a=')) {
+        const parts = data.split('|');
+        const result: any = {};
+        for (const part of parts) {
+            const [key, val] = part.split('=');
+            if (key === 'a') result.action = val;
+            if (key === 's') result.symbol = normalizeSymbolInput(val);
+            if (key === 'pct') result.percentage = parseInt(val, 10);
+            if (key === 'tp' && val) result.targetPrice = parseFloat(val);
+            if (key === 'sh' && val) result.stopHedgePrice = parseFloat(val);
+        }
+        return result;
+    }
+    
+    // Legacy format (e.g., "TP XRP", "a|s|p|tp|sh" from previous code)
+    if (data.includes('|')) {
+        // Old pipe format: "a|s|p|tp|sh"
+        const parts = data.split('|');
+        return {
+            action: parts[0],
+            symbol: normalizeSymbolInput(parts[1]),
+            percentage: parseInt(parts[2], 10) || 100,
+            targetPrice: parts[3] ? parseFloat(parts[3]) : undefined,
+            stopHedgePrice: parts[4] ? parseFloat(parts[4]) : undefined
+        };
+    }
+
+    // Very old text format: "TP XRP"
+    const norm = normalizeActionInput(data);
+    return {
+        action: norm.action,
+        symbol: norm.extractedSymbol,
+        percentage: norm.extractedPercentage || 100
+    };
 }
 
 function escapeHtml(t:any){ if(t==null) return ''; return t.toString()
@@ -1556,7 +1782,13 @@ function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global
                 
                 const sh = stopLock !== null && stopLock !== undefined ? stopLock.toString() : '';
                 
-                const callback_data = `${a}|${s}|${p}|${tp}|${sh}`;
+                const callback_data = buildCallbackData({
+                    action: a,
+                    symbol: s,
+                    percentage: p,
+                    targetPrice: tp ? parseFloat(tp) : undefined,
+                    stopHedgePrice: sh ? parseFloat(sh) : undefined
+                });
                 
                 currentRow.push({ text: btn.label, callback_data });
                 
@@ -1700,9 +1932,52 @@ app.get('/api/status', (req, res) => {
   res.json({
     isBotRunning,
     apiKeysConfigured: {
-      binance: !!(BINANCE_API_KEY && BINANCE_API_SECRET),
+      binance: !!((BINANCE_API_KEY && BINANCE_API_SECRET) || (BINANCE_DEMO_API_KEY && BINANCE_DEMO_API_SECRET)),
       telegram: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
+      email: !!(process.env.SMTP_USER && process.env.EMAIL_TO),
+      webhook: !!PA_WEBHOOK_URL
     },
+  });
+});
+
+const logBuffer: string[] = [];
+function addLog(msg: string) {
+  logBuffer.push(`[${new Date().toISOString()}] ${msg}`);
+  if (logBuffer.length > 50) logBuffer.shift();
+  console.log(msg);
+}
+
+
+app.get('/api/debug-logs', (req, res) => {
+  res.json({ logs: logBuffer });
+});
+
+app.get('/api/debug-keys', (req, res) => {
+  res.json({
+    sameKey: process.env.BINANCE_API_KEY === process.env.BINANCE_DEMO_API_KEY,
+    sameSecret: process.env.BINANCE_API_SECRET === process.env.BINANCE_DEMO_API_SECRET
+  });
+});
+
+app.get('/api/debug-hedge', async (req, res) => {
+  try {
+    const activeClient = VALIDATION_MODE === "DEMO_TRADING" ? binanceDemo : binance;
+    const modeResp = await activeClient.fapiPrivateGetPositionSideDual();
+    res.json({ modeResp });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/debug-env', (req, res) => {
+  res.json({
+    VALIDATION_MODE,
+    BINANCE_API_KEY: BINANCE_API_KEY ? `Set (Length: ${BINANCE_API_KEY.length})` : 'Missing',
+    BINANCE_API_SECRET: BINANCE_API_SECRET ? `Set (Length: ${BINANCE_API_SECRET.length})` : 'Missing',
+    BINANCE_DEMO_API_KEY: BINANCE_DEMO_API_KEY ? `Set (Length: ${BINANCE_DEMO_API_KEY.length})` : 'Missing',
+    BINANCE_DEMO_API_SECRET: BINANCE_DEMO_API_SECRET ? `Set (Length: ${BINANCE_DEMO_API_SECRET.length})` : 'Missing',
+    TELEGRAM_BOT_TOKEN: TELEGRAM_BOT_TOKEN ? 'Set' : 'Missing',
+    GEMINI_API_KEY: GEMINI_API_KEY ? 'Set' : 'Missing',
   });
 });
 
@@ -1725,14 +2000,10 @@ app.post('/api/bot/toggle', async (req, res) => {
   }
 });
 
-app.post('/api/bot/force-run', async (req, res) => {
-  try {
-    await monitorMarkets();
-    res.json({ success: true, message: 'Bot run completed successfully' });
-  } catch (err: any) {
-    console.error('Force run failed:', err);
-    res.status(500).json({ success: false, error: err.message || 'Force run failed' });
-  }
+app.post('/api/bot/force-run', (req, res) => {
+  // Run in background to prevent browser timeout
+  monitorMarkets().catch(err => console.error('Force run failed in background:', err));
+  res.json({ success: true, message: 'Bot run started in background' });
 });
 
 app.get('/api/signals', (req, res) => {
@@ -1893,20 +2164,49 @@ async function generateAiReply(userMessage: string) {
     Berikan jawaban yang membantu, ringkas, dan relevan dengan konteks trading di atas. Gunakan Bahasa Indonesia.
     
     KONSEP UTAMA (WAJIB DIPAHAMI):
-    Strategi Recovery ini menggunakan konsep "Rasio 2:1 Searah Tren".
-    - Jika posisi sedang Locking (Long = Short) dan mengalami Floating Loss:
-      - Cek Tren Utama (RangeFilter pada TF_4H).
-      - PRIORITASKAN "REDUCE" (Kurangi Lawan Tren 50%) JIKA:
-        1. Posisi Lawan Tren sedang PROFIT (Hijau). Ambil profitnya!
-        2. Margin Ratio > 15% (Hemat Margin).
-      - HANYA PILIH "ADD" (Tambah Searah Tren) JIKA:
-        1. Margin Ratio < 15% (Aman).
-        2. Posisi Lawan Tren sedang LOSS (Merah) dan sayang jika dicut.
+    Strategi Recovery ini menggunakan konsep "Recovery by Zone (Supply–Demand–Pivot–StopHedge)" sebagai SOP utama.
+    - Menyesuaikan strategi: SupplyHigh/Low → zona jual ideal, DemandHigh/Low → zona beli ideal, Pivot → equilibrium untuk reduce, StopHedge → invalidasi lock.
+    - Pola Zone Strategy: Lock at Extremes, Release at Pivot, Reduce di Mid-Range, Add di Edge, Hold Lock jika harga di tengah, Recovery mode jika harga kembali ke Demand/Supply.
+    - Terapkan juga teknik inti lainnya seperti Locking Standard (Full/Partial), Hedging Step, Exposure Balancing, dan MR Guard sesuai kondisi.
     
     PENGGANTI STOP LOSS (STOP HEDGE):
     - Dalam mode recovery ini, KITA TIDAK MENGGUNAKAN STOP LOSS KONVENSIONAL.
     - Pengganti Stop Loss adalah KEMBALI KE MODE LOCKING 1:1 (NEUTRAL).
     - Jika harga bergerak berlawanan dengan prediksi tren kita, segera sarankan untuk MENAMBAH posisi yang tertinggal agar rasio kembali 1:1 (Locking Total).
+
+    🌐 KEAHLIAN INTI DALAM HEDGING RECOVERY YANG ANDA KUASAI:
+    
+    🧠 1. Locking Standard (Full/Partial Lock)
+    Fokus pada menetralisir risiko ketika posisi sudah berat atau market bergerak berlawanan kuat.
+    - Menentukan kapan lock perlu dilakukan segera atau menunggu zone tertentu.
+    - Menilai apakah lock akan menurunkan MR, menstabilkan equity, atau mencegah kerusakan lebih dalam.
+    - Membandingkan kebutuhan lock vs reduce.
+    - Menilai apakah lock-nya terlalu berat (over-hedging) atau terlalu kecil (under-hedging).
+    - Variasi Lock: Full Lock (qty long ≈ qty short), Partial Lock (salah satu sisi dominan), Dynamic Lock (variasi oleh zona), Smart Lock by Bias (lock kecil jika trend masih kuat).
+
+    🧩 2. Hedging Step / Step-by-Step Recovery
+    Memperbaiki BEP dan tekanan posisi secara berjenjang, aman, dan selalu memperhatikan MR.
+    - Menilai kapan aman melakukan step beli/jual (ADD_LONG/ADD_SHORT).
+    - Menghitung efek setiap step pada MR, Net exposure, Drawdown, dan Keseimbangan posisi.
+    - Menyusun urutan step yang aman (misal: Step reduce dulu → baru step add kecil → lalu lock → lalu unlock di zone tertentu).
+    - Model Step: Step Compression (perkecil gap BEP), Step Defensive (tambah posisi kecil untuk kurangi tekanan net), Inverse Step (step pendek ke arah floating loss), Weighted Step (penambahan lot diselaraskan dengan zona demand/supply).
+
+    🗺️ 3. Recovery by Zone (Supply–Demand–Pivot–StopHedge)
+    Teknik paling presisi berbasis area sebagai SOP utama.
+    - Menentukan di zone mana TP partial dilakukan, hedge dilepas sebagian, step ditambah, lock dibuka, atau risiko dikurangi.
+    - Menyesuaikan strategi: SupplyHigh/Low → zona jual ideal, DemandHigh/Low → zona beli ideal, Pivot → equilibrium untuk reduce, StopHedge → invalidasi lock.
+    - Pola Zone Strategy: Lock at Extremes, Release at Pivot, Reduce di Mid-Range, Add di Edge, Hold Lock jika harga di tengah, Recovery mode jika harga kembali ke Demand/Supply.
+
+    🔥 4. Teknik Lanjutan
+    - Exposure Balancing: Mengubah struktur posisi supaya tidak berat ke satu sisi berdasarkan zona (mis. "Unbalanced Long" dinetralkan).
+    - MR & Margin Guard Strategy: Menolak/memperingatkan aksi yang menaikkan MR di area bahaya (≥25%) dan memberi alternatif risiko rendah.
+    - Dynamic Unlock Strategy: Membuka lock secara bertahap di zone aman, menghindari "panic unlock".
+    - Multi-Layer Hedge: Merancang hedge besar + hedge kecil cadangan, atau “ladder hedge” mengikuti struktur market.
+
+    🛡️ 5. Second Opinion Institusional-Level (PERAN UTAMA ANDA)
+    Menilai apakah Action dalam trading user atau tanya jawab user benar dari sudut Risiko, Zona, Bias trend, MR, dan Floating structure.
+    Berikan label penilaian: AGREE, CAUTION, REVISE, atau REJECT.
+    Lalu berikan ActionSuggested dari teknik-teknik di atas.
     
     [ADDENDUM_ID]: COMPREHENSIVE_COIN_ANALYSIS
     [MODE]: SAFE_MERGE
@@ -1918,7 +2218,7 @@ async function generateAiReply(userMessage: string) {
     - Berikan rekomendasi yang jelas: ENTRY LONG, ENTRY SHORT, atau HOLD (Wait and See).
     - Sebutkan titik harga spesifik untuk Entry, Target Profit (TP), dan Invalidation (Stop Loss / Stop Hedge) berdasarkan struktur SMC.
 
-    Jika pengguna bertanya tentang posisi mereka, berikan saran spesifik untuk kaki Long dan Short sesuai strategi 2:1 di atas.
+    Jika pengguna bertanya tentang posisi mereka, berikan saran spesifik untuk kaki Long dan Short sesuai strategi Recovery by Zone (Supply–Demand–Pivot–StopHedge) di atas.
     Jadikan indikator "RangeFilter" pada TF_4H sebagai acuan UTAMA Anda untuk melihat tren.
     Gunakan TF_1H dan TF_15m (SMC, RSI) untuk mencari titik masuk/keluar (entry/exit) yang lebih presisi.
     
@@ -2032,68 +2332,236 @@ async function startServer() {
     }
   }
 
-  async function executeTrade(symbol: string, action: string, percentage: number, targetPrice?: number, stopHedgePrice?: number) {
+  function getValidationModeLabel() {
+    switch (VALIDATION_MODE) {
+      case "TEST_ORDER": return "🧪 TEST ORDER (Validation Only)";
+      case "DEMO_TRADING": return "🎮 DEMO TRADING (Sandbox)";
+      case "DRY_RUN": return "🤖 DRY RUN (Simulation)";
+      case "LIVE_TRADING": return "🔥 LIVE TRADING (Real Money)";
+      default: return "❓ UNKNOWN";
+    }
+  }
+
+  async function submitTestOrder(symbol: string, side: string, quantity: number, price?: number, params: any = {}) {
+    try {
+      const binanceSymbol = symbol.replace('/', '').split(':')[0];
+      
+      // Determine order type from params if possible, else infer
+      let orderType = params.type || (params.stopPrice ? (price ? 'STOP' : 'STOP_MARKET') : (price ? 'LIMIT' : 'MARKET'));
+      
+      // If it's a trigger order but type is still MARKET, fix it
+      if (params.stopPrice && orderType === 'MARKET') {
+          orderType = 'STOP_MARKET';
+      }
+
+      const testParams: any = {
+        symbol: binanceSymbol,
+        side: side.toUpperCase(),
+        type: orderType,
+        quantity: quantity,
+        ...params
+      };
+      
+      if (price && !testParams.price) {
+        testParams.price = price;
+      }
+      
+      if (orderType.includes('LIMIT') || orderType.includes('STOP') || orderType.includes('TAKE_PROFIT')) {
+        testParams.timeInForce = 'GTC';
+      }
+
+      console.log(`[TEST_ORDER PAYLOAD]`, JSON.stringify(testParams));
+      
+      const response = await (binance as any).fapiPrivatePostOrderTest(testParams);
+      return { success: true, data: response };
+    } catch (error: any) {
+      console.error(`[TEST_ORDER ERROR]`, error.message, error.body || "");
+      return { success: false, error: error.message || "Unknown error" };
+    }
+  }
+
+  async function executeTrade(rawSymbol: string, rawAction: string, rawPercentage: number, targetPrice?: number, stopHedgePrice?: number) {
+    const modeLabel = getValidationModeLabel();
+    console.log(`[EXECUTE_TRADE] Mode: ${VALIDATION_MODE} (${modeLabel})`);
+    
+    console.log("[EXEC INPUT BEFORE NORMALIZE]", { symbol: rawSymbol, action: rawAction, percentage: rawPercentage, targetPrice, stopHedgePrice });
+    
+    const normAction = normalizeActionInput(rawAction);
+    const action = normAction.action;
+    const symbol = normalizeSymbolInput(rawSymbol || normAction.extractedSymbol);
+    let percentage = rawPercentage || normAction.extractedPercentage || 100;
+    
+    // Use targetPrice from normalization if not explicitly provided
+    if (!targetPrice && normAction.extractedTargetPrice) {
+        targetPrice = normAction.extractedTargetPrice;
+        console.log(`[EXECUTE_TRADE] Using targetPrice from normalized input: ${targetPrice}`);
+    }
+    
+    console.log("[EXEC INPUT AFTER NORMALIZE]", { symbol, action, percentage });
+    
+    if (!action || !symbol) {
+        return `❌ Unsupported action after normalization: ${rawAction} ${rawSymbol}`;
+    }
+
+    const activeClient = VALIDATION_MODE === "DEMO_TRADING" ? binanceDemo : binance;
+
     if (!BINANCE_API_KEY || !BINANCE_API_SECRET) return "❌ API Keys missing.";
     try {
       const base = symbol.split('/')[0].split(':')[0];
-      const fullSymbol = `${base}/USDT:USDT`;
+      const fullSymbol = `${base}/USDT:USDT`;   // format CCXT
+      const binanceSymbolId = `${base}USDT`;    // format raw Binance
 
-      const ticker = await binance.fetchTicker(fullSymbol);
-      const currentPrice = ticker.last;
-      if (!currentPrice) throw new Error("Could not fetch price");
-
-      // DETECT HEDGE MODE (Best Effort)
-      let hasHedgeMode = false;
-      try {
-        const response = await binance.fapiPrivateGetPositionSideDual();
-        if (response && (response.dualSidePosition === true || response.dualSidePosition === 'true')) {
-            hasHedgeMode = true;
-        }
-      } catch (modeErr) {
-        // Fallback inference
-        const positions = await binance.fetchPositions();
-        hasHedgeMode = positions.some((p: any) => p.side === 'long' || p.side === 'short');
+      const ticker = await activeClient.fetchTicker(fullSymbol);
+      const currentPrice = Number(ticker?.last || 0);
+      if (!currentPrice || currentPrice <= 0) {
+        throw new Error("Could not fetch valid market price");
       }
 
-      const positions = await binance.fetchPositions();
-      // In One-Way mode, positions might not have 'long'/'short' side, just 'both' or implicit.
-      // We filter loosely to find relevant positions.
-      const longPos  = positions.find((p:any)=>p.symbol===fullSymbol && p.side==='long' && p.contracts>0) 
-                      || positions.find((p:any)=>p.symbol===fullSymbol && p.side==='both' && parseFloat(p.info.positionAmt) > 0);
-      
-      const shortPos = positions.find((p:any)=>p.symbol===fullSymbol && p.side==='short' && p.contracts>0)
-                      || positions.find((p:any)=>p.symbol===fullSymbol && p.side==='both' && parseFloat(p.info.positionAmt) < 0);
+      // 1) DETEKSI MODE POSISI DARI ENDPOINT RESMI
+      let hasHedgeMode = false;
+      try {
+        const modeResp = await activeClient.fapiPrivateGetPositionSideDual();
+        hasHedgeMode =
+          modeResp?.dualSidePosition === true ||
+          modeResp?.dualSidePosition === 'true';
+      } catch (err: any) {
+        addLog(`Failed to fetch position side dual: ${err.message}`);
+        // Fallback inference if API fails
+        const positions = await activeClient.fetchPositions();
+        hasHedgeMode = positions.some((p: any) => p.info && (p.info.positionSide === 'LONG' || p.info.positionSide === 'SHORT'));
+      }
 
-      const longQty  = longPos  ? Math.abs(longPos.contracts)  : 0;
-      const shortQty = shortPos ? Math.abs(shortPos.contracts) : 0;
+      // 2) AMBIL RULES SIMBOL DARI exchangeInfo
+      const exInfo = await activeClient.fapiPublicGetExchangeInfo();
+      const symbolInfo = exInfo?.symbols?.find((s: any) => s.symbol === binanceSymbolId);
+      if (!symbolInfo) {
+        throw new Error(`Symbol rules not found for ${binanceSymbolId}`);
+      }
 
-      let side: 'buy'|'sell'|undefined;
-      let targetLeg: 'LONG'|'SHORT'|undefined; // The logical leg we are affecting
+      const getFilter = (type: string) =>
+        (symbolInfo.filters || []).find((f: any) => f.filterType === type);
+
+      const lot = getFilter("LOT_SIZE") || {};
+      const marketLot = getFilter("MARKET_LOT_SIZE") || {};
+      const minNotionalFilter = getFilter("MIN_NOTIONAL") || {};
+
+      const stepSizeMarket = Number(marketLot.stepSize || lot.stepSize || 0);
+      const minQtyMarket   = Number(marketLot.minQty || lot.minQty || 0);
+
+      const stepSizeLimit  = Number(lot.stepSize || marketLot.stepSize || 0);
+      const minQtyLimit    = Number(lot.minQty || marketLot.minQty || 0);
+
+      const stepSize = targetPrice ? stepSizeLimit : stepSizeMarket;
+      const minQty   = targetPrice ? minQtyLimit   : minQtyMarket;
+      const minNotional = Number(minNotionalFilter.notional || 0);
+
+      if (!stepSize || stepSize <= 0) {
+        throw new Error(`Invalid stepSize for ${binanceSymbolId}`);
+      }
+
+      // 3) AMBIL POSISI LIVE DARI positionRisk
+      let posRows: any[] = [];
+      try {
+        if (typeof (activeClient as any).fapiPrivateV3GetPositionRisk === "function") {
+          const raw = await (activeClient as any).fapiPrivateV3GetPositionRisk({ symbol: binanceSymbolId });
+          posRows = Array.isArray(raw) ? raw : [raw];
+        } else if (typeof (activeClient as any).fapiPrivateV2GetPositionRisk === "function") {
+          const raw = await (activeClient as any).fapiPrivateV2GetPositionRisk({ symbol: binanceSymbolId });
+          posRows = Array.isArray(raw) ? raw : [raw];
+        } else {
+          // fallback terakhir
+          const fallback = await activeClient.fetchPositions([fullSymbol]);
+          posRows = (fallback || []).map((p: any) => ({
+            symbol: binanceSymbolId,
+            positionSide:
+              p.side === "long" ? "LONG" :
+              p.side === "short" ? "SHORT" : "BOTH",
+            positionAmt:
+              p.side === "short"
+                ? String(-Math.abs(Number(p.contracts || 0)))
+                : String(Math.abs(Number(p.contracts || 0))),
+            entryPrice: String(p.entryPrice || 0),
+            markPrice: String(currentPrice),
+            notional: String(p.notional || 0),
+          }));
+        }
+      } catch (err) {
+        throw new Error("Failed to fetch live position risk");
+      }
+
+      const findLongRow = () => {
+        if (hasHedgeMode) {
+          return posRows.find((r: any) => r.symbol === binanceSymbolId && r.positionSide === "LONG");
+        }
+        return posRows.find(
+          (r: any) =>
+            r.symbol === binanceSymbolId &&
+            r.positionSide === "BOTH" &&
+            Number(r.positionAmt || 0) > 0
+        );
+      };
+
+      const findShortRow = () => {
+        if (hasHedgeMode) {
+          return posRows.find((r: any) => r.symbol === binanceSymbolId && r.positionSide === "SHORT");
+        }
+        return posRows.find(
+          (r: any) =>
+            r.symbol === binanceSymbolId &&
+            r.positionSide === "BOTH" &&
+            Number(r.positionAmt || 0) < 0
+        );
+      };
+
+      const longRow = findLongRow();
+      const shortRow = findShortRow();
+
+      const longQty = longRow ? Math.abs(Number(longRow.positionAmt || 0)) : 0;
+      const shortQty = shortRow ? Math.abs(Number(shortRow.positionAmt || 0)) : 0;
+
+      let side: "buy" | "sell" | undefined;
+      let targetLeg: "LONG" | "SHORT" | undefined;
       let quantity = 0;
-      let msgAction = '';
-      const executionType = targetPrice ? 'LIMIT' : 'MARKET';
-      
+      let msgAction = "";
+
       if (isNaN(percentage) || percentage <= 0) percentage = 100;
 
-      // --- ACTION LOGIC ---
-      if (action === 'HEDGE_ON' || action === 'HO') {
+      // 4) LOGIKA AKSI
+      if (action === "HEDGE_ON" || action === "HO") {
         const ok = await ensureMrGuardForAdd();
         if (!ok.ok) return ok.msg!;
         if (longQty === 0 && shortQty === 0) return `❌ No open positions to hedge.`;
 
         if (longQty >= shortQty) {
-          side = 'sell'; targetLeg = 'SHORT';
-          const needHedgeToLock = Math.max(0, longQty - shortQty);
-          quantity = needHedgeToLock > 0 ? needHedgeToLock : (0.25 * longQty);
-          msgAction = `HEDGE_ON: add SHORT to lock/cover LONG`;
+          side = "sell";
+          targetLeg = "SHORT";
+          const delta = Math.max(0, longQty - shortQty);
+          quantity = delta > 0 ? delta : (0.25 * longQty);
+          msgAction = "HEDGE_ON: add SHORT to lock/cover LONG";
         } else {
-          side = 'buy'; targetLeg = 'LONG';
-          const needHedgeToLock = Math.max(0, shortQty - longQty);
-          quantity = needHedgeToLock > 0 ? needHedgeToLock : (0.25 * shortQty);
-          msgAction = `HEDGE_ON: add LONG to lock/cover SHORT`;
+          side = "buy";
+          targetLeg = "LONG";
+          const delta = Math.max(0, shortQty - longQty);
+          quantity = delta > 0 ? delta : (0.25 * shortQty);
+          msgAction = "HEDGE_ON: add LONG to lock/cover SHORT";
         }
-      }
-      else if (action === 'UNLOCK' || action === 'UL') {
+      } else if (action === "LOCK_NEUTRAL" || action === "LN") {
+        if (longQty === 0 && shortQty === 0) return `❌ No open positions to lock.`;
+        
+        if (longQty > shortQty) {
+          side = "sell";
+          targetLeg = "SHORT";
+          quantity = longQty - shortQty;
+          msgAction = "LOCK_NEUTRAL: add SHORT to match LONG";
+        } else if (shortQty > longQty) {
+          side = "buy";
+          targetLeg = "LONG";
+          quantity = shortQty - longQty;
+          msgAction = "LOCK_NEUTRAL: add LONG to match SHORT";
+        } else {
+          return `✅ <b>LOCK_NEUTRAL</b>\n\nPosition is already 1:1 neutral for ${fullSymbol}.`;
+        }
+      } else if (action === 'UNLOCK' || action === 'UL') {
         if (longQty === 0 && shortQty === 0) return `❌ No positions to unlock.`;
         if (longQty <= shortQty && longQty > 0) {
           side = 'sell'; targetLeg = 'LONG';
@@ -2102,8 +2570,7 @@ async function startServer() {
           side = 'buy'; targetLeg = 'SHORT';
           quantity = shortQty; msgAction = `UNLOCK: close SHORT (wrong leg)`;
         } else return `ℹ️ Already effectively unlocked.`;
-      }
-      else if (action === 'ROLE' || action === 'RR') {
+      } else if (action === 'ROLE' || action === 'RR') {
         const ok = await ensureMrGuardForAdd();
         if (!ok.ok) return ok.msg!;
         if (longQty > shortQty && longQty > 0) {
@@ -2113,126 +2580,372 @@ async function startServer() {
           side = 'buy'; targetLeg = 'SHORT';
           quantity = shortQty; msgAction = `ROLE: close SHORT (promote LONG)`;
         } else return `❌ Role failed: cannot determine primary.`;
-      }
-      else if (action === 'REDUCE_LONG' || action === 'RL') {
-        if (!longPos) return `❌ No LONG position to reduce for ${fullSymbol}`;
-        side='sell'; targetLeg='LONG';
-        quantity = longQty * (percentage/100);
-        msgAction = `Reducing LONG by ${percentage}%`;
-      }
-      else if (action === 'REDUCE_SHORT' || action === 'RS') {
-        if (!shortPos) return `❌ No SHORT position to reduce for ${fullSymbol}`;
-        side='buy'; targetLeg='SHORT';
-        quantity = shortQty * (percentage/100);
-        msgAction = `Reducing SHORT by ${percentage}%`;
-      }
-      else if (action === 'ADD_LONG' || action === 'AL') {
+      } else if (action === "REDUCE_LONG" || action === "RL") {
+        side = "sell";
+        targetLeg = "LONG";
+        quantity = longQty * (percentage / 100);
+        msgAction = `REDUCE_LONG ${percentage}%`;
+      } else if (action === "REDUCE_SHORT" || action === "RS") {
+        side = "buy";
+        targetLeg = "SHORT";
+        quantity = shortQty * (percentage / 100);
+        msgAction = `REDUCE_SHORT ${percentage}%`;
+      } else if (action === "ADD_LONG" || action === "AL") {
         const ok = await ensureMrGuardForAdd();
         if (!ok.ok) return ok.msg!;
-        side='buy'; targetLeg='LONG';
+        side = "buy";
+        targetLeg = "LONG";
         quantity = 15 / (targetPrice || currentPrice);
-        msgAction = `Adding to LONG (15 USDT)`;
-      }
-      else if (action === 'ADD_SHORT' || action === 'AS') {
+        msgAction = "ADD_LONG fixed 15 USDT";
+      } else if (action === "ADD_SHORT" || action === "AS") {
         const ok = await ensureMrGuardForAdd();
         if (!ok.ok) return ok.msg!;
-        side='sell'; targetLeg='SHORT';
+        side = "sell";
+        targetLeg = "SHORT";
         quantity = 15 / (targetPrice || currentPrice);
-        msgAction = `Adding to SHORT (15 USDT)`;
-      }
-      else if (action === 'LOCK_NEUTRAL' || action === 'LN') {
-        if (longQty > shortQty) {
-          side='sell'; targetLeg='SHORT';
-          quantity = longQty - shortQty;
-          msgAction = `Locking Neutral: Adding SHORT`;
-        } else if (shortQty > longQty) {
-          side='buy'; targetLeg='LONG';
-          quantity = shortQty - longQty;
-          msgAction = `Locking Neutral: Adding LONG`;
-        } else return `❌ Position is already 1:1 Neutral.`;
-      }
-      else if (action === 'HOLD') {
+        msgAction = "ADD_SHORT fixed 15 USDT";
+      } else if (action === "TAKE_PROFIT" || action === "TP") {
+        if (longQty > 0 && (!shortQty || longQty >= shortQty)) {
+          side = "sell";
+          targetLeg = "LONG";
+          quantity = longQty * (percentage / 100);
+          msgAction = `TAKE_PROFIT LONG ${percentage}%`;
+        } else if (shortQty > 0) {
+          side = "buy";
+          targetLeg = "SHORT";
+          quantity = shortQty * (percentage / 100);
+          msgAction = `TAKE_PROFIT SHORT ${percentage}%`;
+        } else {
+          return `❌ No open position for TAKE_PROFIT`;
+        }
+      } else if (action === 'HOLD') {
         return `✅ <b>HOLD</b>\n\nNo trade executed for ${fullSymbol}.`;
-      }
-      else if (action === 'TAKE_PROFIT' || action === 'TP') {
-         // TP Logic simplified for brevity, assuming standard TP
-         if (longQty > 0 && (!shortQty || longQty >= shortQty)) {
-             side='sell'; targetLeg='LONG'; quantity = longQty * (percentage/100); msgAction = `TP LONG`;
-         } else if (shortQty > 0) {
-             side='buy'; targetLeg='SHORT'; quantity = shortQty * (percentage/100); msgAction = `TP SHORT`;
-         } else return `❌ No position to TP.`;
-      }
-      else {
-        return `❌ Unknown action: ${action}`;
+      } else {
+        return `❌ Unsupported action: ${action}`;
       }
 
-      // --- PLACEMENT WITH RETRY ---
-      const placeOrder = async (useHedgeMode: boolean): Promise<any> => {
-        if (!side || !targetLeg) throw new Error("Invalid trade parameters");
-        quantity = parseFloat(quantity.toFixed(4));
-        if (quantity <= 0) throw new Error("Quantity too small");
+      if (!side || !targetLeg) {
+        throw new Error("Invalid trade parameters");
+      }
 
+      // 5) NORMALISASI QTY SESUAI RULES BINANCE
+      const isReducing = ["REDUCE_LONG", "RL", "REDUCE_SHORT", "RS", "UNLOCK", "UL", "ROLE", "RR", "TAKE_PROFIT", "TP"].includes(action);
+
+      const openQtyAbs = targetLeg === "LONG" ? longQty : shortQty;
+      const refRow = targetLeg === "LONG" ? longRow : shortRow;
+      const refPrice = Number(targetPrice || refRow?.markPrice || refRow?.entryPrice || currentPrice || 0);
+
+      if (!refPrice || refPrice <= 0) {
+        throw new Error("Unable to determine reference price");
+      }
+
+      function decimalsFromStep(step: number): number {
+        const s = step.toString();
+        return s.includes(".") ? s.split(".")[1].length : 0;
+      }
+
+      function floorToStep(value: number, step: number): number {
+        const precision = decimalsFromStep(step);
+        return Number((Math.floor(value / step) * step).toFixed(precision));
+      }
+
+      function ceilToStep(value: number, step: number): number {
+        const precision = decimalsFromStep(step);
+        return Number((Math.ceil(value / step) * step).toFixed(precision));
+      }
+
+      if (isReducing) {
+        // Jangan pernah melebihi posisi yang sedang terbuka
+        quantity = Math.min(quantity, openQtyAbs);
+      }
+
+      let qty = floorToStep(quantity, stepSize);
+
+      if (qty <= 0) {
+        throw new Error(`PARTIAL_ROUNDED_TO_ZERO symbol=${fullSymbol} leg=${targetLeg} requestedQty=${quantity} minQty=${minQty} stepSize=${stepSize}`);
+      } else if (qty < minQty) {
+        throw new Error(`MIN_QTY_NOT_REACHED symbol=${fullSymbol} leg=${targetLeg} requestedQty=${quantity} normalizedQty=${qty} minQty=${minQty} stepSize=${stepSize}`);
+      }
+
+      let notional = qty * refPrice;
+      const notionalBefore = notional;
+      let adjustmentReason = "NONE";
+
+      // Jika reduce/TP terlalu kecil, coba naikan ke min executable qty
+      if (minNotional > 0 && notional < minNotional) {
+        if (REDUCE_POLICY === "STRICT_PARTIAL") {
+          throw new Error(`PARTIAL_TOO_SMALL qty=${qty} notional=${notional.toFixed(8)} minNotional=${minNotional}`);
+        } else if (REDUCE_POLICY === "FORCE_MIN_EXEC") {
+          const minExecQty = ceilToStep(minNotional / refPrice, stepSize);
+
+          if (isReducing && minExecQty <= openQtyAbs && minExecQty >= minQty) {
+            qty = minExecQty;
+            notional = qty * refPrice;
+            adjustmentReason = "UPSCALED_TO_MIN_EXECUTABLE";
+          } else {
+            throw new Error(
+              `DUST_REDUCE symbol=${fullSymbol} leg=${targetLeg} openQty=${openQtyAbs} refPrice=${refPrice} notional=${notional.toFixed(8)} minNotional=${minNotional}`
+            );
+          }
+        }
+      }
+
+      // 6) HELPERS FOR ORDER PLACEMENT
+      const buildParams = (useHedgeMode: boolean, determinedOrderType: string) => {
         const params: any = {};
         if (useHedgeMode) {
-            params.positionSide = targetLeg; // 'LONG' or 'SHORT'
-            // Explicitly set reduceOnly to false for adding positions to avoid ambiguity
-            if (action === 'LOCK_NEUTRAL' || action === 'LN' || action === 'ADD_LONG' || action === 'ADD_SHORT' || action === 'HEDGE_ON') {
-                params.reduceOnly = false;
-            }
+          params.positionSide = targetLeg;
         } else {
-            // One-Way Mode: do NOT send positionSide
-            // For One-Way, if we are reducing, we might need reduceOnly=true?
-            // But usually Binance handles it by side.
+          if (isReducing) {
+            params.reduceOnly = true;
+          }
         }
 
-        console.log(`[EXEC] ${fullSymbol} ${side} ${quantity} | Mode: ${useHedgeMode?'Hedge':'OneWay'} | Params:`, params);
+        if (stopHedgePrice) {
+          params.stopPrice = stopHedgePrice;
+        } else if (targetPrice && (determinedOrderType.includes('STOP') || determinedOrderType.includes('TAKE_PROFIT'))) {
+          params.stopPrice = targetPrice;
+        }
 
-        return targetPrice
-          ? await binance.createLimitOrder(fullSymbol, side!, quantity, targetPrice, params)
-          : await binance.createMarketOrder(fullSymbol, side!, quantity, params);
+        return params;
       };
 
-      try {
-        // Attempt 1: Use detected mode
-        let order;
-        try {
-            order = await placeOrder(hasHedgeMode);
-        } catch (err: any) {
-            console.warn(`[ATTEMPT 1 FAILED] Mode: ${hasHedgeMode} | Error: ${err.message}`);
-            // Check for Position Mode Mismatch (-4061)
-            if (err.message && err.message.includes("-4061")) {
-                console.warn(`[RETRY] Caught -4061. Retrying with opposite mode (Hedge: ${!hasHedgeMode})...`);
-                // Retry with opposite mode
-                order = await placeOrder(!hasHedgeMode);
-            } else {
-                throw err; // Re-throw other errors
-            }
-        }
-
-        let msg = `✅ <b>${executionType} ORDER SUCCESS!</b>\n\n${msgAction}\nSymbol: ${fullSymbol}\nQty: ${order.amount}\nPrice: ${order.price || order.average || currentPrice}`;
-        
-        // Stop Hedge Logic (Optional)
+      const determineOrderType = () => {
+        let orderType = 'MARKET';
         if (stopHedgePrice) {
-             // ... (Stop logic omitted for brevity, can be added if needed)
-             msg += `\n\n(Stop-Lock not set in this retry-optimized block)`;
+          orderType = targetPrice ? 'STOP' : 'STOP_MARKET';
+        } else if (targetPrice) {
+          if (isReducing || action === 'TP') {
+            if (side === 'sell') {
+              orderType = targetPrice > currentPrice ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
+            } else {
+              orderType = targetPrice < currentPrice ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
+            }
+          } else {
+            if (side === 'buy') {
+              orderType = targetPrice < currentPrice ? 'LIMIT' : 'STOP_MARKET';
+            } else {
+              orderType = targetPrice > currentPrice ? 'LIMIT' : 'STOP_MARKET';
+            }
+          }
         }
-        return msg;
+        return orderType;
+      };
 
-      } catch (e:any) {
-        console.error("Trade Execution Error:", e);
-        if (e.message && (e.message.includes("-2015") || e.message.includes("Invalid API-key"))) {
+      const placeOrderWithClient = async (useHedgeMode: boolean) => {
+        const orderType = determineOrderType();
+        const params = buildParams(useHedgeMode, orderType);
+        
+        addLog(
+          `[EXEC_TRY] [${VALIDATION_MODE}] ${fullSymbol} action=${action} ${side} qty=${qty} ` +
+          `type=${orderType} stopPrice=${params.stopPrice || 'N/A'} targetPrice=${targetPrice || 'Market'} ` +
+          `refPrice=${refPrice} currentPrice=${currentPrice} notional=${notional.toFixed(4)} ` +
+          `HedgeMode=${useHedgeMode} Params=${JSON.stringify(params)}`
+        );
+
+        if (orderType === 'STOP_MARKET' || orderType === 'STOP' || orderType === 'TAKE_PROFIT_MARKET') {
+          const price = orderType === 'STOP' ? targetPrice : undefined;
+          return await activeClient.createOrder(fullSymbol, orderType, side!, qty, price, params);
+        } else if (orderType === 'LIMIT') {
+          return await activeClient.createLimitOrder(fullSymbol, side!, qty, targetPrice, params);
+        } else {
+          return await activeClient.createMarketOrder(fullSymbol, side!, qty, undefined, params);
+        }
+      };
+
+      if (VALIDATION_MODE === "DRY_RUN") {
+        const orderTypeDisplay = determineOrderType();
+        const params = buildParams(hasHedgeMode, orderTypeDisplay);
+        
+        return (
+          `✅ <b>DRY RUN ORDER</b>\n\n` +
+          `Action: ${msgAction}\n` +
+          `Symbol: ${fullSymbol}\n` +
+          `Side: ${side!.toUpperCase()}\n` +
+          `Leg: ${targetLeg}\n` +
+          `Requested Qty: ${quantity}\n` +
+          `Normalized Qty: ${qty}\n` +
+          `Ref Price: ${refPrice}\n` +
+          `Current Price: ${currentPrice}\n` +
+          `Stop Price: ${params.stopPrice || 'N/A'}\n` +
+          `Target Price: ${targetPrice || 'Market'}\n` +
+          `Notional Before: ${notionalBefore.toFixed(8)}\n` +
+          `Notional After: ${notional.toFixed(8)}\n` +
+          `MinNotional: ${minNotional}\n` +
+          `AdjustmentReason: ${adjustmentReason}\n` +
+          `Type: ${orderTypeDisplay}\n` +
+          `Note: No live order sent (DRY_RUN mode active)`
+        );
+      }
+
+      if (VALIDATION_MODE === "TEST_ORDER") {
+        const orderTypeTest = determineOrderType();
+        const params = buildParams(hasHedgeMode, orderTypeTest);
+        params.type = orderTypeTest;
+        
+        const testResult = await submitTestOrder(fullSymbol, side!, qty, targetPrice, params);
+        
+        if (testResult.success) {
+          return (
+            `✅ <b>TEST ORDER ACCEPTED</b>\n\n` +
+            `Action: ${msgAction}\n` +
+            `Symbol: ${fullSymbol}\n` +
+            `Side: ${side!.toUpperCase()}\n` +
+            `Leg: ${targetLeg}\n` +
+            `Qty: ${qty}\n` +
+            `Notional≈ ${notional.toFixed(4)} USDT\n` +
+            `Stop Price: ${params.stopPrice || 'N/A'}\n` +
+            `Target Price: ${targetPrice || 'Market'}\n` +
+            `Type: ${orderTypeTest}\n\n` +
+            `ℹ️ <i>Order validated by Binance /fapi/v1/order/test endpoint. No actual trade executed.</i>`
+          );
+        } else {
+          return (
+            `❌ <b>TEST ORDER REJECTED</b>\n\n` +
+            `Action: ${msgAction}\n` +
+            `Symbol: ${fullSymbol}\n` +
+            `Error: ${escapeHtml(testResult.error)}\n\n` +
+            `Diagnostics:\n` +
+            `- Qty: ${qty}\n` +
+            `- Price: ${refPrice}\n` +
+            `- StopPrice: ${params.stopPrice || 'N/A'}\n` +
+            `- TargetPrice: ${targetPrice || 'Market'}\n` +
+            `- Notional: ${notional.toFixed(4)}\n` +
+            `- MinNotional: ${minNotional}`
+          );
+        }
+      }
+
+      try {
+        let order: any;
+        
+        if (VALIDATION_MODE === "DEMO_TRADING") {
+            if (!BINANCE_DEMO_API_KEY || !BINANCE_DEMO_API_SECRET) {
+                return `❌ <b>DEMO TRADING CONFIG ERROR</b>\n\nReason: BINANCE_DEMO_API_KEY/SECRET is missing in environment variables.`;
+            }
+            console.log(`[DEMO_TRADING EXEC] Using Binance Demo Trading Client`);
+        }
+
+        try {
+          order = await placeOrderWithClient(hasHedgeMode);
+        } catch (err: any) {
+          const msg = String(err?.message || err?.msg || "");
+          addLog(`[EXEC_ERR] 1st try failed: ${msg}`);
+          if (msg.includes("-4061") || msg.toLowerCase().includes("position side does not match")) {
+            const modeResp2 = await activeClient.fapiPrivateGetPositionSideDual();
+            const actualHedgeMode = modeResp2?.dualSidePosition === true || modeResp2?.dualSidePosition === "true";
+            addLog(`[EXEC_RETRY] actualHedgeMode=${actualHedgeMode}`);
+            order = await placeOrderWithClient(actualHedgeMode);
+          } else {
+            throw err;
+          }
+        }
+  
+        const successLabel = VALIDATION_MODE === "DEMO_TRADING" ? "DEMO TRADING ORDER VALIDATED" : "ORDER SUCCESS!";
+        const finalOrderType = determineOrderType();
+        return (
+          `✅ <b>${successLabel}</b>\n\n` +
+          `Action: ${msgAction}\n` +
+          `Symbol: ${fullSymbol}\n` +
+          `Side: ${side!.toUpperCase()}\n` +
+          `Leg: ${targetLeg}\n` +
+          `Qty: ${order.amount}\n` +
+          `Notional≈ ${notional.toFixed(4)} USDT\n` +
+          `Type: ${finalOrderType}\n` +
+          `Price: ${targetPrice || 'Market'}\n` +
+          `Stop: ${stopHedgePrice || (finalOrderType.includes('STOP') || finalOrderType.includes('TAKE_PROFIT') ? targetPrice : 'N/A')}\n` +
+          `Validation Mode: ${VALIDATION_MODE}\n` +
+          (VALIDATION_MODE === "DEMO_TRADING" ? `Note: Sent to Binance Demo Trading environment, not live production.` : "")
+        );
+
+      } catch (e: any) {
+        const msg = String(e?.message || e || "");
+        if (msg.includes("-4164") || msg.toLowerCase().includes("notional")) {
+          return (
+            `❌ <b>NOTIONAL ERROR (-4164)</b>\n\n` +
+            `Action: ${action}\n` +
+            `Symbol: ${fullSymbol}\n` +
+            `Leg: ${targetLeg}\n` +
+            `Requested Qty: ${quantity}\n` +
+            `Normalized Qty: ${qty}\n` +
+            `Ref Price: ${refPrice}\n` +
+            `Notional≈ ${notional.toFixed(8)}\n` +
+            `MinNotional: ${minNotional}\n` +
+            `OpenQty: ${openQtyAbs}\n\n` +
+            `Hint: TP/Reduce terlalu kecil untuk rule Binance atau posisi terlalu kecil (dust).`
+          );
+        }
+        if (msg.includes("-2015") || msg.includes("Invalid API-key")) {
             return `❌ <b>AUTHENTICATION ERROR</b>\n\nBinance API rejected the request.\nReason: Invalid API-key, IP, or permissions.`;
         }
-        if (e.message && e.message.includes("-4061")) {
-             return `❌ <b>POSITION MODE STUCK</b>\n\nFailed to execute even after retry.\nDetected Mode: ${hasHedgeMode ? 'Hedge' : 'One-Way'}\nPlease manually check your Position Mode settings on Binance.`;
-        }
-        return `❌ <b>EXECUTION FAILED</b>\n\n${escapeHtml(e.message)}`;
+        return `❌ <b>EXECUTION FAILED</b>\n\nMode: ${hasHedgeMode ? 'Hedge' : 'One-Way'}\nError: ${escapeHtml(msg)}`;
       }
+
     } catch (err: any) {
       console.error("Critical Error:", err);
-      return `❌ <b>ERROR</b>\n\n${escapeHtml(err.message || String(err))}`;
+      const errMsg = err.message || String(err);
+      
+      if (errMsg.startsWith("DUST_REDUCE")) {
+        const match = errMsg.match(/symbol=([^ ]+) leg=([^ ]+) openQty=([^ ]+) refPrice=([^ ]+) notional=([^ ]+) minNotional=([^ ]+)/);
+        if (match) {
+          return `❌ <b>DUST REDUCE</b>\n` +
+                 `Symbol: ${match[1]}\n` +
+                 `Leg: ${match[2]}\n` +
+                 `OpenQty: ${match[3]}\n` +
+                 `Ref Price: ${match[4]}\n` +
+                 `Notional: ${match[5]}\n` +
+                 `MinNotional: ${match[6]}\n` +
+                 `Reason: Full posisi yang tersisa masih di bawah minimum executable Binance.`;
+        }
+      } else if (errMsg.startsWith("PARTIAL_TOO_SMALL")) {
+        return `❌ <b>PARTIAL TOO SMALL</b>\n\n${escapeHtml(errMsg)}\nReason: REDUCE_POLICY is STRICT_PARTIAL.`;
+      } else if (errMsg.startsWith("PARTIAL_ROUNDED_TO_ZERO")) {
+        const match = errMsg.match(/symbol=([^ ]+) leg=([^ ]+) requestedQty=([^ ]+) minQty=([^ ]+) stepSize=([^ ]+)/);
+        if (match) {
+          return `❌ <b>PARTIAL ROUNDED TO ZERO</b>\n` +
+                 `Symbol: ${match[1]}\n` +
+                 `Leg: ${match[2]}\n` +
+                 `Requested Qty: ${match[3]}\n` +
+                 `Normalized Qty: 0\n` +
+                 `MinQty: ${match[4]}\n` +
+                 `StepSize: ${match[5]}\n` +
+                 `Reason: ukuran order setelah normalisasi stepSize menjadi 0 dan tidak memenuhi minimum quantity Binance.`;
+        }
+      } else if (errMsg.startsWith("MIN_QTY_NOT_REACHED")) {
+        const match = errMsg.match(/symbol=([^ ]+) leg=([^ ]+) requestedQty=([^ ]+) normalizedQty=([^ ]+) minQty=([^ ]+) stepSize=([^ ]+)/);
+        if (match) {
+          return `❌ <b>MIN QTY NOT REACHED</b>\n` +
+                 `Symbol: ${match[1]}\n` +
+                 `Leg: ${match[2]}\n` +
+                 `Requested Qty: ${match[3]}\n` +
+                 `Normalized Qty: ${match[4]}\n` +
+                 `MinQty: ${match[5]}\n` +
+                 `StepSize: ${match[6]}\n` +
+                 `Reason: ukuran order lebih kecil dari minimum quantity Binance untuk simbol ini.`;
+        }
+      }
+      
+      return `❌ <b>ERROR</b>\n\n${escapeHtml(errMsg)}`;
     }
   }
+
+const processedEvents = new Map<string, number>();
+
+function isDuplicateEvent(key: string): boolean {
+    const now = Date.now();
+    // Clean up old events (older than 60s)
+    for (const [k, timestamp] of processedEvents.entries()) {
+        if (now - timestamp > 60000) {
+            processedEvents.delete(k);
+        }
+    }
+    
+    if (processedEvents.has(key)) {
+        return true;
+    }
+    processedEvents.set(key, now);
+    return false;
+}
 
 async function pollTelegram() {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -2246,42 +2959,79 @@ async function pollTelegram() {
     const res = await axios.get(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=10`);
     const updates = res.data.result;
     if (updates && updates.length > 0) {
+      // 1) Advance offset immediately to prevent other instances from processing
       for (const update of updates) {
-        lastUpdateId = update.update_id;
-        
+        lastUpdateId = Math.max(lastUpdateId, update.update_id);
+      }
+      // Acknowledge to Telegram immediately
+      axios.get(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=0`).catch(() => {});
+      
+      // 2) Process updates
+      for (const update of updates) {
+        // De-dup by update_id
+        if (isDuplicateEvent(`update_${update.update_id}`)) {
+            console.log(`[TG DEDUP] Skipping duplicate update_id: ${update.update_id}`);
+            continue;
+        }
+
         // Handle Callback Queries (Button Clicks)
         if (update.callback_query) {
             const callback = update.callback_query;
-            const rawData = callback.data; // "a|s|p|tp|sh"
-            const parts = rawData.split('|');
+            const rawData = callback.data;
             
-            const data = {
-                a: parts[0],
-                s: parts[1],
-                p: parseInt(parts[2]),
-                tp: parts[3] ? parseFloat(parts[3]) : undefined,
-                sh: parts[4] ? parseFloat(parts[4]) : undefined
-            };
+            // De-dup by callback data + message id
+            const dedupKey = `cb_${callback.message?.message_id}_${rawData}`;
+            if (isDuplicateEvent(dedupKey)) {
+                console.log(`[TG DEDUP] Skipping duplicate callback: ${dedupKey}`);
+                await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+                    callback_query_id: callback.id,
+                    text: `Already processing...`
+                }).catch(() => {});
+                continue;
+            }
+
+            const parsed = parseTelegramCallbackData(rawData);
+            console.log(`\n--- TG EVENT ---`);
+            console.log(`[TG UPDATE ID] ${update.update_id}`);
+            console.log(`[TG CALLBACK ID] ${callback.id}`);
+            console.log(`[TG MESSAGE ID] ${callback.message?.message_id}`);
+            console.log(`[TG EXEC TRACE] Executing ${parsed.action} on ${parsed.symbol} via Callback`);
+            console.log(`----------------\n`);
+            
+            if (!parsed.action || !parsed.symbol) {
+                await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+                    callback_query_id: callback.id,
+                    text: `❌ Error: Invalid action or symbol in callback data`,
+                    show_alert: true
+                });
+                continue;
+            }
             
             // Acknowledge callback to stop loading animation
             await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
                 callback_query_id: callback.id,
-                text: `Processing ${data.a} on ${data.s}...`
+                text: `Processing ${parsed.action} on ${parsed.symbol}...`
             });
 
             // Execute Trade with Target Price and Stop Hedge
-            const resultMsg = await executeTrade(data.s, data.a, data.p, data.tp, data.sh);
+            const resultMsg = await executeTrade(parsed.symbol, parsed.action, parsed.percentage || 100, parsed.targetPrice, parsed.stopHedgePrice);
             
             // Send Result
             await sendTelegramMessage(resultMsg);
-        }
 
         // Handle Text Messages
-        if (update.message && update.message.text) {
+        } else if (update.message && update.message.text) {
           const chatId = update.message.chat.id.toString();
           if (chatId === TELEGRAM_CHAT_ID) {
             const userText = update.message.text.trim();
             
+            // De-dup by message id
+            const dedupKey = `msg_${update.message.message_id}`;
+            if (isDuplicateEvent(dedupKey)) {
+                console.log(`[TG DEDUP] Skipping duplicate message: ${dedupKey}`);
+                continue;
+            }
+
             // Handle Admin Commands
             if (userText === '/rf_drift_status') {
                 const status = driftMonitor.getStatus();
@@ -2297,6 +3047,70 @@ async function pollTelegram() {
                                 `Last Check: ${new Date(status.last_check).toISOString()}`;
                     await sendTelegramMessage(msg);
                 }
+                continue;
+            }
+
+            if (userText === '/validation_mode') {
+                const modeLabel = (VALIDATION_MODE === "TEST_ORDER") ? "🧪 TEST ORDER (Validation Only)" : 
+                                  (VALIDATION_MODE === "DEMO_TRADING") ? "🎮 DEMO TRADING (Sandbox)" : 
+                                  (VALIDATION_MODE === "LIVE_TRADING") ? "🔥 LIVE TRADING (Real Money)" :
+                                  "🤖 DRY RUN (Simulation)";
+                await sendTelegramMessage(`🛡️ <b>Current Validation Mode:</b>\n\n${modeLabel}\n\nTo change, update <code>VALIDATION_MODE</code> in environment variables.`);
+                continue;
+            }
+
+            if (userText === '/demo_status') {
+                const hasKeys = !!(BINANCE_DEMO_API_KEY && BINANCE_DEMO_API_SECRET);
+                let msg = `🎮 <b>Binance Demo Trading Status</b>\n\n`;
+                msg += `Mode: ${VALIDATION_MODE}\n`;
+                msg += `Demo Enabled: ${VALIDATION_MODE === 'DEMO_TRADING' ? '✅ Yes' : '❌ No'}\n`;
+                msg += `API Keys: ${hasKeys ? '✅ Set' : '❌ Missing'}\n`;
+                msg += `DefaultType: future\n`;
+                
+                if (hasKeys) {
+                    try {
+                        const balance = await binanceDemo.fetchBalance();
+                        msg += `Connection: ✅ Success\n`;
+                        const usdtBalance = (balance.total as any)?.USDT || 0;
+                        msg += `USDT Balance: ${usdtBalance} USDT`;
+                    } catch (err: any) {
+                        msg += `Connection: ❌ Failed\n`;
+                        msg += `Error: ${escapeHtml(err.message)}`;
+                    }
+                } else {
+                    msg += `\n<i>Please set BINANCE_DEMO_API_KEY and BINANCE_DEMO_API_SECRET to use DEMO_TRADING mode.</i>`;
+                }
+                await sendTelegramMessage(msg);
+                continue;
+            }
+
+            if (userText.startsWith('/test_order')) {
+                const parts = userText.split(' ');
+                const symbol = parts[1] || 'BTC/USDT';
+                const percentage = parseInt(parts[2]) || 10;
+                
+                await sendTelegramMessage(`🧪 <b>Manual Test Order</b>\n\nSymbol: ${symbol}\nPercentage: ${percentage}%\n\nProcessing...`);
+                const result = await executeTrade(symbol, 'AL', percentage); // AL = ADD_LONG as a test
+                await sendTelegramMessage(result);
+                continue;
+            }
+
+            // Try parsing as trade command first
+            const parsedText = normalizeActionInput(userText);
+            if (parsedText.action && parsedText.extractedSymbol) {
+                console.log(`\n--- TG EVENT ---`);
+                console.log(`[TG UPDATE ID] ${update.update_id}`);
+                console.log(`[TG MESSAGE ID] ${update.message.message_id}`);
+                console.log(`[TG EXEC TRACE] Executing ${parsedText.action} on ${parsedText.extractedSymbol} via Text`);
+                console.log(`----------------\n`);
+                
+                const resultMsg = await executeTrade(
+                    parsedText.extractedSymbol, 
+                    parsedText.action, 
+                    parsedText.extractedPercentage || 100,
+                    parsedText.extractedTargetPrice
+                );
+                await sendTelegramMessage(resultMsg);
                 continue;
             }
 
@@ -2338,6 +3152,30 @@ async function pollTelegram() {
   setTimeout(pollTelegram, 3000);
 }
 
+  app.post('/api/debug-trade', async (req, res) => {
+    try {
+      const { symbol, action, percentage, targetPrice, stopHedgePrice } = req.body;
+      console.log(`[DEBUG_TRADE_API] Received:`, { symbol, action, percentage, targetPrice, stopHedgePrice });
+      
+      if (!action) {
+        return res.status(400).json({ success: false, error: 'Action is required (e.g., BUY, SELL, TP, RL)' });
+      }
+
+      const result = await executeTrade(
+        symbol || '', 
+        action, 
+        Number(percentage) || 100, 
+        targetPrice ? Number(targetPrice) : undefined, 
+        stopHedgePrice ? Number(stopHedgePrice) : undefined
+      );
+      
+      res.json({ success: true, result });
+    } catch (error: any) {
+      console.error(`[DEBUG_TRADE_API] Error:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
 app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Server running on http://localhost:${PORT}`);
     
@@ -2372,6 +3210,9 @@ app.listen(PORT, '0.0.0.0', async () => {
     }
     
     pollTelegram();
+  }).on('error', (err: any) => {
+    console.error('Server error:', err);
+    process.exit(1);
   });
 }
 
