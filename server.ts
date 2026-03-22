@@ -10,7 +10,7 @@ import { createServer as createViteServer } from 'vite';
 import { RSI, MACD, EMA, BollingerBands, SMA } from 'technicalindicators';
 import { Storage } from '@google-cloud/storage';
 import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, setDoc, getDoc, collection, query, orderBy, limit, getDocs } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, getDoc, collection, query, orderBy, limit, getDocs, serverTimestamp, setLogLevel } from 'firebase/firestore';
 import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
 import fs from 'fs';
 import path from 'path';
@@ -73,6 +73,7 @@ async function initFirebase() {
   try {
     const firebaseConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf8'));
     const app = initializeApp(firebaseConfig);
+    setLogLevel('error'); // Suppress idle stream warnings
     db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
     auth = getAuth(app);
     
@@ -1119,7 +1120,7 @@ type ExcelRow = {
   'AccountMR%': number | ''; 'MR%': string | ''; MRProjected: number | '';
   MRDeltaIfAction: number | ''; PairRiskWeight: number | ''; RiskTag: string;
   Action: string; StrategyMode: string; RecoveryPhase: string; ActionRiskType: string;
-  ActionSuggested: string; Status: string; Notes: string;
+  ActionSuggested: string; Status: string; Notes: string; BEP_2to1: number | '';
   ArchiveKey: string; SourceEmailId: string; FileName: string;
 };
 
@@ -1216,6 +1217,7 @@ function composeExcelRows(params: {
       ActionSuggested: '',
       Status: '',
       Notes: '',
+      BEP_2to1: c?.action_now?.bep_price_if_2_to_1 ?? '',
       ArchiveKey: archiveKey,
       SourceEmailId: '',
       FileName: ''
@@ -1304,6 +1306,34 @@ async function monitorMarkets() {
     const hedgingRecovery = calculateHedgingRecovery(positions);
     const accountRisk = await fetchAccountRisk();
 
+    // Fetch recent backtest results
+    let recentBacktests: any[] = [];
+    try {
+      const q = query(collection(db, 'backtests'), orderBy('timestamp', 'desc'), limit(5));
+      const backtestsSnapshot = await getDocs(q);
+      recentBacktests = backtestsSnapshot.docs.map(doc => doc.data());
+    } catch (e) {
+      console.error('Error fetching backtest results:', e);
+    }
+
+    // Fetch approved settings for the symbols being analyzed
+    let approvedSettings: any[] = [];
+    try {
+      const settingsPromises = symbolsToFetch.map(async (symbol) => {
+        const docId = symbol.replace(/\//g, '_');
+        const docRef = doc(db, 'approved_settings', docId);
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          return docSnap.data();
+        }
+        return null;
+      });
+      const results = await Promise.all(settingsPromises);
+      approvedSettings = results.filter(s => s !== null);
+    } catch (e) {
+      console.error('Error fetching approved settings:', e);
+    }
+
     // 3. Analyze with Gemini (V2 Decision Card & SOP Orchestrator)
     const ai = getAI();
     const inputPayload = {
@@ -1325,6 +1355,8 @@ async function monitorMarkets() {
         scannerUniverse: top20Symbols,
         marketData,
         recentHistory: signals.slice(0, 5), // Include last 5 signals for self-supervision
+        recentBacktests, // Include recent backtests for strategy optimization
+        approvedSettings, // Include approved settings for specific coins
         openOrders: openOrders.map((o: any) => ({
             symbol: o.symbol,
             side: o.side,
@@ -1349,166 +1381,358 @@ async function monitorMarkets() {
       - Anda memiliki akses ke 'recentHistory' (5 sinyal terakhir) untuk menjaga konsistensi keputusan.
       - Data Anda diarsipkan secara otomatis ke GCS dan dikirim ke Outlook (tAnalyses).
       - Fokus utama Anda saat ini adalah: **HEDGING RECOVERY BY ZONE**.
+      - Anda juga memiliki akses ke 'recentBacktests' yang berisi hasil backtest terbaru. Gunakan data ini untuk mengoptimalkan strategi trading Anda (misalnya, menyesuaikan stop loss, take profit, atau menghindari pair dengan win rate rendah).
+      - **PENTING (APPROVED SETTINGS)**: Jika ada data di dalam array 'approvedSettings' untuk koin tertentu, Anda **WAJIB** menggunakan parameter tersebut (seperti Take Profit, Lock Trigger, Max MR, dll) sebagai pengganti nilai default di SOP Utama khusus untuk koin tersebut. Ini adalah hasil backtest yang sudah dioptimalkan dan disetujui oleh user.
 
       DATA MASUK:
       ${JSON.stringify(inputPayload, null, 2)}
 
-      TUGAS 1: MONITORING POSISI AKUN (FOKUS UTAMA)
-      Anda mengubah data pasar & portofolio dari 'accountPositions' menjadi:
-      (1) DECISION CARD 1-LAYAR per pair (siap lihat → klik),
-      (2) SOP skenario (rejection / break&retest up/down / invalidation),
-      (3) Paket ENFORCEMENT untuk server (validasi stop‑lock, MR projected per aksi, dan alerts deterministik).
-      (4) Gunakan Paket “Institutional Reversal Detector” untuk mendeteksi reversal/pullback sedini mungkin:
-      STRUKTUR ANALISIS YANG WAJIB KAMU GUNAKAN
-      Untuk setiap simbol pair dan timeframe:
-      1) **Market Structure**
-        - Identifikasi HH/HL atau LH/LL.
-        - Tentukan apakah ada perubahan struktur pertama (CHoCH / MS Break).
-        - Jika struktur berubah → tanda reversal awal.
-      2) **Smart Money (OB + Liquidity)**
-        - Deteksi Order Block mana yang sedang aktif (bullish atau bearish).
-        - Beri peringatan jika harga menyapu likuiditas (equal high/low sweep).
-        - Tentukan zona potensial untuk pullback atau breakout kuat.
-      3) **VSA**
-        - Cari:
-        - Climactic volume
-        - Stopping volume
-        - No Supply / No Demand
-        - Beri sinyal apakah trend mulai melemah.
-      4) **Divergence (RSI/MACD)**
-        - Identifikasi bullish/bearish divergence.
-        - Tandai apakah ini divergence kuat atau lemah.
-      5) **Fibonacci Pullback**
-        - Gunakan swing terakhir.
-        - Fokuskan analisis pada 0.618 – 0.705 – 0.786.
-        - Beri konfirmasi jika level Fibo bertemu OB / Liquidity.
-      6) **Bollinger Band**
-        - Tandai jika candle close di luar band → potensi overextension.
-        - Konfirmasi re-entry ke band → sinyal reversal valid.
-      7) **MA50 & MA200**
-        - MA200 = area reversal besar.
-        - MA50 flattening = momentum melemah.
-        - Cross behaviour = konfirmasi tambahan.n.
+      SOP UTAMA – TRADING SENTINEL
+      Strategi: Hedging Recovery Konservatif, Berbasis Trend & Lock 1:1
+      Tujuan: Jaga MR rendah, bekukan risiko dengan benar, ikuti trend, exit penuh & reset.
 
-      TUGAS 2: TOP 20 SCANNER (SINYAL TAMBAHAN)
-      HANYA JIKA accountRisk.marginRatio < 25%, pilih 1–2 koin dari 'scannerUniverse' dengan setup PALING SEMPURNA.
-      Jika MR >= 25%, TUGAS 2 DIABAIKAN (kosongkan new_signals).
+      ============================================================
+      SECTION 0 – IDENTITAS & PERAN
+      ============================================================
+      Kamu adalah SENTINEL, asisten trading yang:
+      - Mengelola posisi dengan pendekatan Hedging Recovery konservatif,
+      - Menggunakan hedge sebagai pengganti stop loss,
+      - Menjaga risiko (MR) sebagai prioritas utama,
+      - Mengutamakan exit penuh searah trend dan memulai kembali dengan struktur baru (reset).
+
+      ATURAN EMAS (GOLDEN RULE) HEDGING RECOVERY:
+      - JANGAN PERNAH menyarankan REDUCE atau CUT LOSS pada posisi yang sedang MERAH (Rugi/Floating Loss).
+      - REDUCE HANYA BOLEH dilakukan pada posisi yang sedang HIJAU (Profit).
+      - Jika sebuah posisi sedang rugi, solusinya adalah HOLD, LOCK (Hedge), atau ADD searah trend, BUKAN dipotong (cut loss).
+
+      Kamu TIDAK bertindak barbar:
+      - Tidak cut loss posisi merah,
+      - Tidak martingale,
+      - Tidak menambah lot besar mendadak,
+      - Tidak mengabaikan MR,
+      - Tidak mempertahankan posisi nyangkut tanpa rencana.
+
+      ============================================================
+      SECTION 1 – RUANG LINGKUP PENERAPAN STRATEGI
+      ============================================================
+      Strategi ini HANYA boleh diterapkan pada:
+      1) TRADING BARU (fresh signal),
+      2) TRADING LAMA dengan syarat:
+         - Gap atau Lock Trigger 4% DIHITUNG BERDASARKAN PERSENTASE PERGERAKAN HARGA ASLI (Spot Price) dari koin tersebut, BUKAN dari persentase Margin Ratio (MR) atau PnL.
+         - Karena pengguna menggunakan leverage tinggi dengan win rate mendekati 100%, fluktuasi MR bisa sangat besar, namun patokan utama tetap pergerakan harga spot harian.
+         - Jika pergerakan harga spot melawan posisi > 4% → anggap struktur berat → fokus reduce/lock saja,
+           JANGAN ekspansi dengan strategi ini.
+
+      Aturan global:
+      - MR ideal: < 15%
+      - MR guardrail keras: 25% (jika mendekati atau melewati ini → stop ekspansi, prioritas turunkan MR).
+
+      ============================================================
+      SECTION 2 – DEFINISI OPERASIONAL
+      ============================================================
+      Gunakan definisi berikut dalam pengambilan keputusan:
+
+      1. Bias4H:
+         - Arah trend utama (UP / DOWN / RANGE) pada timeframe 4H.
+      2. Bias1H:
+         - Tekanan jangka pendek pada timeframe 1H (konfirmasi/penolakan terhadap Bias4H).
+      3. Hedge:
+         - Posisi lawan (opposite position) yang dibuka sebagai pengganti stop loss.
+         - Tujuan: membekukan risiko, bukan untuk spekulasi dua arah.
+      4. Lock 1:1:
+         - Kondisi di mana qty long ≈ qty short.
+         - Net exposure ≈ 0 → risiko pergerakan harga dibekukan.
+      5. Add 0.5:
+         - Penambahan posisi kecil, setengah dari ukuran standar,
+         - Digunakan hanya setelah ada konfirmasi trend baru.
+      6. Struktur 2:1:
+         - Misalnya: Long2 vs Short1 (Net LONG) atau Short2 vs Long1 (Net SHORT).
+         - Hanya digunakan ketika:
+             • Trend kuat dan jelas,
+             • MR masih jauh di bawah 15%.
+      7. Gap 4% / Lock Trigger:
+         - Batas toleransi pergerakan harga asli (spot price) yang melawan posisi kita.
+         - Dihitung dari persentase pergerakan harga spot, BUKAN dari Margin Ratio (MR).
+         - Jika harga spot bergerak melawan > 4% → struktur dianggap berat, fokus utama: de-risk.
+
+      ============================================================
+      SECTION 3 – PARAMETER RISIKO GLOBAL
+      ============================================================
+      Selalu patuhi guardrail berikut:
+
+      - MRGlobal < 15%  → kondisi aman untuk:
+          • entry baru,
+          • add kecil (0.5),
+          • struktur 2:1 bila trend jelas.
+      - MRGlobal 15–25% → zona waspada:
+          • fokus pengurangan risiko, 
+          • more reduce, less add.
+      - MRGlobal ≥ 25% → keadaan darurat:
+          • DILARANG ekspansi,
+          • hanya boleh: reduce, lock, take profit,
+          • tujuan utama: turunkan MR secepat mungkin.
+
+      Setiap kali menggambar skenario:
+      - Jika MRProjected dari suatu aksi > 25% → JANGAN sarankan aksi ekspansi.
+      - Utamakan aksi yang:
+          • Menurunkan MR,
+          • Menyederhanakan struktur posisi,
+          • Mengurangi net exposure.
+
+      ============================================================
+      SECTION 4 – WORKFLOW A: TRADE BARU (FRESH SIGNAL)
+      ============================================================
+
+      4.1 ANALISIS PRA-ENTRY
+      Sebelum mengusulkan entry:
+      - Pastikan:
+        - Bias4H jelas (UP atau DOWN),
+        - Bias1H mendukung atau minimal tidak berlawanan keras,
+        - Market bukan dalam kondisi noise ekstrem tanpa struktur.
+
+      - Identifikasi zona:
+        - DemandLow/High untuk peluang long,
+        - SupplyLow/High untuk peluang short,
+        - Pivot sebagai area keseimbangan,
+        - StopHedge berdasarkan struktur low/high signifikan.
+
+      4.2 ENTRY AWAL
+      - Entry hanya 1 posisi awal:
+        - Jika Bias4H = UP → usulkan LONG1,
+        - Jika Bias4H = DOWN → usulkan SHORT1.
+      - Jangan langsung 2:1 saat entry pertama.
+      - Pastikan MRProjected setelah entry tetap di bawah guardrail aman.
+
+      4.3 STOP LOSS = HEDGE
+      - Alih-alih stop loss tradisional, gunakan HEDGE:
+        - Untuk posisi LONG:
+            • Tetapkan StopHedge di bawah struktur invalidasi (misal break low H4).
+            • Jika harga menyentuh StopHedge → buka SHORT1,
+              sehingga struktur menjadi LONG1 + SHORT1 (LOCK 1:1).
+        - Untuk posisi SHORT:
+            • Tetapkan StopHedge di atas struktur invalidasi (misal break high H4).
+            • Jika harga menyentuh StopHedge → buka LONG1,
+              sehingga struktur menjadi SHORT1 + LONG1 (LOCK 1:1).
+
+      - Setelah HEDGE aktif (lock 1:1):
+        - HENTIKAN ekspansi,
+        - Masuk ke mode WAIT & SEE (lihat Section 6).
+
+      4.4 JIKA HARGA BERGERAK SESUAI TREND TANPA KENA HEDGE
+      - Jika posisi utama (LONG atau SHORT) profit dan tidak menyentuh StopHedge:
+        - Sentinel boleh mengusulkan pendekatan lanjutan:
+          - Menambah posisi searah trend (2:1),
+          - Atau menambah hedge kecil (0.5) untuk stabilitas.
+
+      - Namun, taki utama:
+        - Setiap EXIT long/short dilakukan dengan prinsip:
+          • Profit sisi trend ≥ kerugian sisi lawan + biaya trading.
+        - Tujuan:
+          • Menutup rugi sisi hedge,
+          • Menutup biaya,
+          • Menyisakan profit bersih,
+          • Menurunkan MR.
+
+      ============================================================
+      SECTION 5 – WORKFLOW B: TRADE LAMA (PERGERAKAN SPOT ≤ 4%)
+      ============================================================
+
+      5.1 KUALIFIKASI
+      Untuk trading lama:
+      - HANYA gunakan strategi ini jika:
+        - Pergerakan harga spot yang melawan posisi masih ≤ 4%,
+        - Struktur tidak terlalu berat,
+        - MR masih dalam batas wajar.
+
+      5.2 PRIORITAS
+      Jika trade lama memenuhi syarat:
+      - Analisa:
+        - Bias4H,
+        - Bias1H,
+        - Net long/short (RatioHint),
+        - Floating PnL sisi long dan short.
+
+      - Tujuan utama:
+        - Menyusun ulang posisi agar:
+          • Sejalan dengan trend dominan,
+          • Lock jika perlu,
+          • De-risk lebih dulu sebelum ekspansi.
+
+      5.3 BATASAN
+      - Dilarang menambah posisi besar pada struktur lama yang sudah berat.
+      - Jika pergerakan harga spot mendekati batas 4% melawan posisi:
+        - Utamakan:
+          • reduce posisi profit,
+          • gunakan lock,
+          • hindari ADD agresif.
+
+      ============================================================
+      SECTION 6 – MODE LOCK 1:1 (WAIT & SEE MODE)
+      ============================================================
+
+      6.1 KONDISI MASUK MODE LOCK
+      - Lock 1:1 terjadi jika:
+        - Posisi utama + hedge seimbang (LongQty ≈ ShortQty).
+      - Begitu lock terjadi:
+        - JANGAN langsung unlock,
+        - JANGAN langsung add besar,
+        - Fokus: observasi & konfirmasi.
+
+      6.2 TUGAS SENTINEL DALAM MODE LOCK
+      - Bacalah:
+        - Bias4H (apakah sudah bergeser?),
+        - Bias1H (mendukung perubahan arah?),
+        - Range Filter / indikator institusional lain,
+        - Real-time price action:
+            • Break of structure (BOS),
+            • Retest,
+            • Rejection kuat di Supply/Demand.
+
+      - Sentinel tidak boleh:
+        - Spekulasi tanpa konfirmasi,
+        - Membuka struktur baru yang tidak perlu.
+
+      6.3 KONDISI KEDUA LEG SAMA-SAMA MERAH (RUGI)
+      Jika LONG dan SHORT sama-sama merah:
+      - Jangan reduce dulu.
+      - Tunggu konfirmasi trend baru:
+        - Jika konfirmasi trend DOWN:
+             → ADD_SHORT kecil (0.5) bertahap pada pullback ke Supply/resistance sampai struktur menjadi maksimal 2:1 (Short 2, Long 1).
+        - Jika konfirmasi trend UP:
+             → ADD_LONG kecil (0.5) bertahap pada pullback ke Demand/support sampai struktur menjadi maksimal 2:1 (Long 2, Short 1).
+
+      - ADD 0.5 hanya boleh jika:
+        - MRProjected setelah ADD tetap < 25%,
+        - Pullback dan struktur jelas,
+        - Trend baru benar-benar terkonfirmasi.
+
+      6.4 KONDISI SALAH SATU LEG PROFIT, YANG LAIN RUGI
+      Jika salah satu sisi profit:
+      - ATURAN MUTLAK: JANGAN PERNAH menyarankan REDUCE atau CUT LOSS pada leg (posisi) yang sedang MERAH (Rugi/Floating Loss). REDUCE HANYA BOLEH dilakukan pada leg yang sedang HIJAU (Profit).
+      - HANYA BOLEH UNLOCK (Tutup posisi hedge) JIKA POSISI HEDGE TERSEBUT SEDANG PROFIT.
+      - Jika trend baru DOWN:
+          • Jika SHORT profit dan LONG rugi:
+              → boleh REDUCE_SHORT sebagian untuk kunci profit,
+                atau ADD_SHORT kecil di pullback bila masih aman.
+          • Jika LONG profit dan SHORT rugi:
+              → boleh REDUCE_LONG untuk mengamankan profit.
+
+      - Jika trend baru UP (kebalikan skenario di atas):
+          • Jika LONG profit dan SHORT rugi:
+              → REDUCE_LONG atau ADD_LONG kecil.
+          • Jika SHORT profit dan LONG rugi:
+              → REDUCE_SHORT.
+
+      - Prinsip:
+          • Sisi profit dapat dipakai sebagai sumber dana recovery.
+          • Sisi rugi (merah) HARUS DIBIARKAN (HOLD) atau di-recovery dengan ADD searah trend, BUKAN di-reduce/cut loss.
+
+      6.5 MANUVER REVERT KE LOCK NEUTRAL 1:1 (DARI 2:1)
+      Jika struktur saat ini tidak seimbang (misal Long 2, Short 1) dan trend berbalik arah sebelum mencapai target BEP:
+      - AKSI: REVERT KE 1:1 dengan cara MENUTUP POSISI EKSTRA (REDUCE leg yang dominan), BUKAN menambah posisi baru.
+      - Tutup posisi ekstra tersebut TEPAT DI ATAS PROFIT (sedikit profit) untuk menutupi biaya trading dan memotong risiko floating lebih cepat.
+      - Sisa posisi akan kembali menjadi LOCK NEUTRAL 1:1.
+      - Masuk ke mode WAIT & SEE tanpa tekanan MR, tunggu struktur market (Demand/Supply) dan trend baru untuk kembali melakukan ADD 0.5.
+
+      ============================================================
+      SECTION 7 – EXPANSI KECIL (ADD 0.5) & STRUKTUR 2:1
+      ============================================================
+
+      7.1 ATURAN ADD 0.5
+      - ADD 0.5 hanya boleh:
+        - Setelah konfirmasi trend baru,
+        - Setelah terlihat pullback sehat,
+        - Selama MRProjected tetap di bawah 25%.
+
+      - Tujuan ADD 0.5:
+        - Mengikuti trend baru secara konservatif,
+        - Mempercepat recovery tanpa meningkatkan risiko berlebihan.
+
+      7.2 ATURAN STRUKTUR 2:1
+      - Struktur 2:1 (Long2 vs Short1 atau Short2 vs Long1) hanya boleh:
+        - Pada kondisi MR rendah (< 15%) ATAU saat melakukan recovery ketika kedua leg merah (lihat 6.3),
+        - Trend kuat dan jelas (Bias4H & Bias1H kompak),
+        - Tidak dalam kondisi lock yang kusut.
+
+      - Gunakan 2:1 sebagai:
+        - Strategi growth saat akun sehat,
+        - Strategi recovery saat kedua leg merah,
+        - BUKAN saat MR tinggi atau struktur kacau.
+
+      ============================================================
+      SECTION 8 – EXIT & RESET
+      ============================================================
+
+      8.1 ATURAN EXIT (INTI STRATEGI HEDGING RECOVERY)
+      - INTI STRATEGI: Apabila dalam posisi hedge (terutama saat struktur 2:1), EXIT WAJIB dilakukan secara BERSAMAAN (full close kedua kaki long dan short) dengan prinsip NET PROFIT.
+      - Jangan exit sebagian sambil menyisakan struktur berat yang membingungkan.
+      - Berdasarkan perhitungan BEP Profit + Fees:
+          • Profit posisi yang dominan (searah trend) + profit yang sudah direalisasikan dari unlock hedge sebelumnya
+            ≥ total kerugian posisi lawan + biaya trading.
+      - Jika posisi saat ini sudah 2:1 (UNBALANCED), Anda WAJIB menghitung dan menampilkan di harga berapa BEP (Break Even Point) itu tercapai sesuai trend yang ada saat ini.
+      - RUMUS BEP 2:1 = ((Qty_Long * Entry_Long) - (Qty_Short * Entry_Short)) / (Qty_Long - Qty_Short)
+
+      8.2 SETELAH EXIT PENUH
+      - Setelah semua posisi di pair ditutup dengan net profit:
+        - Anggap struktur di pair tersebut selesai (cycle complete).
+        - WAJIB masuk ke mode WAIT & SEE.
+        - Sentinel boleh mencari peluang entry baru (fresh posisi) searah trend menggunakan kembali workflow TRADE BARU (Section 4).
+
+      ============================================================
+      SECTION 9 – PRIORITAS MULTI-PAIR
+      ============================================================
+
+      Jika ada banyak pair:
+      - Prioritaskan:
+        1) Pair dengan MRProjected tertinggi,
+        2) Pair dengan pergerakan harga spot melawan posisi mendekati batas 4%,
+        3) Pair dengan floating loss terbesar berlawanan dengan Bias4H.
+
+      - Untuk pair berisiko tinggi:
+        - Utamakan:
+          • REDUCE posisi,
+          • LOCK_NEUTRAL bila perlu,
+          • TAKE_PROFIT di sisi yang menguntungkan.
+
+      ============================================================
+      SECTION 10 – PRINSIP FILOSOFIS
+      ============================================================
+
+      - Hedging digunakan sebagai:
+        • Pengganti stop loss,
+        • Alat untuk membekukan risiko,
+        • Bukan alat berjudi dua arah.
+
+      - Fokus utama:
+        • Kontrol MR,
+        • Struktur bersih,
+        • Add kecil, bukan agresif,
+        • Exit penuh searah trend,
+        • Reset setelah exit.
+
+      - Setiap rekomendasi harus:
+        • Selaras dengan Bias4H,
+        • Menghormati batas MR,
+        • Menjaga pergerakan harga spot melawan posisi tetap ≤ 4% untuk struktur lama,
+        • Mempermudah recovery, bukan menambah beban.
+
+      END OF SOP – MAIN TRADING PROTOCOL
 
       BAHASA & OUTPUT
       - Gunakan BAHASA INDONESIA.
       - OUTPUT HARUS valid JSON PERSIS sesuai KONTRAK di bawah (TANPA teks lain di luar JSON).
       - Urutkan decision_cards A→Z berdasarkan symbol.
 
-      ATURAN WAJIB TUGAS 1 (HARUS DIIKUTI TANPA PELANGGARAN):
-      1) FOKUS AKUN:
-         - WAJIB buatkan 1 decision_card untuk SETIAP symbol yang ada di 'accountPositions'.
-         - DILARANG membuat decision_card untuk koin di 'scannerUniverse' yang TIDAK memiliki posisi di 'accountPositions'.
-         - Fokus analisa adalah mengelola risiko dan profitabilitas posisi yang sedang berjalan.
-      1) GUARD MODE (MR% > mr_guard_pct):
-         - Dilarang: ADD_LONG (AL), ADD_SHORT (AS), HEDGE_ON (HO), ROLE (RR). bila MR < 25%
-         - Diperbolehkan: HOLD, REDUCE_LONG (RL), REDUCE_SHORT (RS), LOCK_NEUTRAL (LN),
-           UNLOCK (UL) *hanya jika mengurangi exposure & hedge sudah Hijau/BE*, TAKE_PROFIT (TP).
-         - Prioritas saat GUARD:
-           1) TAKE_PROFIT leg hijau yang MENURUNKAN MR (wajib tampilkan MR projected),
-           2) HOLD bila belum ada trigger invalidation,
-           3) LOCK_NEUTRAL hanya bila syarat LN terpenuhi (lihat poin 3),
-           4) REDUCE leg yang melawan tren jika benar‑benar menurunkan MR tanpa membuka risiko lebih besar.
-
-      2) STOP_HEDGE_LOCK (LOCK kembali 1:1) – WAJIB = invalidation swing TF 1H + buffer ATR:
-         - Jika trend_4h = UP → stop_hedge_lock = swingLow_1H − (params.unlock_buffer_atr × ATR14_4H), dibulatkan wajar.
-         - Jika trend_4h = DOWN → stop_hedge_lock = swingHigh_1H + (params.unlock_buffer_atr × ATR14_4H).
-         - Larangan: stop_hedge_lock TIDAK BOLEH berada di zona SUPPLY saat tren UP atau di zona DEMAND saat tren DOWN.
-         - Jika ATR14_4H null → fallback: pakai swing level (tanpa ATR) atau buffer kecil berbasis % harga (mis. 0.2%).
-
-      3) LOCK_NEUTRAL (LN) saat GUARD_NO_ADD hanya jika SALAH SATU benar:
-         (a) Harga menyentuh/menembus stop_hedge_lock (invalidation kena), ATAU
-         (b) MR% projected setelah LN TIDAK > 25%, ATAU
-         (c) Drawdown leg utama “ekstrem” (mis. unrealizedPnL_leg_utama ≤ −40% dari notional leg)
-             DAN harga berada ≤ 1 × ATR14_4H dari stop_hedge_lock (dekat invalidation).
-         Jika tak terpenuhi → ACTION: HOLD (atau TP bila ada leg hijau yang menurunkan MR).
-
-      4) UNLOCK (UL) hanya jika:
-         - Hedge_leg unrealizedPnL ≥ 0 (atau ~Break Even; toleransi ±0.2% notional),
-         - Konfluensi 4H pro‑bias minimal 2/3 (rf_ok + rqk_ok + wae_ok; vwap_ok opsional),
-         - MR% ≤ mr_guard_pct ATAU MR% projected setelah UNLOCK tidak > 20%.
-         Bila belum terpenuhi → HOLD.
-
-      5) KONFLUENSI (TF 4H):
-         - rf_ok: RangeFilter.trend selaras arah (BUY=UP, SELL=DOWN),
-         - rqk_ok: price > rqk.estimate untuk BUY; price < rqk.estimate untuk SELL,
-         - wae_ok: WAE.trend selaras arah; bonus jika isExploding = true,
-         - vwap_ok (opsional): BUY valid jika VWAP_dist_pct ≥ +params.vwap_delta_pct; SELL valid jika ≤ −params.vwap_delta_pct.
-         - Minimal konfluensi inti: 2 dari 3 (rf_ok, rqk_ok, wae_ok). vwap_ok hanya penambah bobot.
-
-      6) BREAK & RETEST (SOP & ALERTS):
-         - Invalidation: swing lawan arah TF 1H (swingLow untuk bullish; swingHigh untuk bearish).
-         - Break valid: jarak tembus ≥ params.k_atr × ATR14_4H (jika ATR tersedia).
-           Fallback bila ATR null: RF 4H flip + WAE exploding lawan + VWAP_dist menembus 2 × params.vwap_delta_pct.
-         - Retest valid: harga kembali uji level tembus & reject (1–3 candle).
-
-      7) EKONOMI TOMBOL (server safe-by-design):
-         - Saat GUARD_NO_ADD → AL/AS/HO/RR WAJIB masuk “buttons.block”.
-         - UL “allowed” hanya jika syarat UNLOCK (poin 4) terpenuhi.
-         - LN “allowed” hanya jika syarat LN (poin 3) terpenuhi; jika tidak, beri alasan penolakan & sarankan HOLD/TP.
-
-      8) RECOVERY BY ZONE SEBAGAI SOP UTAMA & ADVANCED TECHNIQUES:
-         - Strategi Recovery ini menggunakan konsep "Recovery by Zone (Supply–Demand–Pivot–StopHedge)" sebagai SOP utama.
-         - Menyesuaikan strategi: SupplyHigh/Low → zona jual ideal, DemandHigh/Low → zona beli ideal, Pivot → equilibrium untuk reduce, StopHedge → invalidasi lock.
-         - Pola Zone Strategy: Lock at Extremes, Release at Pivot, Reduce di Mid-Range, Add di Edge, Hold Lock jika harga di tengah, Recovery mode jika harga kembali ke Demand/Supply.
-         - Gunakan Paket “Institutional Reversal Detector” untuk mendeteksi reversal/pullback sedini mungkin
-         - Terapkan juga keahlian inti berikut jika posisi dalam status RECOVERY:
-         - A. LOCKING STANDARD: Gunakan Full/Partial Lock untuk menetralisir risiko. Evaluasi apakah lock menurunkan MR atau mencegah kerusakan lebih dalam. Hindari over-hedging.
-         - B. HEDGING STEP: Gunakan Step-by-Step Recovery. Susun urutan step yang aman (misal: Reduce dulu → Add kecil → Lock → Unlock di zone tertentu). Perhatikan efek pada MR Projected.
-         - C. EXPOSURE BALANCING & MR GUARD: Netralkan posisi yang terlalu berat ke satu sisi berdasarkan zona. TOLAK aksi yang menaikkan MR ≥ 25%.
-         - D. DYNAMIC UNLOCK: Buka lock secara bertahap di zone aman, hindari panic unlock.
-         - E. SECOND OPINION: Selalu evaluasi aksi dari sudut Risiko, Zona, Bias trend, MR, dan Floating structure.
-
-      TUGAS 2: TOP 20 SCANNER (NEW)
-      Dari data "universe" (Top 20), pilih 1–2 koin dengan setup PALING SEMPURNA menurut:
-      • Range Filter (TF 4H) — kondisi “awal trend / flip” yang kredibel.
-      • SMC (TF 1H) — harga berada/menyentuh area OB/FVG yang relevan (demand untuk BUY, supply untuk SELL).
-      Keluarkan sinyal trading baru (BUY/SELL) berisi ENTRY, TARGET, dan STOP LOSS (SL), HANYA jika Margin Ratio (MR) akun < 25%.
-
-      ATURAN PENILAIAN TUGAS 2 (WAJIB):
-      1) GATE MR:
-         - Jika accountRisk.marginRatio >= mr_guard_pct (default 25) → JANGAN keluarkan sinyal baru.
-           Hanya keluarkan "risk_warning" dan "watchlist_candidates" (maks 3).
-         - Jika MR < 25 → boleh keluarkan sinyal baru (maksimal 2).
-
-      2) DETEKSI “AWAL TREND / FLIP” (RF 4H):
-         - Gunakan Paket “Institutional Reversal Detector” untuk mendeteksi “AWAL TREND / FLIP”
-         - rf_flip_ok: RangeFilter TF_4H ≠ RangeFilter TF_1D, ATAU RangeFilter TF_4H baru saja berganti.
-         - wae_ok: WAE TF_4H trend selaras arah sinyal & isExploding = true.
-         - rqk_ok (bonus): harga di sisi yang benar dari RQK estimate.
-         - Minimal konfluensi: rf_flip_ok + (wae_ok ATAU rqk_ok).
-
-      3) VALIDASI SMC (TF 1H):
-         - BUY: harga di/tepat di atas zona demand OB/FVG.
-         - SELL: harga di/tepat di bawah zona supply OB/FVG.
-         - Toleransi kedekatan: max(0.2%, 0.25×ATR14_4H / price).
-
-      4) FORMULA LEVEL SINYAL:
-         - ENTRY: Limit di mid zona OB/FVG 1H.
-         - SL: BUY di bawah bottom demand - buffer; SELL di atas top supply + buffer.
-         - TARGET 1: Pivot RQK 4H atau tepi zona berlawanan terdekat.
-         - TARGET 2: RR minimal 1.8–2.2.
-
-      5) FILTER AKHIR:
-         - Skor 0–100 (40% RF flip, 30% SMC, 20% RQK/VWAP, 10% RR).
-         - Pilih MAKS 2 terbaik.
-
-      8) MR PROJECTED:
+      ATURAN FORMATTING JSON (WAJIB):
+      1) MR PROJECTED:
          - Untuk aksi yang mengubah exposure (TP/RL/RS/LN/UL), isi “mr_projected_if_action”.
            Jika > 25% → tandai action “risk_denied”: true.
 
-      9) NORMALISASI SYMBOL:
+      2) NORMALISASI SYMBOL:
          - Selalu output "symbol" dalam format "BASE/USDT" (contoh: "BTC/USDT"). DILARANG memakai "BTCUSDT" tanpa slash.
 
-      10) TIMESTAMP:
+      3) TIMESTAMP:
          - telemetry.generated_at = waktu SAAT INI (UTC ISO‑8601).
-
-      INPUT DATA (JSON):
-      ${JSON.stringify(inputPayload, null, 2)}
 
       === OUTPUT CONTRACT (WAJIB) ===
       {
@@ -1556,7 +1780,8 @@ async function monitorMarkets() {
               "mr_guard": "ALLOW"|"DENY",
               "unlock_allowed": boolean,
               "mr_projected_if_action": number|null,
-              "risk_denied": boolean
+              "risk_denied": boolean,
+              "bep_price_if_2_to_1": number|null
             },
             "if_then": {
               "if_price_up_to":   [ { "level": number, "do": "HOLD|TAKE_PROFIT|REDUCE_LONG|REDUCE_SHORT", "note":"<=120 chars" } ],
@@ -1571,8 +1796,8 @@ async function monitorMarkets() {
         "sop_actions": [
           { "name":"REJECTION_AT_SUPPLY",
             "when":"Harga menyentuh supply 1H/4H & terlihat rejection (close turun / failed break) di LTF.",
-            "then_actions":["REDUCE_LONG","HOLD"],
-            "notes":"Gunakan reduce untuk menurunkan MR. LN hanya saat trigger LN terpenuhi."
+            "then_actions":["REDUCE_LONG","HOLD","LOCK_NEUTRAL","ADD_SHORT"],
+            "notes":"Gunakan reduce HANYA jika posisi HIJAU. Jika posisi merah, gunakan HOLD, LOCK_NEUTRAL, atau ADD_SHORT (jika trend down & MR aman)."
           },
           { "name":"BREAK_RETEST_DOWN",
             "when":"Break turun invalidation (>= k_atr×ATR14 atau fallback) + retest gagal.",
@@ -1582,7 +1807,12 @@ async function monitorMarkets() {
           { "name":"BREAK_RETEST_UP",
             "when":"Break di atas swing/supply + retest hold + konfluensi 4H ≥ 2/3.",
             "then_actions":["HOLD","UNLOCK"],
-            "notes":"UNLOCK bertahap; hindari jika hedge masih merah."
+            "notes":"UNLOCK bertahap; HANYA BOLEH jika hedge yang ditutup sedang HIJAU (profit)."
+          },
+          { "name":"REJECTION_AT_DEMAND",
+            "when":"Harga menyentuh demand 1H/4H & terlihat rejection (close naik / failed break) di LTF.",
+            "then_actions":["REDUCE_SHORT","HOLD","LOCK_NEUTRAL","ADD_LONG"],
+            "notes":"Gunakan reduce HANYA jika posisi HIJAU. Jika posisi merah, gunakan HOLD, LOCK_NEUTRAL, atau ADD_LONG (jika trend up & MR aman)."
           }
         ],
         "server_enforce": {
@@ -1629,7 +1859,7 @@ async function monitorMarkets() {
       - Gunakan PERSIS nilai di input JSON "params": k_atr, unlock_buffer_atr, vwap_delta_pct, time_stop_hedge_bars_h1, hedge_ratio, mr_guard_pct.
       - DILARANG mengganti/tuning nilai params_used. Tampilkan params_used = nilai input apa adanya.
       - Jika suatu param TIDAK ada di input, baru gunakan default proyek:
-        k_atr=0.50, unlock_buffer_atr=0.25, vwap_delta_pct=0.10, hedge_ratio=2.0, mr_guard_pct=15.0.
+        k_atr=0.50, unlock_buffer_atr=0.25, vwap_delta_pct=0.10, hedge_ratio=2.0, mr_guard_pct=25.0.
 
       SYMBOL NORMALIZATION:
       - Selalu output "symbol" sebagai "BASE/USDT" (contoh: "BTC/USDT"). DILARANG "BTCUSDT" tanpa slash.
@@ -1645,74 +1875,6 @@ async function monitorMarkets() {
       - vwap_delta_pct diperlakukan sebagai persentase (%). Tuliskan angka persen apa adanya (contoh 0.10 berarti 0.10%).
       - mr_projected_if_action = MR estimasi DALAM PERSEN (%). risk_denied = true jika mr_projected_if_action > 25.
 
-      GUARD & ACTION NOW:
-      - global_guard.mr_guard_pct = NILAI INPUT (atau default 15). Mode = GUARD_NO_ADD bila mr_pct > mr_guard_pct; NORMAL bila sebaliknya.
-      - Saat GUARD_NO_ADD, "buttons.block" WAJIB memuat AL, AS, HO, RR. UL/LN ikut diblok jika syaratnya tidak terpenuhi.
-      - UNLOCK allowed hanya jika hedge hijau/BE + konfluensi pro‑bias ≥ 2/3 + aturan MR terpenuhi.
-      - LOCK_NEUTRAL allowed hanya jika trigger LN terpenuhi (invalidation kena ATAU MR projected ≤ 25% ATAU drawdown ekstrem & dekat invalidation).
-
-      [ADDENDUM_ID]: HEDGE_NORMALIZATION_V2
-      [MODE]: SAFE_MERGE
-      [PRIORITY]: lower_than_base
-      [CONFLICT_RESOLUTION]: if conflict -> prefer BASE, except "DefensiveNormalizationExemption"
-
-      SCOPE:
-      - Menambah aturan "ALLOWED — Defensive Normalization" dengan preferensi sizing berbasis MR.
-      - Menambah skenario "POST HEDGE 1:1 (STABILITY MODE)" tanpa mengubah skema output base.
-      - Tidak menghapus, mengganti, atau menonaktifkan guard lain yang sudah ada.
-
-      DEFENSIVE NORMALIZATION EXEMPTION (KHUSUS):
-      - Pengecualian NO-ADD diperbolehkan khusus untuk "penambahan sisi hedge" yang tujuannya mengurangi net exposure (mendekatkan ke 1:1) DAN
-        MR SETELAH AKSI tidak melebihi 25% (atau tidak naik dari MR saat ini).
-      - Jika estimasi MR_after tidak tersedia, tandai status "CONDITIONAL" dan sertakan "pre_trade_check_required": true pada output.
-
-      A) ALLOWED — DEFENSIVE NORMALIZATION (dengan preferensi MR dari user)
-      TRIGGER UMUM (harus memenuhi SEMUA):
-      1) HedgeRatio ≠ "1:1_NEUTRAL"  (masih miring/net bias)
-      2) Tujuan tindakan → mendekat ke 1:1 (bukan menjauh)
-      3) Minimal SATU kondisi risiko terpenuhi:
-         - MR mendekati/di atas soft cap BASE, atau
-         - Kedua leg merah, atau
-         - Harga berada di/near HTF supply atau terdapat tanda impulse exhaustion, atau
-         - Early warning struktur (mis. h1_choch_bear = true)
-      4) Aksi tidak menghapus hedge yang merah secara penuh (partial allowed).
-
-      PREFERENSI SIZING BERDASARKAN MR (HARUS DIIKUTI):
-      - Jika MR < 25%:
-        → **Pilih "ADD SHORT untuk menyamai"** (meningkatkan short agar mendekati 1:1).
-        → Ukuran langkah (step) = 25–35% dari GapQty (bukan sekaligus 100%).
-        → Syarat: MR_after ≤ 25% DAN tidak lebih tinggi dari MR_current. Jika tidak pasti → status "CONDITIONAL" + pre_trade_check_required:true.
-
-      - Jika MR > 25%:
-        → **Pilih "REDUCE sisi dominan"** (jika net long, reduce LONG; jika net short, reduce SHORT).
-        → Ukuran langkah (step) = 20–35% dari GapQty.
-        → Tujuan: menurunkan MR dengan cepat sambil tetap menjaga hedge aktif.
-
-      B) DECISION CARD — POST HEDGE 1:1 (STABILITY MODE)
-      CONDITION: HedgeRatio == "1:1_NEUTRAL"
-      DEFAULT: primary: "HOLD", status: "ALLOWED", do: "Tunggu konfirmasi arah, tidak add, tidak unlock"
-
-      SCENARIO A — RE-ENGAGE LONG (CONDITIONAL):
-      Semua harus benar:
-      1) H1 bullish & tidak ada h1_choch_bear
-      2) acceptance_above_supply == true (reclaim/PDH acceptance)
-      3) Price menahan di atas equilibrium setelah retest
-      4) MR < soft cap BASE (mis. < 28%)
-      5) Bollinger Band
-      → ACTION: primary: "RE-ENGAGE_LONG", status: "CONDITIONAL", do: tambah long kecil (10–20% dari base), **tetap pertahankan short** (tidak remove)
-
-      SCENARIO B — RANGE (ALLOWED HOLD):
-      structure.range_mode == true ATAU tidak ada konfirmasi arah
-      → ACTION: primary: "HOLD", status: "ALLOWED", do: biarkan hedge menyerap noise
-
-      SCENARIO C — DEFENSIVE REDUCE LONG (CONDITIONAL/ALLOWED):
-      Minimal 2 terpenuhi:
-      - h1_choch_bear == true
-      - h1_bos_bear == true
-      - Close di bawah equilibrium / gagal reclaim
-      - Tanda breakdown demand
-      → ACTION: primary: "DEFENSIVE_REDUCE_LONG", status: "CONDITIONAL" (atau "ALLOWED" bila MR ≥ soft cap), do: reduce long 20–30%, jaga short aktif
-
       [ADDENDUM_ID]: TOP_20_VOLUME_SIGNALS
       [MODE]: SAFE_MERGE
       [PRIORITY]: high
@@ -1725,7 +1887,9 @@ async function monitorMarkets() {
 
       STRICT OUTPUT:
       - Keluarkan JSON saja sesuai kontrak; TIDAK BOLEH ada teks di luar JSON.
-      - WAJIB buatkan 1 decision_card untuk setiap symbol yang ada di 'accountPositions'. JANGAN buatkan decision_card untuk koin scanner kecuali koin tersebut juga ada di posisi akun.
+      - WAJIB buatkan 1 decision_card untuk SETIAP symbol yang ada di 'accountPositions' tanpa terkecuali.
+      - CRITICAL: Anda HARUS menghasilkan tepat ${[...new Set(positions.map((p: any) => p.symbol))].length} decision_card untuk posisi akun, yaitu untuk symbol: ${[...new Set(positions.map((p: any) => p.symbol))].join(', ')}. JANGAN ADA YANG TERLEWAT!
+      - JANGAN buatkan decision_card untuk koin scanner (Top 20) kecuali koin tersebut juga ada di posisi akun.
       - new_signals diisi berdasarkan scanning Top 20.
       - Untuk tombol (buttons.show), label WAJIB menyertakan nama pair agar jelas (contoh: "RL BTC", "HOLD ETH").
     `;
@@ -2205,6 +2369,9 @@ function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global
             if (act.mr_projected_if_action !== null && act.mr_projected_if_action !== undefined) {
                 message += `📈 MR Projected: ${act.mr_projected_if_action}%\n`;
             }
+            if (act.bep_price_if_2_to_1 !== null && act.bep_price_if_2_to_1 !== undefined) {
+                message += `🎯 BEP (2:1): ${act.bep_price_if_2_to_1}\n`;
+            }
             message += `\n`;
         }
 
@@ -2294,6 +2461,481 @@ function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global
 }
 
 // API Routes
+// Backtesting Engine Logic
+async function runBacktest(
+  symbol: string, 
+  timeframe: string, 
+  days: number, 
+  takeProfitPct: number = 4.0,
+  lock11Mode: boolean = true,
+  lockTriggerPct: number = 2.0,
+  add05Mode: boolean = true,
+  structure21Mode: boolean = false,
+  maxMrPct: number = 25.0
+) {
+  try {
+    const limit = 1000;
+    const since = Date.now() - (days * 24 * 60 * 60 * 1000);
+    
+    let allOhlcv: any[] = [];
+    let currentSince = since;
+    
+    while (allOhlcv.length < 2000 && currentSince < Date.now()) {
+      const ohlcv = await binance.fetchOHLCV(symbol, timeframe, currentSince, limit);
+      if (ohlcv.length === 0) break;
+      allOhlcv = allOhlcv.concat(ohlcv);
+      currentSince = ohlcv[ohlcv.length - 1][0] + 1;
+      if (ohlcv.length < limit) break;
+    }
+
+    if (allOhlcv.length < 100) {
+      throw new Error("Not enough historical data for backtesting.");
+    }
+
+    const rf = rangeFilterPineExact(allOhlcv as any, { per: 100, mult: 3.0 });
+    const { longSignal, shortSignal, rf_trend } = rf.arrays;
+    
+    const trades: any[] = [];
+    let currentTrade: any = null;
+    let hedgeTrades: any[] = [];
+    let balance = 1000;
+    const initialBalance = 1000;
+    const equityCurve: any[] = [{ time: allOhlcv[0][0], balance: balance }];
+
+    for (let i = 1; i < allOhlcv.length; i++) {
+      const high = allOhlcv[i][2];
+      const low = allOhlcv[i][3];
+      const close = allOhlcv[i][4];
+      const time = allOhlcv[i][0];
+
+      // 1. Manage Active Trades (Primary + Multiple Hedges)
+      if (currentTrade) {
+        let exitPrice = null;
+        let exitReason = null;
+
+        // Check for Lock 1:1 Trigger if in Lock 1:1 Mode
+        if (lock11Mode && hedgeTrades.length === 0) {
+          const distance = lockTriggerPct;
+          
+          if (currentTrade.type === 'LONG') {
+            const basePrice = currentTrade.lastUnlockPrice || currentTrade.entryPrice;
+            const hedgeTriggerPrice = basePrice * (1 - distance / 100);
+            if (low <= hedgeTriggerPrice) {
+              hedgeTrades.push({
+                type: 'SHORT',
+                entryPrice: hedgeTriggerPrice,
+                entryTime: time,
+                amount: currentTrade.amount // 1:1 Lock
+              });
+            }
+          } else if (currentTrade.type === 'SHORT') {
+            const basePrice = currentTrade.lastUnlockPrice || currentTrade.entryPrice;
+            const hedgeTriggerPrice = basePrice * (1 + distance / 100);
+            if (high >= hedgeTriggerPrice) {
+              hedgeTrades.push({
+                type: 'LONG',
+                entryPrice: hedgeTriggerPrice,
+                entryTime: time,
+                amount: currentTrade.amount // 1:1 Lock
+              });
+            }
+          }
+        }
+
+        // Check for Add 0.5 Mode (Unhedged)
+        if (add05Mode && hedgeTrades.length === 0) {
+          if (currentTrade.type === 'LONG' && longSignal[i]) {
+            // Add 0.5x to position
+            const addAmount = currentTrade.amount * 0.5;
+            const newAmount = currentTrade.amount + addAmount;
+            const newEntryPrice = ((currentTrade.entryPrice * currentTrade.amount) + (close * addAmount)) / newAmount;
+            currentTrade.amount = newAmount;
+            currentTrade.entryPrice = newEntryPrice;
+          } else if (currentTrade.type === 'SHORT' && shortSignal[i]) {
+            // Add 0.5x to position
+            const addAmount = currentTrade.amount * 0.5;
+            const newAmount = currentTrade.amount + addAmount;
+            const newEntryPrice = ((currentTrade.entryPrice * currentTrade.amount) + (close * addAmount)) / newAmount;
+            currentTrade.amount = newAmount;
+            currentTrade.entryPrice = newEntryPrice;
+          }
+        }
+
+        // Calculate current floating PnL
+        const primaryFloating = currentTrade.type === 'LONG' 
+          ? (close - currentTrade.entryPrice) * currentTrade.amount
+          : (currentTrade.entryPrice - close) * currentTrade.amount;
+        
+        let hedgeFloating = 0;
+        for (const ht of hedgeTrades) {
+          hedgeFloating += ht.type === 'LONG'
+            ? (close - ht.entryPrice) * ht.amount
+            : (ht.entryPrice - close) * ht.amount;
+        }
+
+        const realizedHedgeProfit = currentTrade.realizedHedgeProfit || 0;
+        const totalNetProfit = primaryFloating + hedgeFloating + realizedHedgeProfit;
+        const targetProfit = (currentTrade.entryPrice * currentTrade.amount) * (takeProfitPct / 100);
+
+        // Hedged Specific Logic (Add 0.5 & Unlocking)
+        if (hedgeTrades.length > 0) {
+          const ht = hedgeTrades[0]; // Assume 1 hedge for simplicity
+
+          // A. Add 0.5 Mode if both legs are red
+          if (add05Mode && primaryFloating < 0 && hedgeFloating < 0) {
+            const primaryAmount = currentTrade.amount;
+            const hedgeAmount = ht.amount;
+            const maxRatio = 2.0;
+            
+            if (longSignal[i]) {
+              if (currentTrade.type === 'LONG' && (primaryAmount / hedgeAmount) < maxRatio) {
+                const addAmount = hedgeAmount * 0.5;
+                if ((primaryAmount + addAmount) / hedgeAmount <= maxRatio) {
+                  const newAmount = primaryAmount + addAmount;
+                  currentTrade.entryPrice = ((currentTrade.entryPrice * primaryAmount) + (close * addAmount)) / newAmount;
+                  currentTrade.amount = newAmount;
+                }
+              } else if (ht.type === 'LONG' && (hedgeAmount / primaryAmount) < maxRatio) {
+                const addAmount = primaryAmount * 0.5;
+                if ((hedgeAmount + addAmount) / primaryAmount <= maxRatio) {
+                  const newAmount = hedgeAmount + addAmount;
+                  ht.entryPrice = ((ht.entryPrice * hedgeAmount) + (close * addAmount)) / newAmount;
+                  ht.amount = newAmount;
+                }
+              }
+            } else if (shortSignal[i]) {
+              if (currentTrade.type === 'SHORT' && (primaryAmount / hedgeAmount) < maxRatio) {
+                const addAmount = hedgeAmount * 0.5;
+                if ((primaryAmount + addAmount) / hedgeAmount <= maxRatio) {
+                  const newAmount = primaryAmount + addAmount;
+                  currentTrade.entryPrice = ((currentTrade.entryPrice * primaryAmount) + (close * addAmount)) / newAmount;
+                  currentTrade.amount = newAmount;
+                }
+              } else if (ht.type === 'SHORT' && (hedgeAmount / primaryAmount) < maxRatio) {
+                const addAmount = primaryAmount * 0.5;
+                if ((hedgeAmount + addAmount) / primaryAmount <= maxRatio) {
+                  const newAmount = hedgeAmount + addAmount;
+                  ht.entryPrice = ((ht.entryPrice * hedgeAmount) + (close * addAmount)) / newAmount;
+                  ht.amount = newAmount;
+                }
+              }
+            }
+          }
+
+          // B. Unlocking Logic (Only if hedge is in profit)
+          if (currentTrade.type === 'LONG' && (longSignal[i] || rf_trend[i] === 'UP')) {
+            if (hedgeFloating > 0) { // ONLY IF PROFIT
+              currentTrade.realizedHedgeProfit = realizedHedgeProfit + hedgeFloating;
+              hedgeTrades = [];
+              currentTrade.lastUnlockPrice = close;
+            }
+          } else if (currentTrade.type === 'SHORT' && (shortSignal[i] || rf_trend[i] === 'DOWN')) {
+            if (hedgeFloating > 0) { // ONLY IF PROFIT
+              currentTrade.realizedHedgeProfit = realizedHedgeProfit + hedgeFloating;
+              hedgeTrades = [];
+              currentTrade.lastUnlockPrice = close;
+            }
+          }
+
+          // C. Revert to 1:1 Lock (Reduce Dominant Leg)
+          // If structure is 2:1 and trend reverses, close the excess amount if it's in profit to form a neutral 1:1 lock
+          if (hedgeTrades.length > 0) {
+            if (currentTrade.amount > ht.amount) {
+              // Primary is dominant
+              const excessAmount = currentTrade.amount - ht.amount;
+              const excessPnL = currentTrade.type === 'LONG'
+                ? (close - currentTrade.entryPrice) * excessAmount
+                : (currentTrade.entryPrice - close) * excessAmount;
+              
+              // If trend reverses and excess is in profit
+              if (excessPnL > 0) {
+                if ((currentTrade.type === 'LONG' && (shortSignal[i] || rf_trend[i] === 'DOWN')) ||
+                    (currentTrade.type === 'SHORT' && (longSignal[i] || rf_trend[i] === 'UP'))) {
+                  currentTrade.realizedHedgeProfit = realizedHedgeProfit + excessPnL;
+                  currentTrade.amount = ht.amount; // Revert to 1:1
+                }
+              }
+            } else if (ht.amount > currentTrade.amount) {
+              // Hedge is dominant
+              const excessAmount = ht.amount - currentTrade.amount;
+              const excessPnL = ht.type === 'LONG'
+                ? (close - ht.entryPrice) * excessAmount
+                : (ht.entryPrice - close) * excessAmount;
+              
+              // If trend reverses and excess is in profit
+              if (excessPnL > 0) {
+                if ((ht.type === 'LONG' && (shortSignal[i] || rf_trend[i] === 'DOWN')) ||
+                    (ht.type === 'SHORT' && (longSignal[i] || rf_trend[i] === 'UP'))) {
+                  currentTrade.realizedHedgeProfit = realizedHedgeProfit + excessPnL;
+                  ht.amount = currentTrade.amount; // Revert to 1:1
+                }
+              }
+            }
+          }
+        }
+
+        // Exit Logic
+        if (hedgeTrades.length > 0) {
+          // Exit both legs if total net profit covers losses + fees (BEP + small profit)
+          // We use targetProfit * 0.25 as a small buffer for BEP to ensure fees are covered
+          const bepTarget = targetProfit * 0.25; 
+          if (totalNetProfit >= bepTarget) {
+            exitPrice = close;
+            exitReason = 'HEDGE_BEP_PROFIT';
+          }
+        } else {
+          // Primary is not hedged
+          if (currentTrade.type === 'LONG') {
+            const currentFloatingHigh = (high - currentTrade.entryPrice) * currentTrade.amount;
+            const totalPotentialProfitHigh = currentFloatingHigh + realizedHedgeProfit;
+            if (takeProfitPct > 0 && totalPotentialProfitHigh >= targetProfit) {
+              exitPrice = high;
+              exitReason = 'TAKE_PROFIT';
+            }
+          } else if (currentTrade.type === 'SHORT') {
+            const currentFloatingLow = (currentTrade.entryPrice - low) * currentTrade.amount;
+            const totalPotentialProfitLow = currentFloatingLow + realizedHedgeProfit;
+            if (takeProfitPct > 0 && totalPotentialProfitLow >= targetProfit) {
+              exitPrice = low;
+              exitReason = 'TAKE_PROFIT';
+            }
+          }
+        }
+
+        if (exitPrice) {
+          // Calculate Primary Profit
+          const primaryProfit = currentTrade.type === 'LONG' 
+            ? (exitPrice - currentTrade.entryPrice) * currentTrade.amount
+            : (currentTrade.entryPrice - exitPrice) * currentTrade.amount;
+          
+          let totalTradeProfit = primaryProfit + (currentTrade.realizedHedgeProfit || 0);
+          
+          // Calculate All Active Hedge Profits (if any)
+          for (const ht of hedgeTrades) {
+            const hp = ht.type === 'LONG'
+              ? (exitPrice - ht.entryPrice) * ht.amount
+              : (ht.entryPrice - exitPrice) * ht.amount;
+            totalTradeProfit += hp;
+          }
+
+          balance += totalTradeProfit;
+          trades.push({
+            ...currentTrade,
+            exitPrice,
+            exitTime: time,
+            exitReason,
+            isHedged: hedgeTrades.length > 0,
+            hedgeCount: hedgeTrades.length,
+            profit: totalTradeProfit,
+            profitPct: (totalTradeProfit / (currentTrade.entryPrice * currentTrade.amount)) * 100,
+            finalBalance: balance
+          });
+          
+          currentTrade = null;
+          hedgeTrades = [];
+        }
+      }
+
+      // 2. Check for new entries
+      if (!currentTrade) {
+        let entryMultiplier = structure21Mode ? 2.0 : 1.0;
+        // Limit entry size based on maxMrPct
+        const maxAllowedAmount = (balance * (maxMrPct / 100)) / close;
+        
+        if (longSignal[i]) {
+          let amount = (balance / close) * entryMultiplier;
+          if (amount > maxAllowedAmount) amount = maxAllowedAmount;
+          
+          currentTrade = {
+            type: 'LONG',
+            entryPrice: close,
+            entryTime: time,
+            amount: amount
+          };
+        } else if (shortSignal[i]) {
+          let amount = (balance / close) * entryMultiplier;
+          if (amount > maxAllowedAmount) amount = maxAllowedAmount;
+          
+          currentTrade = {
+            type: 'SHORT',
+            entryPrice: close,
+            entryTime: time,
+            amount: amount
+          };
+        }
+      }
+      
+      // Calculate Equity for Curve
+      let currentEquity = balance;
+      if (currentTrade) {
+        const p1 = currentTrade.type === 'LONG' 
+          ? (close - currentTrade.entryPrice) * currentTrade.amount 
+          : (currentTrade.entryPrice - close) * currentTrade.amount;
+        currentEquity += p1;
+        
+        for (const ht of hedgeTrades) {
+          const hp = ht.type === 'LONG'
+            ? (close - ht.entryPrice) * ht.amount
+            : (ht.entryPrice - close) * ht.amount;
+          currentEquity += hp;
+        }
+        
+        currentEquity += (currentTrade.realizedHedgeProfit || 0);
+      }
+
+      equityCurve.push({ time, balance: currentEquity });
+    }
+
+    return {
+      symbol, timeframe, days,
+      summary: {
+        initialBalance,
+        finalBalance: balance,
+        totalProfit: balance - initialBalance,
+        profitPct: ((balance - initialBalance) / initialBalance) * 100,
+        totalTrades: trades.length,
+        winRate: trades.length > 0 ? (trades.filter(t => t.profit > 0).length / trades.length) * 100 : 0,
+        maxDrawdown: calculateMaxDrawdown(equityCurve)
+      },
+      trades: trades.reverse(),
+      equityCurve: equityCurve.filter((_, i) => i % 5 === 0)
+    };
+  } catch (error: any) {
+    console.error("Backtest Error:", error);
+    throw error;
+  }
+}
+
+function calculateMaxDrawdown(equityCurve: any[]) {
+  let maxBalance = 0;
+  let maxDd = 0;
+  for (const point of equityCurve) {
+    if (point.balance > maxBalance) maxBalance = point.balance;
+    const dd = (maxBalance - point.balance) / maxBalance;
+    if (dd > maxDd) maxDd = dd;
+  }
+  return maxDd * 100;
+}
+
+app.post('/api/ai/optimize', async (req, res) => {
+  try {
+    const { backtestResult } = req.body;
+    if (!backtestResult) {
+      return res.status(400).json({ error: 'Backtest result is required' });
+    }
+
+    const prompt = `
+      You are an expert quantitative trader and AI trading strategist.
+      Analyze the following backtest results and provide actionable recommendations to optimize the trading strategy.
+      
+      Backtest Parameters:
+      - Symbol: ${backtestResult.symbol}
+      - Timeframe: ${backtestResult.timeframe}
+      - Days: ${backtestResult.days}
+      
+      Performance Summary:
+      - Initial Balance: $${backtestResult.summary.initialBalance.toFixed(2)}
+      - Final Balance: $${backtestResult.summary.finalBalance.toFixed(2)}
+      - Total Profit: $${backtestResult.summary.totalProfit.toFixed(2)} (${backtestResult.summary.profitPct.toFixed(2)}%)
+      - Total Trades: ${backtestResult.summary.totalTrades}
+      - Win Rate: ${backtestResult.summary.winRate.toFixed(2)}%
+      - Max Drawdown: ${backtestResult.summary.maxDrawdown.toFixed(2)}%
+      
+      Please provide:
+      1. A brief evaluation of the performance (e.g., is the drawdown acceptable for the return?).
+      2. Specific parameter adjustments to improve the strategy based on the **SOP UTAMA - TRADING SENTINEL** (e.g., Take Profit, Lock Trigger %, Max MR %, enabling/disabling Add 0.5 or Structure 2:1).
+      3. Any market regimes or conditions where this strategy might fail based on the data.
+      4. A final recommendation on whether this strategy is ready for live trading.
+      
+      PENTING: Strategi ini menggunakan HEDGING LOCK (Lock 1:1) dan SAMA SEKALI TIDAK MENGENAL CUT LOSS. JANGAN PERNAH menyarankan Cut Loss. Jelaskan bahwa jika ada loss yang terjadi di backtest, itu adalah hasil dari dinamika "Unlocking" (membuka kunci hedge saat trend berbalik) yang mungkin belum optimal, BUKAN karena cut loss. 
+      
+      ATURAN HEDGING YANG DIGUNAKAN ENGINE SAAT INI:
+      1. Engine HANYA akan menutup posisi hedge (unlock) apabila kondisi hedge tersebut sedang PROFIT.
+      2. Bila kondisi kedua leg (Long dan Short) sedang RED (floating loss), engine akan menggunakan fitur "Add 0.5" bertahap sesuai trend sampai struktur menjadi 2:1.
+      3. Engine akan melakukan EXIT CLOSE pada kedua kaki (Long dan Short) setelah menghitung BEP Profit + Fees, yaitu ketika leg yang dominan telah mengcover loss dari leg yang lebih kecil.
+      
+      Fokus pada optimasi parameter Hedging (Lock Trigger, Take Profit, Max MR) untuk meminimalisir Drawdown dan memaksimalkan efisiensi dari aturan hedging di atas.
+      
+      Format your response in Markdown. Keep it concise, analytical, and actionable. 
+      IMPORTANT: You MUST write your entire response in Indonesian (Bahasa Indonesia).
+    `;
+
+    const aiResponse = await generateWithRetry(prompt, 'gemini-3.1-pro-preview');
+    res.json({ analysis: aiResponse });
+  } catch (error: any) {
+    console.error("AI Optimization Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/backtest', async (req, res) => {
+  try {
+    const { symbol, timeframe, days, takeProfitPct, lock11Mode, lockTriggerPct, add05Mode, structure21Mode, maxMrPct } = req.body;
+    if (!symbol || !timeframe) {
+      return res.status(400).json({ error: "Symbol and timeframe are required." });
+    }
+    const result = await runBacktest(
+      symbol, 
+      timeframe, 
+      parseInt(days) || 7, 
+      parseFloat(takeProfitPct) || 4.0,
+      lock11Mode === true,
+      parseFloat(lockTriggerPct) || 2.0,
+      add05Mode === true,
+      structure21Mode === true,
+      parseFloat(maxMrPct) || 25.0
+    );
+
+    // Save the backtest result to Firestore for the AI to learn from
+    try {
+      const docId = symbol.replace(/\//g, '_');
+      await setDoc(doc(db, 'backtests', docId), {
+        timestamp: serverTimestamp(),
+        symbol: result.symbol,
+        timeframe: result.timeframe,
+        days: result.days,
+        summary: result.summary
+      }, { merge: true });
+    } catch (e) {
+      console.error("Failed to save backtest result to Firestore:", e);
+      // We don't throw here to avoid failing the backtest request
+    }
+
+    res.json(result);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/backtest/approve', async (req, res) => {
+  try {
+    const { symbol, timeframe, days, takeProfitPct, lock11Mode, lockTriggerPct, add05Mode, structure21Mode, maxMrPct, summary } = req.body;
+    if (!symbol) {
+      return res.status(400).json({ error: "Symbol is required." });
+    }
+
+    const docId = symbol.replace(/\//g, '_');
+    await setDoc(doc(db, 'approved_settings', docId), {
+      timestamp: serverTimestamp(),
+      symbol,
+      timeframe,
+      days: parseInt(days) || 30,
+      takeProfitPct: parseFloat(takeProfitPct) || 4.0,
+      lock11Mode: lock11Mode === true,
+      lockTriggerPct: parseFloat(lockTriggerPct) || 2.0,
+      add05Mode: add05Mode === true,
+      structure21Mode: structure21Mode === true,
+      maxMrPct: parseFloat(maxMrPct) || 25.0,
+      summary
+    }, { merge: true });
+
+    res.json({ success: true, message: `Settings approved for ${symbol}` });
+  } catch (error: any) {
+    console.error("Failed to save approved settings:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/status', (req, res) => {
   res.json({
     isBotRunning,
@@ -2650,51 +3292,72 @@ async function generateAiReply(userMessage: string, chatId: string = 'default', 
     ========================================================
     PANDUAN STRATEGI (HANYA JIKA MEMBERIKAN ANALISA)
     ========================================================
-    KONSEP UTAMA:
-    Strategi Recovery ini menggunakan konsep "Recovery by Zone (Supply–Demand–Pivot–StopHedge)" sebagai SOP utama.
-    - Menyesuaikan strategi: SupplyHigh/Low → zona jual ideal, DemandHigh/Low → zona beli ideal, Pivot → equilibrium untuk reduce, StopHedge → invalidasi lock.
-    - Pola Zone Strategy: Lock at Extremes, Release at Pivot, Reduce di Mid-Range, Add di Edge, Hold Lock jika harga di tengah, Recovery mode jika harga kembali ke Demand/Supply.
-    - Terapkan juga teknik inti lainnya seperti Locking Standard (Full/Partial), Hedging Step, Exposure Balancing, dan MR Guard sesuai kondisi.
-    
-    PENGGANTI STOP LOSS (STOP HEDGE):
-    - Dalam mode recovery ini, KITA TIDAK MENGGUNAKAN STOP LOSS KONVENSIONAL.
-    - Pengganti Stop Loss adalah KEMBALI KE MODE LOCKING 1:1 (NEUTRAL).
-    - Jika harga bergerak berlawanan dengan prediksi tren kita, segera sarankan untuk MENAMBAH posisi yang tertinggal agar rasio kembali 1:1 (Locking Total).
+    SOP UTAMA – TRADING SENTINEL
+    Strategi: Hedging Recovery Konservatif, Berbasis Trend & Lock 1:1
+    Tujuan: Jaga MR rendah, bekukan risiko dengan benar, ikuti trend, exit penuh & reset.
 
-    🌐 KEAHLIAN INTI DALAM HEDGING RECOVERY YANG ANDA KUASAI:
-    
-    🧠 1. Locking Standard (Full/Partial Lock)
-    Fokus pada menetralisir risiko ketika posisi sudah berat atau market bergerak berlawanan kuat.
-    - Menentukan kapan lock perlu dilakukan segera atau menunggu zone tertentu.
-    - Menilai apakah lock akan menurunkan MR, menstabilkan equity, atau mencegah kerusakan lebih dalam.
-    - Membandingkan kebutuhan lock vs reduce.
-    - Menilai apakah lock-nya terlalu berat (over-hedging) atau terlalu kecil (under-hedging).
-    - Variasi Lock: Full Lock (qty long ≈ qty short), Partial Lock (salah satu sisi dominan), Dynamic Lock (variasi oleh zona), Smart Lock by Bias (lock kecil jika trend masih kuat).
+    SECTION 0 – IDENTITAS & PERAN
+    Kamu adalah SENTINEL, asisten trading yang:
+    - Mengelola posisi dengan pendekatan Hedging Recovery konservatif,
+    - Menggunakan hedge sebagai pengganti stop loss,
+    - Menjaga risiko (MR) sebagai prioritas utama,
+    - Mengutamakan exit penuh searah trend dan memulai kembali dengan struktur baru (reset).
+    ATURAN EMAS: JANGAN PERNAH menyarankan REDUCE atau CUT LOSS pada posisi yang sedang MERAH (Rugi/Floating Loss). REDUCE HANYA BOLEH dilakukan pada posisi yang sedang HIJAU (Profit).
+    Kamu TIDAK bertindak barbar: Tidak cut loss posisi merah, tidak martingale, tidak menambah lot besar mendadak, tidak mengabaikan MR, tidak mempertahankan posisi nyangkut tanpa rencana.
 
-    🧩 2. Hedging Step / Step-by-Step Recovery
-    Memperbaiki BEP dan tekanan posisi secara berjenjang, aman, dan selalu memperhatikan MR.
-    - Menilai kapan aman melakukan step beli/jual (ADD_LONG/ADD_SHORT).
-    - Menghitung efek setiap step pada MR, Net exposure, Drawdown, dan Keseimbangan posisi.
-    - Menyusun urutan step yang aman (misal: Step reduce dulu → baru step add kecil → lalu lock → lalu unlock di zone tertentu).
-    - Model Step: Step Compression (perkecil gap BEP), Step Defensive (tambah posisi kecil untuk kurangi tekanan net), Inverse Step (step pendek ke arah floating loss), Weighted Step (penambahan lot diselaraskan dengan zona demand/supply).
+    SECTION 1 – RUANG LINGKUP PENERAPAN STRATEGI
+    Strategi ini HANYA boleh diterapkan pada:
+    1) TRADING BARU (fresh signal),
+    2) TRADING LAMA dengan syarat pergerakan harga spot (real spot price) yang melawan posisi maksimal 4%. Jika pergerakan spot > 4% → anggap struktur berat → fokus reduce/lock saja. (Ingat: 4% ini dari harga spot, BUKAN dari Margin Ratio).
+    Aturan global: MR ideal: < 15%, MR guardrail keras: 25%.
 
-    🗺️ 3. Recovery by Zone (Supply–Demand–Pivot–StopHedge)
-    Teknik paling presisi berbasis area sebagai SOP utama.
-    - Menentukan di zone mana TP partial dilakukan, hedge dilepas sebagian, step ditambah, lock dibuka, atau risiko dikurangi.
-    - Menyesuaikan strategi: SupplyHigh/Low → zona jual ideal, DemandHigh/Low → zona beli ideal, Pivot → equilibrium untuk reduce, StopHedge → invalidasi lock.
-    - Pola Zone Strategy: Lock at Extremes, Release at Pivot, Reduce di Mid-Range, Add di Edge, Hold Lock jika harga di tengah, Recovery mode jika harga kembali ke Demand/Supply.
+    SECTION 2 – DEFINISI OPERASIONAL
+    1. Bias4H: Arah trend utama (UP / DOWN / RANGE) pada timeframe 4H.
+    2. Bias1H: Tekanan jangka pendek pada timeframe 1H.
+    3. Hedge: Posisi lawan yang dibuka sebagai pengganti stop loss.
+    4. Lock 1:1: Kondisi di mana qty long ≈ qty short.
+    5. Add 0.5: Penambahan posisi kecil setelah konfirmasi trend baru.
+    6. Struktur 2:1: Hanya digunakan ketika trend kuat dan jelas, MR < 15%.
+    7. Gap 4% / Lock Trigger: Batas toleransi pergerakan harga spot (real spot price) yang melawan posisi, BUKAN persentase Margin Ratio.
 
-    🔥 4. Teknik Lanjutan
-    - Exposure Balancing: Mengubah struktur posisi supaya tidak berat ke satu sisi berdasarkan zona (mis. "Unbalanced Long" dinetralkan).
-    - MR & Margin Guard Strategy: Menolak/memperingatkan aksi yang menaikkan MR di area bahaya (≥25%) dan memberi alternatif risiko rendah.
-    - Dynamic Unlock Strategy: Membuka lock secara bertahap di zone aman, menghindari "panic unlock".
-    - Multi-Layer Hedge: Merancang hedge besar + hedge kecil cadangan, atau “ladder hedge” mengikuti struktur market.
+    SECTION 3 – PARAMETER RISIKO GLOBAL
+    - MRGlobal < 15% → kondisi aman.
+    - MRGlobal 15–25% → zona waspada (fokus pengurangan risiko).
+    - MRGlobal ≥ 25% → keadaan darurat (DILARANG ekspansi, hanya reduce/lock/TP).
 
-    🛡️ 5. Second Opinion Institusional-Level (PERAN UTAMA ANDA)
-    Menilai apakah Action dalam trading user atau tanya jawab user benar dari sudut Risiko, Zona, Bias trend, MR, dan Floating structure.
-    Berikan label penilaian: AGREE, CAUTION, REVISE, atau REJECT.
-    Lalu berikan ActionSuggested dari teknik-teknik di atas.
-    
+    SECTION 4 – WORKFLOW A: TRADE BARU
+    - Entry hanya 1 posisi awal searah Bias4H.
+    - STOP LOSS = HEDGE. Jika harga menyentuh StopHedge (invalidation level), buka posisi lawan hingga Lock 1:1, lalu masuk mode WAIT & SEE.
+    - EXIT dilakukan jika profit sisi trend ≥ kerugian sisi lawan + biaya trading.
+
+    SECTION 5 – WORKFLOW B: TRADE LAMA (PERGERAKAN SPOT ≤ 4%)
+    - Tujuan utama: Menyusun ulang posisi agar sejalan dengan trend dominan, lock jika perlu, de-risk lebih dulu sebelum ekspansi.
+
+    SECTION 6 – MODE LOCK 1:1 (WAIT & SEE MODE)
+    - JANGAN langsung unlock atau add besar. Fokus observasi konfirmasi trend baru.
+    - HANYA BOLEH UNLOCK (Tutup posisi hedge) JIKA POSISI HEDGE TERSEBUT SEDANG PROFIT.
+    - REVERT KE 1:1: Jika struktur 2:1 dan trend berbalik arah, AKSI ADALAH REDUCE POSISI EKSTRA (yang dominan) tepat di atas profit untuk kembali ke Lock Neutral 1:1 dan masuk mode Wait & See. JANGAN menambah posisi baru untuk me-lock.
+    - Jika kedua leg merah: Tunggu konfirmasi trend baru, lalu ADD 0.5 bertahap searah trend baru pada pullback sampai struktur menjadi maksimal 2:1.
+    - Jika salah satu leg profit: Sisi profit dapat dipakai sebagai sumber dana recovery, sisi rugi diarahkan oleh trend baru.
+
+    SECTION 7 – EXPANSI KECIL (ADD 0.5) & STRUKTUR 2:1
+    - ADD 0.5 hanya setelah konfirmasi trend baru dan MR < 25%.
+    - Struktur 2:1 hanya saat MR < 15% dan trend kuat, ATAU saat melakukan recovery ketika kedua leg merah.
+
+    SECTION 8 – EXIT & RESET (INTI STRATEGI HEDGING RECOVERY)
+    - INTI STRATEGI: Apabila dalam posisi hedge (terutama struktur 2:1), EXIT WAJIB dilakukan secara BERSAMAAN (full close kedua kaki long dan short) dengan prinsip NET PROFIT.
+    - Exit dilakukan setelah menghitung BEP Profit + Fees, yaitu ketika leg yang dominan + profit unlock sebelumnya telah mengcover loss dari leg yang lebih kecil.
+    - Jika posisi saat ini sudah 2:1 (UNBALANCED), WAJIB menghitung di harga berapa BEP itu tercapai sesuai trend yang ada saat ini.
+    - RUMUS BEP 2:1 = ((Qty_Long * Entry_Long) - (Qty_Short * Entry_Short)) / (Qty_Long - Qty_Short)
+    - Setelah exit penuh dengan net profit, WAJIB masuk ke mode WAIT & SEE (reset) dan cari peluang baru (fresh posisi).
+
+    SECTION 9 – PRIORITAS MULTI-PAIR
+    - Prioritaskan pair dengan MRProjected tertinggi, pergerakan spot melawan posisi mendekati 4%, atau floating loss terbesar berlawanan Bias4H.
+
+    SECTION 10 – PRINSIP FILOSOFIS
+    - Hedging adalah pengganti stop loss untuk membekukan risiko.
+    - Fokus utama: Kontrol MR, struktur bersih, add kecil, exit penuh searah trend, reset.
+
     [ADDENDUM_ID]: COMPREHENSIVE_COIN_ANALYSIS
     [MODE]: SAFE_MERGE
     [PRIORITY]: high
@@ -2746,9 +3409,10 @@ async function generateAiReply(userMessage: string, chatId: string = 'default', 
     3. Titik Harga Masuk (SMC di TF Kecil):
        - Sebutkan Area Entry Ideal berdasarkan FVG atau Order Block di TF 1H atau 15m.
        - Berikan angka harga spesifik.
-    4. Manajemen Risiko (Stop Hedge):
+    4. Manajemen Risiko (Stop Hedge) & BEP:
        - Tentukan "Harga Stop Hedge" (Titik Invalidation).
-       - Jelaskan aksi jika harga menyentuh titik ini (misal: "Lock Kembali ke 1:1").
+       - Jelaskan aksi jika harga menyentuh titik ini. INGAT: Jika posisi saat ini 2:1, aksi Stop Hedge adalah REVERT KE 1:1 dengan cara MENUTUP POSISI EKSTRA (REDUCE leg yang dominan), BUKAN menambah posisi baru.
+       - Jika posisi saat ini 2:1, sebutkan di harga berapa BEP (Break Even Point) tercapai. Gunakan rumus: BEP = ((Qty_Long * Entry_Long) - (Qty_Short * Entry_Short)) / (Qty_Long - Qty_Short).
     5. Rangkuman Reversal/Pullback
     
     Format dalam PLAIN TEXT, gunakan emoji secukupnya. JANGAN gunakan Markdown (tanpa bintang, tanpa garis bawah).

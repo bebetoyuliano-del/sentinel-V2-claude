@@ -51,6 +51,30 @@ service cloud.firestore {
     //   - tradedSymbols: list (required)
     //   - evaluation: string (required)
     //
+    // Collection: backtests
+    // Document ID: symbol (with _ instead of /)
+    // Fields:
+    //   - symbol: string
+    //   - timeframe: string
+    //   - days: number
+    //   - summary: object
+    //   - timestamp: timestamp
+    //
+    // Collection: approved_settings
+    // Document ID: symbol (with _ instead of /)
+    // Fields:
+    //   - symbol: string
+    //   - timeframe: string
+    //   - days: number
+    //   - takeProfitPct: number
+    //   - lock11Mode: boolean
+    //   - lockTriggerPct: number
+    //   - add05Mode: boolean
+    //   - structure21Mode: boolean
+    //   - maxMrPct: number
+    //   - summary: object
+    //   - timestamp: timestamp
+    //
     // ===============================================================
 
     // ===============================================================
@@ -133,6 +157,21 @@ service cloud.firestore {
              data.evaluation is string && data.evaluation.size() < 20000;
     }
 
+    function isValidApprovedSettings(data) {
+      return hasOnlyAllowedFields(['symbol', 'timeframe', 'days', 'takeProfitPct', 'lock11Mode', 'lockTriggerPct', 'add05Mode', 'structure21Mode', 'maxMrPct', 'summary', 'timestamp']) &&
+             data.symbol is string &&
+             data.timeframe is string &&
+             data.days is number &&
+             data.takeProfitPct is number &&
+             data.lock11Mode is bool &&
+             data.lockTriggerPct is number &&
+             data.add05Mode is bool &&
+             data.structure21Mode is bool &&
+             data.maxMrPct is number &&
+             data.summary is map &&
+             data.timestamp is timestamp;
+    }
+
     // ===============================================================
     // Rules
     // ===============================================================
@@ -185,6 +224,16 @@ service cloud.firestore {
       allow create: if isAdmin() && isValidJournalSummary(request.resource.data);
       allow update: if isAdmin() && isValidJournalSummary(request.resource.data);
       allow delete: if isAdmin();
+    }
+
+    match /backtests/{symbol} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    match /approved_settings/{symbol} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() && isValidApprovedSettings(request.resource.data);
     }
   }
 }

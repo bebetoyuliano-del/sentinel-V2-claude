@@ -1,10 +1,62 @@
 import { useEffect, useState } from 'react';
-import { Activity, Play, Square, TrendingUp, AlertCircle, RefreshCw, MessageSquare, Target, BarChart2, X, Bot, User, Send, LogOut, CheckCircle2, BookOpen } from 'lucide-react';
+import { Activity, Play, Square, TrendingUp, AlertCircle, RefreshCw, MessageSquare, Target, BarChart2, X, Bot, User, Send, LogOut, CheckCircle2, BookOpen, FlaskConical } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { AdvancedRealTimeChart } from 'react-ts-tradingview-widgets';
 import { auth, db, loginWithGoogle, logout } from './firebase';
 import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
-import { collection, query, orderBy, limit, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore';
+import { collection, query, orderBy, limit, onSnapshot, addDoc, serverTimestamp, getDocFromServer, doc } from 'firebase/firestore';
+import BacktestView from './components/BacktestView';
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
 
 interface Status {
   isBotRunning: boolean;
@@ -46,7 +98,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [showChart, setShowChart] = useState(false);
   const [chartSymbol, setChartSymbol] = useState('BINANCE:BTCUSDT.P');
-  const [activeTab, setActiveTab] = useState<'signals' | 'chat' | 'journal'>('signals');
+  const [activeTab, setActiveTab] = useState<'signals' | 'chat' | 'journal' | 'backtest'>('signals');
   const [chatMessages, setChatMessages] = useState<{role: 'user'|'ai', content: string}[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [isChatting, setIsChatting] = useState(false);
@@ -74,6 +126,17 @@ export default function App() {
   };
 
   useEffect(() => {
+    async function testConnection() {
+      try {
+        await getDocFromServer(doc(db, 'test', 'connection'));
+      } catch (error) {
+        if(error instanceof Error && error.message.includes('the client is offline')) {
+          console.error("Please check your Firebase configuration. ");
+        }
+      }
+    }
+    testConnection();
+
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
       if (currentUser) {
@@ -107,7 +170,7 @@ export default function App() {
       })) as Signal[];
       setSignals(fetchedSignals);
     }, (err) => {
-      console.error("Error fetching signals from Firestore:", err);
+      handleFirestoreError(err, OperationType.GET, 'signals');
     });
 
     // Listen to chat messages
@@ -119,7 +182,7 @@ export default function App() {
       }));
       setChatMessages(fetchedChats as any);
     }, (err) => {
-      console.error("Error fetching chats from Firestore:", err);
+      handleFirestoreError(err, OperationType.GET, 'chats');
     });
 
     // Listen to journal
@@ -131,7 +194,7 @@ export default function App() {
       }));
       setJournal(fetchedJournal);
     }, (err) => {
-      console.error("Error fetching journal from Firestore:", err);
+      handleFirestoreError(err, OperationType.GET, 'trading_journal');
     });
 
     return () => {
@@ -166,8 +229,11 @@ export default function App() {
       ]);
 
       if (statusRes.ok) {
-        setStatus(await statusRes.json());
-        setError(null); // Clear error on successful status fetch
+        const data = await statusRes.json().catch(() => null);
+        if (data) {
+          setStatus(data);
+          setError(null); // Clear error on successful status fetch
+        }
       }
       
       if (marketRes.ok) {
@@ -250,11 +316,15 @@ export default function App() {
     
     try {
       // Save user message to Firestore
-      await addDoc(collection(db, 'chats'), {
-        role: 'user',
-        content: userMsg,
-        timestamp: new Date().toISOString()
-      });
+      try {
+        await addDoc(collection(db, 'chats'), {
+          role: 'user',
+          content: userMsg,
+          timestamp: new Date().toISOString()
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, 'chats');
+      }
 
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -264,11 +334,15 @@ export default function App() {
       const data = await res.json();
       if (data.reply) {
         // Save AI reply to Firestore
-        await addDoc(collection(db, 'chats'), {
-          role: 'ai',
-          content: data.reply,
-          timestamp: new Date().toISOString()
-        });
+        try {
+          await addDoc(collection(db, 'chats'), {
+            role: 'ai',
+            content: data.reply,
+            timestamp: new Date().toISOString()
+          });
+        } catch (err) {
+          handleFirestoreError(err, OperationType.WRITE, 'chats');
+        }
       }
     } catch (err) {
       console.error('Failed to send message:', err);
@@ -598,6 +672,13 @@ export default function App() {
                 <BookOpen className="w-4 h-4" />
                 Trading Journal
               </button>
+              <button 
+                onClick={() => setActiveTab('backtest')}
+                className={`text-sm font-medium flex items-center gap-2 px-2 py-1 border-b-2 transition-colors ${activeTab === 'backtest' ? 'border-emerald-500 text-emerald-400' : 'border-transparent text-zinc-400 hover:text-zinc-300'}`}
+              >
+                <FlaskConical className="w-4 h-4" />
+                Backtest
+              </button>
             </div>
 
             <div className="flex-1 overflow-y-auto min-h-0">
@@ -730,6 +811,8 @@ export default function App() {
                     ))
                   )}
                 </div>
+              ) : activeTab === 'backtest' ? (
+                <BacktestView />
               ) : (
                 <div className="flex flex-col h-full bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
                   <div className="flex-1 overflow-y-auto p-4 space-y-4">
