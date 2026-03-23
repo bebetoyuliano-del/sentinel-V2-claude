@@ -1262,10 +1262,31 @@ async function ensureAuth() {
 }
 
 // Core monitoring function
-async function monitorMarkets() {
+async function monitorMarkets(force = false) {
   await ensureAuth();
   const startTime = Date.now();
   console.log(`[PERF] Starting monitorMarkets run at ${new Date().toISOString()}`);
+  
+  if (db) {
+    try {
+      const lockRef = doc(db, 'system', 'bot_lock');
+      if (!force) {
+        const lockSnap = await getDoc(lockRef);
+        if (lockSnap.exists()) {
+          const lastRun = lockSnap.data().last_run_time || 0;
+          // If last run was less than 14 minutes ago, skip to prevent multiple instances from spamming
+          if (Date.now() - lastRun < 14 * 60 * 1000) {
+            console.log(`[LOCK] Skipping monitorMarkets, last run was less than 14 minutes ago.`);
+            return;
+          }
+        }
+      }
+      await setDoc(lockRef, { last_run_time: Date.now() }, { merge: true });
+    } catch (e) {
+      console.error('Error checking/setting bot lock:', e);
+    }
+  }
+
   try {
     console.log('Fetching market data and positions...');
     
@@ -1740,6 +1761,11 @@ async function monitorMarkets() {
       3) TIMESTAMP:
          - telemetry.generated_at = waktu SAAT INI (UTC ISO‑8601).
 
+      4) JUMLAH KARTU (PENTING):
+         - Buatlah HANYA SATU decision_card per koin yang memiliki posisi terbuka (open positions).
+         - JANGAN membuat decision_card untuk koin yang tidak memiliki posisi terbuka.
+         - JANGAN membuat duplikat decision_card untuk koin yang sama.
+
       === OUTPUT CONTRACT (WAJIB) ===
       {
         "market_summary": "string <= 320 chars",
@@ -1961,7 +1987,18 @@ async function monitorMarkets() {
         };
     }
     
-    const cards = analysisData.decision_cards || [];
+    let cards = analysisData.decision_cards || [];
+    
+    // Deduplicate cards by symbol to prevent spam
+    const uniqueCards = [];
+    const seenSymbols = new Set();
+    for (const c of cards) {
+        if (c.symbol && !seenSymbols.has(c.symbol)) {
+            seenSymbols.add(c.symbol);
+            uniqueCards.push(c);
+        }
+    }
+    cards = uniqueCards;
     latestDecisionCards = cards;
     const se = analysisData.server_enforce || { overrides:[], mr_projection:[], alerts:[] };
     const gg = analysisData.global_guard || { mode:"NORMAL" };
@@ -3079,7 +3116,7 @@ app.post('/api/bot/toggle', async (req, res) => {
     res.json({ isBotRunning });
   } else {
     try {
-      await monitorMarkets();
+      await monitorMarkets(true);
       monitorInterval = setInterval(() => {
         monitorMarkets().catch(console.error);
       }, 900000); // 15 minutes
@@ -3093,7 +3130,7 @@ app.post('/api/bot/toggle', async (req, res) => {
 
 app.post('/api/bot/force-run', (req, res) => {
   // Run in background to prevent browser timeout
-  monitorMarkets().catch(err => console.error('Force run failed in background:', err));
+  monitorMarkets(true).catch(err => console.error('Force run failed in background:', err));
   res.json({ success: true, message: 'Bot run started in background' });
 });
 
