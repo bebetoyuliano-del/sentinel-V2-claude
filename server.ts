@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import axios from 'axios';
 import ccxt from 'ccxt';
 import cors from 'cors';
@@ -470,6 +470,8 @@ function getAI() {
 let signals: any[] = [];
 let isBotRunning = false;
 let monitorInterval: NodeJS.Timeout | null = null;
+let isPaperTradingRunning = false;
+let paperTradingInterval: NodeJS.Timeout | null = null;
 let latestDecisionCards: any[] = [];
 
 // Helper to send Telegram message
@@ -908,6 +910,9 @@ async function generateWithRetry(prompt: string, modelName: string = 'gemini-3.1
       }
       
       config.config = {};
+      if (modelName === 'gemini-3.1-pro-preview') {
+        config.config.thinkingConfig = { thinkingLevel: ThinkingLevel.HIGH };
+      }
       if (jsonMode) {
         config.config.responseMimeType = 'application/json';
       }
@@ -2503,6 +2508,154 @@ function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global
     return payloads;
 }
 
+// Paper Trading Engine Logic
+async function runPaperTradingEngine() {
+  await ensureAuth();
+  if (!db) return;
+
+  console.log(`[PAPER] Running Paper Trading Engine at ${new Date().toISOString()}`);
+
+  try {
+    // 1. Ensure Paper Wallet exists
+    const walletRef = doc(db, 'paper_wallet', 'main');
+    const walletSnap = await getDoc(walletRef);
+    let wallet = { balance: 10000, equity: 10000, freeMargin: 10000, updatedAt: new Date().toISOString() };
+    if (!walletSnap.exists()) {
+      await setDoc(walletRef, wallet);
+    } else {
+      wallet = walletSnap.data() as any;
+    }
+
+    // 2. Fetch Approved Settings
+    const settingsSnap = await getDocs(collection(db, 'approved_settings'));
+    const approvedSettings = settingsSnap.docs.map(doc => doc.data());
+
+    if (approvedSettings.length === 0) {
+      console.log('[PAPER] No approved settings found. Skipping cycle.');
+      return;
+    }
+
+    // 3. Fetch Open Positions
+    const positionsSnap = await getDocs(collection(db, 'paper_positions'));
+    const openPositions = positionsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    // 4. Process each approved setting
+    for (const setting of approvedSettings) {
+      const { symbol, timeframe, takeProfitPct, lock11Mode, lockTriggerPct, add05Mode, structure21Mode, maxMrPct } = setting;
+      
+      try {
+        // Fetch recent OHLCV
+        const ohlcv = await binance.fetchOHLCV(symbol, timeframe, undefined, 100);
+        if (ohlcv.length < 100) continue;
+
+        const currentPrice = ohlcv[ohlcv.length - 1][4];
+        const rf = rangeFilterPineExact(ohlcv as any, { per: 100, mult: 3.0 });
+        const { longSignal, shortSignal } = rf.arrays;
+        
+        // Check signal on the last closed candle
+        const lastClosedIndex = ohlcv.length - 2;
+        const hasLongSignal = longSignal[lastClosedIndex];
+        const hasShortSignal = shortSignal[lastClosedIndex];
+
+        // Find existing position for this symbol
+        const existingPosition = openPositions.find((p: any) => p.symbol === symbol && p.status === 'OPEN');
+
+        // Handle Exits & Updates
+        if (existingPosition) {
+          let shouldClose = false;
+          let closeReason = '';
+          let pnl = 0;
+
+          const isLong = existingPosition.side === 'LONG';
+          const entryPrice = existingPosition.entryPrice;
+          const size = existingPosition.size;
+
+          // Calculate current PnL
+          if (isLong) {
+            pnl = (currentPrice - entryPrice) * size;
+          } else {
+            pnl = (entryPrice - currentPrice) * size;
+          }
+
+          const pnlPct = (pnl / (entryPrice * size)) * 100;
+
+          // Check Take Profit
+          if (pnlPct >= takeProfitPct) {
+            shouldClose = true;
+            closeReason = 'Take Profit';
+          } 
+          // Check Opposite Signal
+          else if ((isLong && hasShortSignal) || (!isLong && hasLongSignal)) {
+            shouldClose = true;
+            closeReason = 'Opposite Signal';
+          }
+
+          if (shouldClose) {
+            // Close position
+            await setDoc(doc(db, 'paper_history', existingPosition.id), {
+              ...existingPosition,
+              exitPrice: currentPrice,
+              pnl,
+              reason: closeReason,
+              closedAt: new Date().toISOString(),
+              status: 'CLOSED'
+            });
+            await deleteDoc(doc(db, 'paper_positions', existingPosition.id));
+
+            // Update Wallet
+            wallet.balance += pnl;
+            wallet.equity = wallet.balance;
+            wallet.freeMargin = wallet.balance;
+            wallet.updatedAt = new Date().toISOString();
+            await setDoc(walletRef, wallet);
+
+            await sendTelegramMessage(`[PAPER] 💰 <b>Closed ${existingPosition.side} ${symbol}</b>\nReason: ${closeReason}\nPnL: $${pnl.toFixed(2)}`);
+          } else {
+            // Update Unrealized PnL
+            await setDoc(doc(db, 'paper_positions', existingPosition.id), {
+              unrealizedPnl: pnl
+            }, { merge: true });
+          }
+        } 
+        // Handle Entries
+        else {
+          if (hasLongSignal || hasShortSignal) {
+            const side = hasLongSignal ? 'LONG' : 'SHORT';
+            // Allocate 10% of free margin per trade (simplified)
+            const tradeAmount = wallet.freeMargin * 0.1;
+            const size = tradeAmount / currentPrice;
+
+            if (tradeAmount > 10) { // Minimum trade size
+              const newPosRef = doc(collection(db, 'paper_positions'));
+              await setDoc(newPosRef, {
+                symbol,
+                side,
+                entryPrice: currentPrice,
+                size,
+                unrealizedPnl: 0,
+                takeProfit: isLong ? currentPrice * (1 + takeProfitPct/100) : currentPrice * (1 - takeProfitPct/100),
+                stopLoss: 0, // Simplified for now
+                status: 'OPEN',
+                openedAt: new Date().toISOString()
+              });
+
+              wallet.freeMargin -= tradeAmount;
+              wallet.updatedAt = new Date().toISOString();
+              await setDoc(walletRef, wallet);
+
+              await sendTelegramMessage(`[PAPER] 🟢 <b>Opened ${side} ${symbol}</b>\nEntry: $${currentPrice.toFixed(4)}\nSize: ${size.toFixed(4)}`);
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`[PAPER] Error processing ${symbol}:`, err);
+      }
+    }
+  } catch (error) {
+    console.error('[PAPER] Engine Error:', error);
+  }
+}
+
 // API Routes
 // Backtesting Engine Logic
 async function runBacktest(
@@ -3122,6 +3275,59 @@ app.post('/api/journal/sync', async (req, res) => {
     res.json({ success: true, syncedCount });
   } catch (error: any) {
     console.error('Error syncing journal:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/paper/toggle', async (req, res) => {
+  if (isPaperTradingRunning) {
+    if (paperTradingInterval) clearInterval(paperTradingInterval);
+    isPaperTradingRunning = false;
+    res.json({ isPaperTradingRunning });
+  } else {
+    try {
+      await runPaperTradingEngine();
+      paperTradingInterval = setInterval(() => {
+        runPaperTradingEngine().catch(console.error);
+      }, 60000); // 1 minute
+      isPaperTradingRunning = true;
+      res.json({ isPaperTradingRunning });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Failed to start paper trading' });
+    }
+  }
+});
+
+app.get('/api/paper/status', (req, res) => {
+  res.json({ isPaperTradingRunning });
+});
+
+app.get('/api/paper/wallet', async (req, res) => {
+  try {
+    await ensureAuth();
+    const walletSnap = await getDoc(doc(db, 'paper_wallet', 'main'));
+    res.json(walletSnap.exists() ? walletSnap.data() : { balance: 10000, equity: 10000, freeMargin: 10000 });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/paper/positions', async (req, res) => {
+  try {
+    await ensureAuth();
+    const positionsSnap = await getDocs(collection(db, 'paper_positions'));
+    res.json(positionsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/paper/history', async (req, res) => {
+  try {
+    await ensureAuth();
+    const historySnap = await getDocs(collection(db, 'paper_history'));
+    res.json(historySnap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+  } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });

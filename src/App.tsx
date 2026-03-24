@@ -6,6 +6,7 @@ import { auth, db, loginWithGoogle, logout } from './firebase';
 import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { collection, query, orderBy, limit, onSnapshot, addDoc, serverTimestamp, getDocFromServer, doc } from 'firebase/firestore';
 import BacktestView from './components/BacktestView';
+import PaperTradingView from './components/PaperTradingView';
 
 enum OperationType {
   CREATE = 'create',
@@ -98,7 +99,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [showChart, setShowChart] = useState(false);
   const [chartSymbol, setChartSymbol] = useState('BINANCE:BTCUSDT.P');
-  const [activeTab, setActiveTab] = useState<'signals' | 'chat' | 'journal' | 'backtest'>('signals');
+  const [activeTab, setActiveTab] = useState<'signals' | 'chat' | 'journal' | 'backtest' | 'paper'>('signals');
   const [chatMessages, setChatMessages] = useState<{role: 'user'|'ai', content: string}[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [isChatting, setIsChatting] = useState(false);
@@ -679,6 +680,13 @@ export default function App() {
                 <FlaskConical className="w-4 h-4" />
                 Backtest
               </button>
+              <button 
+                onClick={() => setActiveTab('paper')}
+                className={`text-sm font-medium flex items-center gap-2 px-2 py-1 border-b-2 transition-colors ${activeTab === 'paper' ? 'border-emerald-500 text-emerald-400' : 'border-transparent text-zinc-400 hover:text-zinc-300'}`}
+              >
+                <Activity className="w-4 h-4" />
+                Paper Trading
+              </button>
             </div>
 
             <div className="flex-1 overflow-y-auto min-h-0">
@@ -813,6 +821,8 @@ export default function App() {
                 </div>
               ) : activeTab === 'backtest' ? (
                 <BacktestView />
+              ) : activeTab === 'paper' ? (
+                <PaperTradingView />
               ) : (
                 <div className="flex flex-col h-full bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
                   <div className="flex-1 overflow-y-auto p-4 space-y-4">

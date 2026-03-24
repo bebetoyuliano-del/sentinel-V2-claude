@@ -226,6 +226,21 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    match /paper_wallet/{walletId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /paper_positions/{positionId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /paper_history/{historyId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+
     match /backtests/{symbol} {
       allow read: if isAuthenticated();
       allow write: if isAdmin();

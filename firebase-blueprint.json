@@ -94,6 +94,52 @@
         "evaluation": { "type": "string" }
       },
       "required": ["timestamp", "period", "totalTrades", "winRate", "netPnl", "evaluation"]
+    },
+    "PaperWallet": {
+      "title": "PaperWallet",
+      "description": "Virtual wallet for paper trading",
+      "type": "object",
+      "properties": {
+        "balance": { "type": "number" },
+        "equity": { "type": "number" },
+        "freeMargin": { "type": "number" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["balance", "equity", "freeMargin", "updatedAt"]
+    },
+    "PaperPosition": {
+      "title": "PaperPosition",
+      "description": "Open virtual trading position",
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string" },
+        "side": { "type": "string", "enum": ["LONG", "SHORT"] },
+        "entryPrice": { "type": "number" },
+        "size": { "type": "number" },
+        "unrealizedPnl": { "type": "number" },
+        "takeProfit": { "type": "number" },
+        "stopLoss": { "type": "number" },
+        "status": { "type": "string", "enum": ["OPEN"] },
+        "openedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["symbol", "side", "entryPrice", "size", "status", "openedAt"]
+    },
+    "PaperHistory": {
+      "title": "PaperHistory",
+      "description": "Closed virtual trading position",
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string" },
+        "side": { "type": "string", "enum": ["LONG", "SHORT"] },
+        "entryPrice": { "type": "number" },
+        "exitPrice": { "type": "number" },
+        "size": { "type": "number" },
+        "pnl": { "type": "number" },
+        "reason": { "type": "string" },
+        "openedAt": { "type": "string", "format": "date-time" },
+        "closedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["symbol", "side", "entryPrice", "exitPrice", "size", "pnl", "reason", "openedAt", "closedAt"]
     }
   },
   "firestore": {
@@ -120,6 +166,18 @@
     "/journal_summaries/{summaryId}": {
       "schema": { "$ref": "#/entities/JournalSummary" },
       "description": "Stores 12-hour auto-generated journal summaries"
+    },
+    "/paper_wallet/{walletId}": {
+      "schema": { "$ref": "#/entities/PaperWallet" },
+      "description": "Stores the virtual wallet balance"
+    },
+    "/paper_positions/{positionId}": {
+      "schema": { "$ref": "#/entities/PaperPosition" },
+      "description": "Stores open virtual positions"
+    },
+    "/paper_history/{historyId}": {
+      "schema": { "$ref": "#/entities/PaperHistory" },
+      "description": "Stores closed virtual positions"
     }
   }
 }
