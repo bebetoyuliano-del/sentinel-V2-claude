@@ -107,6 +107,7 @@ export default function App() {
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [journal, setJournal] = useState<any[]>([]);
+  const [journalFilter, setJournalFilter] = useState<'ALL' | 'AI' | 'PAPER_BOT' | 'USER'>('ALL');
   const [isSyncing, setIsSyncing] = useState(false);
 
   const handleSync = async () => {
@@ -713,33 +714,59 @@ export default function App() {
                 </div>
               ) : activeTab === 'journal' ? (
                 <div className="space-y-4">
-                  <div className="flex justify-between items-center mb-4">
+                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-4">
                     <h3 className="text-lg font-bold">Trading Journal</h3>
-                    <button
-                      onClick={handleSync}
-                      disabled={isSyncing}
-                      className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm rounded-lg flex items-center gap-2 transition-colors disabled:opacity-50"
-                    >
-                      <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
-                      {isSyncing ? 'Syncing...' : 'Sync History'}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={journalFilter}
+                        onChange={(e) => setJournalFilter(e.target.value as any)}
+                        className="bg-zinc-800 border border-zinc-700 text-zinc-300 text-xs rounded-lg px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                      >
+                        <option value="ALL">All Sources</option>
+                        <option value="PAPER_BOT">Paper Trades</option>
+                        <option value="AI">AI Signals</option>
+                        <option value="USER">Synced Trades</option>
+                      </select>
+                      <button
+                        onClick={handleSync}
+                        disabled={isSyncing}
+                        className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm rounded-lg flex items-center gap-2 transition-colors disabled:opacity-50"
+                      >
+                        <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
+                        {isSyncing ? 'Syncing...' : 'Sync History'}
+                      </button>
+                    </div>
                   </div>
                   {journal.length > 0 && (
                     <div className="grid grid-cols-3 gap-4 mb-4">
                       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
                         <div className="text-xs text-zinc-500 mb-1">Total Trades</div>
-                        <div className="text-2xl font-bold">{journal.length}</div>
+                        <div className="text-2xl font-bold">
+                          {journal.filter(entry => journalFilter === 'ALL' || entry.source === journalFilter).length}
+                        </div>
                       </div>
                       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
                         <div className="text-xs text-zinc-500 mb-1">Win Rate</div>
                         <div className="text-2xl font-bold text-emerald-400">
-                          {((journal.filter(j => (j.pnl || 0) > 0).length / journal.length) * 100).toFixed(1)}%
+                          {(() => {
+                            const filtered = journal.filter(entry => journalFilter === 'ALL' || entry.source === journalFilter);
+                            if (filtered.length === 0) return '0.0%';
+                            return ((filtered.filter(j => (j.pnl || 0) > 0).length / filtered.length) * 100).toFixed(1) + '%';
+                          })()}
                         </div>
                       </div>
                       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
                         <div className="text-xs text-zinc-500 mb-1">Avg PnL</div>
-                        <div className={`text-2xl font-bold ${journal.reduce((acc, j) => acc + (j.pnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                          {(journal.reduce((acc, j) => acc + (j.pnl || 0), 0) / journal.length).toFixed(2)} USDT
+                        <div className={`text-2xl font-bold ${(() => {
+                          const filtered = journal.filter(entry => journalFilter === 'ALL' || entry.source === journalFilter);
+                          const totalPnl = filtered.reduce((acc, j) => acc + (j.pnl || 0), 0);
+                          return totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400';
+                        })()}`}>
+                          {(() => {
+                            const filtered = journal.filter(entry => journalFilter === 'ALL' || entry.source === journalFilter);
+                            if (filtered.length === 0) return '0.00';
+                            return (filtered.reduce((acc, j) => acc + (j.pnl || 0), 0) / filtered.length).toFixed(2);
+                          })()} USDT
                         </div>
                       </div>
                     </div>
@@ -751,7 +778,9 @@ export default function App() {
                       <p className="text-xs mt-1">Trades executed by Sentinel will appear here.</p>
                     </div>
                   ) : (
-                    journal.map(entry => (
+                    journal
+                      .filter(entry => journalFilter === 'ALL' || entry.source === journalFilter)
+                      .map(entry => (
                       <div key={entry.id} className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
                         <div className="flex justify-between items-start mb-4">
                           <div>
@@ -761,8 +790,12 @@ export default function App() {
                               </span>
                               <span className="font-bold text-lg">{entry.symbol}</span>
                               {entry.source && (
-                                <span className={`px-2 py-0.5 rounded text-xs font-medium ${entry.source === 'AI' ? 'bg-indigo-500/20 text-indigo-400' : 'bg-zinc-500/20 text-zinc-400'}`}>
-                                  {entry.source === 'AI' ? 'AI Signal' : 'User Trade'}
+                                <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                                  entry.source === 'AI' ? 'bg-indigo-500/20 text-indigo-400' : 
+                                  entry.source === 'PAPER_BOT' ? 'bg-emerald-500/20 text-emerald-400' :
+                                  'bg-zinc-500/20 text-zinc-400'
+                                }`}>
+                                  {entry.source === 'AI' ? 'AI Signal' : entry.source === 'PAPER_BOT' ? 'Paper Trade' : 'User Trade'}
                                 </span>
                               )}
                             </div>
@@ -795,11 +828,11 @@ export default function App() {
 
                         <div className="space-y-3">
                           <div>
-                            <div className="text-xs text-zinc-500 mb-1">AI Reasoning</div>
+                            <div className="text-xs text-zinc-500 mb-1">Reasoning / Strategy</div>
                             <p className="text-sm text-zinc-300 leading-relaxed">{entry.reason}</p>
                           </div>
                           
-                          {entry.sentiment && (
+                          {entry.sentiment && typeof entry.sentiment === 'object' && (
                             <div className="bg-zinc-950/50 rounded-lg p-3 border border-zinc-800/50">
                               <div className="flex items-center gap-2 mb-1">
                                 <div className="text-xs text-zinc-500">Sentiment Analysis</div>
@@ -812,6 +845,12 @@ export default function App() {
                                 </span>
                               </div>
                               <p className="text-sm text-zinc-400 italic">"{entry.sentiment.reason}"</p>
+                            </div>
+                          )}
+
+                          {entry.closeReason && (
+                            <div className="text-xs text-zinc-500 italic mt-2">
+                              Closed due to: <span className="text-zinc-400">{entry.closeReason}</span>
                             </div>
                           )}
                         </div>

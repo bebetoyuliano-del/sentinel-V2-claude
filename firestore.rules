@@ -241,6 +241,11 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
+    match /paper_monitoring/{symbol} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+
     match /backtests/{symbol} {
       allow read: if isAuthenticated();
       allow write: if isAdmin();

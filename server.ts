@@ -10,7 +10,7 @@ import { createServer as createViteServer } from 'vite';
 import { RSI, MACD, EMA, BollingerBands, SMA } from 'technicalindicators';
 import { Storage } from '@google-cloud/storage';
 import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, setDoc, getDoc, collection, query, orderBy, limit, getDocs, serverTimestamp, setLogLevel } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, getDoc, collection, query, orderBy, limit, getDocs, serverTimestamp, setLogLevel, deleteDoc, where } from 'firebase/firestore';
 import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
 import fs from 'fs';
 import path from 'path';
@@ -1326,7 +1326,18 @@ async function monitorMarkets(force = false) {
         top20Symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT', 'XRP/USDT:USDT']; // Fallback
     }
 
-    const symbolsToFetch = [...new Set([...positionSymbols, ...top20Symbols])];
+    // Fetch ALL Approved Settings Symbols
+    let approvedSettingsSymbols: string[] = [];
+    let approvedSettings: any[] = [];
+    try {
+      const settingsSnap = await getDocs(collection(db, 'approved_settings'));
+      approvedSettings = settingsSnap.docs.map(doc => doc.data());
+      approvedSettingsSymbols = approvedSettings.map(s => s.symbol);
+    } catch (e) {
+      console.error('Error fetching approved settings:', e);
+    }
+
+    const symbolsToFetch = [...new Set([...positionSymbols, ...top20Symbols, ...approvedSettingsSymbols])];
     
     const marketData = await fetchMarketDataWithIndicators(symbolsToFetch);
     const hedgingRecovery = calculateHedgingRecovery(positions);
@@ -1340,24 +1351,6 @@ async function monitorMarkets(force = false) {
       recentBacktests = backtestsSnapshot.docs.map(doc => doc.data());
     } catch (e) {
       console.error('Error fetching backtest results:', e);
-    }
-
-    // Fetch approved settings for the symbols being analyzed
-    let approvedSettings: any[] = [];
-    try {
-      const settingsPromises = symbolsToFetch.map(async (symbol) => {
-        const docId = symbol.replace(/\//g, '_');
-        const docRef = doc(db, 'approved_settings', docId);
-        const docSnap = await getDoc(docRef);
-        if (docSnap.exists()) {
-          return docSnap.data();
-        }
-        return null;
-      });
-      const results = await Promise.all(settingsPromises);
-      approvedSettings = results.filter(s => s !== null);
-    } catch (e) {
-      console.error('Error fetching approved settings:', e);
     }
 
     // 3. Analyze with Gemini (V2 Decision Card & SOP Orchestrator)
@@ -1379,6 +1372,7 @@ async function monitorMarkets(force = false) {
             unrealizedPnl: p.unrealizedPnl
         })),
         scannerUniverse: top20Symbols,
+        approvedSettingsSymbols, // Explicitly tell Gemini which symbols are approved
         marketData,
         recentHistory: signals.slice(0, 5), // Include last 5 signals for self-supervision
         recentBacktests, // Include recent backtests for strategy optimization
@@ -1409,6 +1403,11 @@ async function monitorMarkets(force = false) {
       - Fokus utama Anda saat ini adalah: **HEDGING RECOVERY BY ZONE**.
       - Anda juga memiliki akses ke 'recentBacktests' yang berisi hasil backtest terbaru. Gunakan data ini untuk mengoptimalkan strategi trading Anda (misalnya, menyesuaikan stop loss, take profit, atau menghindari pair dengan win rate rendah).
       - **PENTING (APPROVED SETTINGS)**: Jika ada data di dalam array 'approvedSettings' untuk koin tertentu, Anda **WAJIB** menggunakan parameter tersebut (seperti Take Profit, Lock Trigger, Max MR, dll) sebagai pengganti nilai default di SOP Utama khusus untuk koin tersebut. Ini adalah hasil backtest yang sudah dioptimalkan dan disetujui oleh user.
+      - **PENTING (SIGNALS)**: Jika Anda melihat peluang trading pada koin yang ada di 'approvedSettingsSymbols', Anda **SANGAT DISARANKAN** untuk memberikan sinyal trading di bagian 'new_signals'. Sinyal ini akan digunakan oleh bot Paper Trading untuk mengeksekusi perdagangan secara otomatis.
+      - **PENTING (SAME PAIR SIGNALS)**: Jika Anda memberikan sinyal baru untuk koin yang **SUDAH MEMILIKI POSISI TERBUKA** (lihat 'accountPositions'), Anda **WAJIB** memberikan penjelasan di bagian 'why_this_pair' apakah ini adalah:
+        1. **Sinyal Baru**: Sinyal independen baru (misal: pembalikan arah atau trend baru).
+        2. **Strategi ADD 0.5**: Bagian dari SOP main trading utama untuk memperkuat posisi yang sudah ada atau melakukan recovery (misal: menambah 0.5 lot di pullback).
+        Jelaskan alasan teknisnya berdasarkan SOP (Bias4H, Bias1H, Rejection, dll).
 
       DATA MASUK:
       ${JSON.stringify(inputPayload, null, 2)}
@@ -2041,37 +2040,7 @@ async function monitorMarkets(force = false) {
         await sendPowerAutomateWebhook(analysisData);
     }
 
-    // --- NEW: Save to Trading Journal ---
-    if (db && new_signals && new_signals.signals && new_signals.signals.length > 0) {
-      try {
-        await ensureAuth();
-        for (const sig of new_signals.signals) {
-          const journalEntry = {
-            id: `journal_${Date.now()}_${sig.symbol.replace('/', '')}`,
-            timestamp: new Date().toISOString(),
-            symbol: sig.symbol || 'UNKNOWN',
-            side: sig.side || 'UNKNOWN',
-            entryPrice: isFinite(typeof sig.entry === 'string' ? parseFloat(sig.entry) : sig.entry) ? (typeof sig.entry === 'string' ? parseFloat(sig.entry) : sig.entry) : 0,
-            stopLoss: isFinite(typeof sig.stop_loss === 'string' ? parseFloat(sig.stop_loss) : sig.stop_loss) ? (typeof sig.stop_loss === 'string' ? parseFloat(sig.stop_loss) : sig.stop_loss) : 0,
-            target1: isFinite(typeof sig.targets?.t1 === 'string' ? parseFloat(sig.targets.t1) : sig.targets?.t1) ? (typeof sig.targets?.t1 === 'string' ? parseFloat(sig.targets.t1) : sig.targets?.t1) : 0,
-            target2: isFinite(typeof sig.targets?.t2 === 'string' ? parseFloat(sig.targets.t2) : sig.targets?.t2) ? (typeof sig.targets?.t2 === 'string' ? parseFloat(sig.targets.t2) : sig.targets?.t2) : 0,
-            reason: sig.why_this_pair || '',
-            sentiment: sig.sentiment?.status || 'NEUTRAL',
-            status: 'OPEN', // OPEN, WIN, LOSS, CLOSED
-            source: 'AI',
-            pnl: 0
-          };
-          try {
-            await setDoc(doc(db, 'trading_journal', journalEntry.id), journalEntry);
-          } catch (err: any) {
-            handleFirestoreError(err, OperationType.WRITE, `trading_journal/${journalEntry.id}`);
-          }
-        }
-        console.log(`✅ Saved ${new_signals.signals.length} signals to Trading Journal.`);
-      } catch (err: any) {
-        handleFirestoreError(err, OperationType.WRITE, 'trading_journal_batch');
-      }
-    }
+    // --- NEW: Save to Trading Journal (REMOVED - Now handled by Paper Trading Engine) ---
     // --- END NEW ---
 
     const payloads = renderDecisionCardsToTelegram(cards, se, gg, new_signals, archiveUrl);
@@ -2537,28 +2506,42 @@ async function runPaperTradingEngine() {
 
     // 3. Fetch Open Positions
     const positionsSnap = await getDocs(collection(db, 'paper_positions'));
-    const openPositions = positionsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    const openPositions = positionsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() } as any));
 
     // 4. Process each approved setting
     for (const setting of approvedSettings) {
-      const { symbol, timeframe, takeProfitPct, lock11Mode, lockTriggerPct, add05Mode, structure21Mode, maxMrPct } = setting;
+      const { symbol, timeframe, takeProfitPct } = setting;
       
       try {
-        // Fetch recent OHLCV
-        const ohlcv = await binance.fetchOHLCV(symbol, timeframe, undefined, 100);
-        if (ohlcv.length < 100) continue;
+        // Fetch current price (lightweight)
+        const ticker = await binance.fetchTicker(symbol);
+        const currentPrice = ticker.last;
 
-        const currentPrice = ohlcv[ohlcv.length - 1][4];
-        const rf = rangeFilterPineExact(ohlcv as any, { per: 100, mult: 3.0 });
-        const { longSignal, shortSignal } = rf.arrays;
-        
-        // Check signal on the last closed candle
-        const lastClosedIndex = ohlcv.length - 2;
-        const hasLongSignal = longSignal[lastClosedIndex];
-        const hasShortSignal = shortSignal[lastClosedIndex];
-
-        // Find existing position for this symbol
+        // Update Monitoring Info
+        const monitoringRef = doc(db, 'paper_monitoring', symbol.replace('/', '_'));
         const existingPosition = openPositions.find((p: any) => p.symbol === symbol && p.status === 'OPEN');
+        
+        // Find if there's a fresh signal from the main bot loop (monitorMarkets)
+        // We look for signals generated in the last 20 minutes
+        const freshSignal = signals.find(s => 
+          s.symbol === symbol && 
+          (Date.now() - new Date(s.timestamp).getTime() < 20 * 60 * 1000)
+        );
+
+        let plan = '';
+        if (existingPosition) {
+          plan = `Monitoring for Take Profit (+${takeProfitPct}%) or Opposite Signal. Current PnL: ${existingPosition.unrealizedPnl >= 0 ? '+' : ''}${existingPosition.unrealizedPnl.toFixed(2)}`;
+        } else {
+          plan = 'Waiting for AI Signal from Sentinel Scanner...';
+        }
+
+        await setDoc(monitoringRef, {
+          symbol,
+          timeframe,
+          currentPrice,
+          plan,
+          updatedAt: new Date().toISOString()
+        }, { merge: true });
 
         // Handle Exits & Updates
         if (existingPosition) {
@@ -2584,10 +2567,10 @@ async function runPaperTradingEngine() {
             shouldClose = true;
             closeReason = 'Take Profit';
           } 
-          // Check Opposite Signal
-          else if ((isLong && hasShortSignal) || (!isLong && hasLongSignal)) {
+          // Check Opposite Signal from AI
+          else if (freshSignal && ((isLong && freshSignal.side === 'SELL') || (!isLong && freshSignal.side === 'BUY'))) {
             shouldClose = true;
-            closeReason = 'Opposite Signal';
+            closeReason = 'AI Opposite Signal';
           }
 
           if (shouldClose) {
@@ -2600,6 +2583,22 @@ async function runPaperTradingEngine() {
               closedAt: new Date().toISOString(),
               status: 'CLOSED'
             });
+
+            // Update Trading Journal
+            if (existingPosition.journalId) {
+              try {
+                await setDoc(doc(db, 'trading_journal', existingPosition.journalId), {
+                  exitPrice: currentPrice,
+                  pnl: pnl,
+                  status: 'CLOSED',
+                  closedAt: new Date().toISOString(),
+                  closeReason: closeReason
+                }, { merge: true });
+              } catch (journalErr) {
+                console.error('[PAPER] Error updating journal on close:', journalErr);
+              }
+            }
+
             await deleteDoc(doc(db, 'paper_positions', existingPosition.id));
 
             // Update Wallet
@@ -2617,33 +2616,79 @@ async function runPaperTradingEngine() {
             }, { merge: true });
           }
         } 
-        // Handle Entries
+        // Handle Entries using AI Signals
         else {
-          if (hasLongSignal || hasShortSignal) {
-            const side = hasLongSignal ? 'LONG' : 'SHORT';
-            // Allocate 10% of free margin per trade (simplified)
-            const tradeAmount = wallet.freeMargin * 0.1;
-            const size = tradeAmount / currentPrice;
+          if (freshSignal) {
+            // Check if we already have a recently closed trade for this exact signal to avoid re-entry
+            const historySnap = await getDocs(query(
+              collection(db, 'paper_history'), 
+              where('symbol', '==', symbol),
+              orderBy('closedAt', 'desc'),
+              limit(1)
+            ));
+            
+            let alreadyTraded = false;
+            if (!historySnap.empty) {
+              const lastTrade = historySnap.docs[0].data();
+              // If the last trade was opened after this signal was generated, we've already used it
+              if (new Date(lastTrade.openedAt).getTime() >= new Date(freshSignal.timestamp).getTime()) {
+                alreadyTraded = true;
+              }
+            }
 
-            if (tradeAmount > 10) { // Minimum trade size
-              const newPosRef = doc(collection(db, 'paper_positions'));
-              await setDoc(newPosRef, {
-                symbol,
-                side,
-                entryPrice: currentPrice,
-                size,
-                unrealizedPnl: 0,
-                takeProfit: isLong ? currentPrice * (1 + takeProfitPct/100) : currentPrice * (1 - takeProfitPct/100),
-                stopLoss: 0, // Simplified for now
-                status: 'OPEN',
-                openedAt: new Date().toISOString()
-              });
+            if (!alreadyTraded) {
+              const side = freshSignal.side === 'BUY' ? 'LONG' : 'SHORT';
+              // Allocate 10% of free margin per trade (simplified)
+              const tradeAmount = wallet.freeMargin * 0.1;
+              const size = tradeAmount / currentPrice;
 
-              wallet.freeMargin -= tradeAmount;
-              wallet.updatedAt = new Date().toISOString();
-              await setDoc(walletRef, wallet);
+              if (tradeAmount > 10) { // Minimum trade size
+                const newPosRef = doc(collection(db, 'paper_positions'));
+                const journalId = `journal_${Date.now()}_${symbol.replace('/', '')}`;
+                
+                // Create Trading Journal Entry
+                const journalEntry = {
+                  id: journalId,
+                  timestamp: new Date().toISOString(),
+                  symbol: symbol,
+                  side: side,
+                  entryPrice: currentPrice,
+                  stopLoss: freshSignal.stop_loss || 0,
+                  target1: freshSignal.targets?.t1 || 0,
+                  target2: freshSignal.targets?.t2 || 0,
+                  reason: freshSignal.why_this_pair || '',
+                  sentiment: freshSignal.sentiment?.status || 'NEUTRAL',
+                  status: 'OPEN',
+                  source: 'PAPER_BOT',
+                  pnl: 0
+                };
 
-              await sendTelegramMessage(`[PAPER] 🟢 <b>Opened ${side} ${symbol}</b>\nEntry: $${currentPrice.toFixed(4)}\nSize: ${size.toFixed(4)}`);
+                try {
+                  await setDoc(doc(db, 'trading_journal', journalId), journalEntry);
+                } catch (journalErr) {
+                  console.error('[PAPER] Error creating journal entry:', journalErr);
+                }
+
+                await setDoc(newPosRef, {
+                  symbol,
+                  side,
+                  entryPrice: currentPrice,
+                  size,
+                  unrealizedPnl: 0,
+                  takeProfit: side === 'LONG' ? currentPrice * (1 + takeProfitPct/100) : currentPrice * (1 - takeProfitPct/100),
+                  stopLoss: 0, // Simplified for now
+                  status: 'OPEN',
+                  openedAt: new Date().toISOString(),
+                  signalId: freshSignal.id, // Track which signal opened this
+                  journalId: journalId // Link to journal
+                });
+
+                wallet.freeMargin -= tradeAmount;
+                wallet.updatedAt = new Date().toISOString();
+                await setDoc(walletRef, wallet);
+
+                await sendTelegramMessage(`[PAPER] 🟢 <b>Opened ${side} ${symbol} (AI Signal)</b>\nEntry: $${currentPrice.toFixed(4)}\nSize: ${size.toFixed(4)}`);
+              }
             }
           }
         }
@@ -3327,6 +3372,16 @@ app.get('/api/paper/history', async (req, res) => {
     await ensureAuth();
     const historySnap = await getDocs(collection(db, 'paper_history'));
     res.json(historySnap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/paper/monitoring', async (req, res) => {
+  try {
+    await ensureAuth();
+    const monitoringSnap = await getDocs(collection(db, 'paper_monitoring'));
+    res.json(monitoringSnap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

@@ -1,37 +1,42 @@
 import React, { useState, useEffect } from 'react';
-import { Play, Square, Wallet, TrendingUp, History, AlertCircle } from 'lucide-react';
+import { Play, Square, Wallet, TrendingUp, History, AlertCircle, Target } from 'lucide-react';
 
 export default function PaperTradingView() {
   const [isRunning, setIsRunning] = useState(false);
   const [wallet, setWallet] = useState<any>(null);
   const [positions, setPositions] = useState<any[]>([]);
   const [history, setHistory] = useState<any[]>([]);
+  const [monitoring, setMonitoring] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const fetchData = async () => {
     try {
-      const [statusRes, walletRes, posRes, histRes] = await Promise.all([
+      const [statusRes, walletRes, posRes, histRes, monitorRes] = await Promise.all([
         fetch('/api/paper/status'),
         fetch('/api/paper/wallet'),
         fetch('/api/paper/positions'),
-        fetch('/api/paper/history')
+        fetch('/api/paper/history'),
+        fetch('/api/paper/monitoring')
       ]);
 
       const status = await statusRes.json();
       const walletData = await walletRes.json();
       const posData = await posRes.json();
       const histData = await histRes.json();
+      const monitorData = await monitorRes.json();
 
       if (!statusRes.ok) throw new Error(status.error || 'Failed to fetch status');
       if (!walletRes.ok) throw new Error(walletData.error || 'Failed to fetch wallet');
       if (!posRes.ok) throw new Error(posData.error || 'Failed to fetch positions');
       if (!histRes.ok) throw new Error(histData.error || 'Failed to fetch history');
+      if (!monitorRes.ok) throw new Error(monitorData.error || 'Failed to fetch monitoring');
 
       setIsRunning(status.isPaperTradingRunning);
       setWallet(walletData);
       setPositions(Array.isArray(posData) ? posData : []);
       setHistory(Array.isArray(histData) ? histData.sort((a: any, b: any) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime()) : []);
+      setMonitoring(Array.isArray(monitorData) ? monitorData : []);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -119,6 +124,66 @@ export default function PaperTradingView() {
           <div className="text-2xl font-bold text-white">
             ${wallet?.freeMargin?.toFixed(2) || '0.00'}
           </div>
+        </div>
+      </div>
+
+      {/* Strategy Monitoring & Plans */}
+      <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl overflow-hidden">
+        <div className="p-4 border-b border-slate-700/50 flex items-center gap-2">
+          <Target className="w-5 h-5 text-emerald-400" />
+          <h3 className="font-semibold text-white">Sentinel Strategy Plan (Monitoring)</h3>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm text-left">
+            <thead className="text-xs text-slate-400 uppercase bg-slate-900/50">
+              <tr>
+                <th className="px-4 py-3">Symbol</th>
+                <th className="px-4 py-3">Trend</th>
+                <th className="px-4 py-3">Price</th>
+                <th className="px-4 py-3">Sentinel Plan / Next Action</th>
+                <th className="px-4 py-3">Last Updated</th>
+              </tr>
+            </thead>
+            <tbody>
+              {monitoring.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="px-4 py-8 text-center text-slate-500">
+                    No symbols being monitored. Ensure you have "Approved Settings".
+                  </td>
+                </tr>
+              ) : (
+                monitoring.map((m) => (
+                  <tr key={m.id} className="border-b border-slate-700/50 last:border-0">
+                    <td className="px-4 py-3 font-medium text-white">
+                      <div className="flex flex-col">
+                        <span>{m.symbol}</span>
+                        <span className="text-[10px] text-slate-500">{m.timeframe}</span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className={`px-2 py-1 rounded text-xs font-medium ${
+                        m.trend === 'UP' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500'
+                      }`}>
+                        {m.trend}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-slate-300">${m.currentPrice?.toFixed(4)}</td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <div className={`w-2 h-2 rounded-full animate-pulse ${
+                          m.plan.includes('Waiting') ? 'bg-yellow-500' : 'bg-blue-500'
+                        }`} />
+                        <span className="text-slate-200">{m.plan}</span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 text-slate-400 text-xs">
+                      {new Date(m.updatedAt).toLocaleTimeString()}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
 
