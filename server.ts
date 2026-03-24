@@ -2045,25 +2045,83 @@ async function monitorMarkets(force = false) {
 
     const payloads = renderDecisionCardsToTelegram(cards, se, gg, new_signals, archiveUrl);
 
-    for (const payload of payloads) {
+    // 1. Process Decision Cards (Monitoring)
+    for (let i = 0; i < cards.length; i++) {
+        const card = cards[i];
+        const payload = payloads[i];
         await sendTelegramMessage(payload.text, payload.reply_markup);
         
-        const newSignal = {
-          id: Date.now().toString() + Math.random().toString(36).substring(7),
+        const monitorSignal = {
+          id: `monitor_${Date.now()}_${card.symbol.replace('/', '')}`,
           timestamp: new Date().toISOString(),
           content: payload.text.replace(STRIP_TAGS, ''),
-          type: 'telegram',
-          symbol: new_signals?.signals?.[0]?.symbol || 'GENERAL'
+          type: 'monitor',
+          symbol: card.symbol
         };
-        signals.unshift(newSignal);
+        signals.unshift(monitorSignal);
         
         if (db) {
           try {
             await ensureAuth();
-            await setDoc(doc(db, 'signals', newSignal.id), newSignal);
+            await setDoc(doc(db, 'signals', monitorSignal.id), monitorSignal);
           } catch (dbErr) {
-            handleFirestoreError(dbErr, OperationType.WRITE, `signals/${newSignal.id}`);
+            handleFirestoreError(dbErr, OperationType.WRITE, `signals/${monitorSignal.id}`);
           }
+        }
+    }
+
+    // 2. Process New Signals (Scanner)
+    if (new_signals && payloads.length > cards.length) {
+        const scannerPayload = payloads[payloads.length - 1];
+        await sendTelegramMessage(scannerPayload.text, scannerPayload.reply_markup);
+
+        // Add ONE summary entry for the UI
+        const scannerSummaryId = `scanner_${Date.now()}`;
+        const scannerSummary = {
+          id: scannerSummaryId,
+          timestamp: new Date().toISOString(),
+          content: scannerPayload.text.replace(STRIP_TAGS, ''),
+          type: 'scanner',
+          symbol: 'GENERAL'
+        };
+        signals.unshift(scannerSummary);
+        if (db) {
+          try {
+            await ensureAuth();
+            await setDoc(doc(db, 'signals', scannerSummaryId), scannerSummary);
+          } catch (dbErr) {
+            handleFirestoreError(dbErr, OperationType.WRITE, `signals/${scannerSummaryId}`);
+          }
+        }
+
+        // Add individual structured signals for the Paper Trading Engine (NOT shown in UI)
+        if (new_signals.signals && new_signals.signals.length > 0) {
+            for (const sig of new_signals.signals) {
+                const signalId = `signal_${Date.now()}_${sig.symbol.replace('/', '')}`;
+                const newSignal = {
+                  id: signalId,
+                  timestamp: new Date().toISOString(),
+                  content: `Structured signal for ${sig.symbol}`, 
+                  type: 'scanner_signal', // Different type for engine
+                  symbol: sig.symbol,
+                  side: sig.side, // BUY or SELL
+                  entry: sig.entry,
+                  stop_loss: sig.stop_loss,
+                  targets: sig.targets,
+                  why_this_pair: sig.why_this_pair,
+                  sentiment: sig.sentiment
+                };
+                signals.unshift(newSignal);
+
+                if (db) {
+                  try {
+                    await ensureAuth();
+                    await setDoc(doc(db, 'signals', newSignal.id), newSignal);
+                  } catch (dbErr) {
+                    handleFirestoreError(dbErr, OperationType.WRITE, `signals/${newSignal.id}`);
+                  }
+                }
+            }
         }
     }
     
@@ -2432,8 +2490,9 @@ function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global
         if (new_signals.signals && new_signals.signals.length > 0) {
             signalMsg += `🎯 <b>NEW SIGNALS FOUND:</b>\n`;
             for (const sig of new_signals.signals) {
-                const sideIcon = sig.side === 'BUY' ? '🟢' : '🔴';
-                signalMsg += `${sideIcon} <b>${escapeHtml(sig.symbol)} (${sig.side})</b>\n`;
+                const sideUpper = String(sig.side).toUpperCase();
+                const sideIcon = (sideUpper === 'BUY' || sideUpper === 'LONG') ? '🟢' : '🔴';
+                signalMsg += `${sideIcon} <b>${escapeHtml(sig.symbol)} (${sideUpper})</b>\n`;
                 signalMsg += `Entry: ${sig.entry}\n`;
                 signalMsg += `SL: ${sig.stop_loss}\n`;
                 signalMsg += `TP1: ${sig.targets.t1} (RR: ${sig.rr.t1_rr})\n`;
@@ -2517,181 +2576,182 @@ async function runPaperTradingEngine() {
         const ticker = await binance.fetchTicker(symbol);
         const currentPrice = ticker.last;
 
-        // Update Monitoring Info
         const monitoringRef = doc(db, 'paper_monitoring', symbol.replace('/', '_'));
-        const existingPosition = openPositions.find((p: any) => p.symbol === symbol && p.status === 'OPEN');
-        
+        const symbolPositions = openPositions.filter((p: any) => p.symbol === symbol && p.status === 'OPEN');
+        let longPos = symbolPositions.find((p: any) => p.side === 'LONG');
+        let shortPos = symbolPositions.find((p: any) => p.side === 'SHORT');
+
         // Find if there's a fresh signal from the main bot loop (monitorMarkets)
-        // We look for signals generated in the last 20 minutes
         const freshSignal = signals.find(s => 
           s.symbol === symbol && 
+          s.type === 'scanner_signal' &&
           (Date.now() - new Date(s.timestamp).getTime() < 20 * 60 * 1000)
         );
 
-        let plan = '';
-        if (existingPosition) {
-          plan = `Monitoring for Take Profit (+${takeProfitPct}%) or Opposite Signal. Current PnL: ${existingPosition.unrealizedPnl >= 0 ? '+' : ''}${existingPosition.unrealizedPnl.toFixed(2)}`;
-        } else {
-          plan = 'Waiting for AI Signal from Sentinel Scanner...';
+        // Calculate PnL
+        let totalUnrealizedPnl = 0;
+        if (longPos) {
+          longPos.currentPnl = (currentPrice - longPos.entryPrice) * longPos.size;
+          longPos.pnlPct = (longPos.currentPnl / (longPos.entryPrice * longPos.size)) * 100;
+          totalUnrealizedPnl += longPos.currentPnl;
+        }
+        if (shortPos) {
+          shortPos.currentPnl = (shortPos.entryPrice - currentPrice) * shortPos.size;
+          shortPos.pnlPct = (shortPos.currentPnl / (shortPos.entryPrice * shortPos.size)) * 100;
+          totalUnrealizedPnl += shortPos.currentPnl;
         }
 
-        await setDoc(monitoringRef, {
-          symbol,
-          timeframe,
-          currentPrice,
-          plan,
-          updatedAt: new Date().toISOString()
-        }, { merge: true });
-
-        // Handle Exits & Updates
-        if (existingPosition) {
-          let shouldClose = false;
-          let closeReason = '';
-          let pnl = 0;
-
-          const isLong = existingPosition.side === 'LONG';
-          const entryPrice = existingPosition.entryPrice;
-          const size = existingPosition.size;
-
-          // Calculate current PnL
-          if (isLong) {
-            pnl = (currentPrice - entryPrice) * size;
-          } else {
-            pnl = (entryPrice - currentPrice) * size;
-          }
-
-          const pnlPct = (pnl / (entryPrice * size)) * 100;
-
-          // Check Take Profit
-          if (pnlPct >= takeProfitPct) {
-            shouldClose = true;
-            closeReason = 'Take Profit';
-          } 
-          // Check Opposite Signal from AI
-          else if (freshSignal && ((isLong && freshSignal.side === 'SELL') || (!isLong && freshSignal.side === 'BUY'))) {
-            shouldClose = true;
-            closeReason = 'AI Opposite Signal';
-          }
-
-          if (shouldClose) {
-            // Close position
-            await setDoc(doc(db, 'paper_history', existingPosition.id), {
-              ...existingPosition,
-              exitPrice: currentPrice,
-              pnl,
-              reason: closeReason,
-              closedAt: new Date().toISOString(),
-              status: 'CLOSED'
-            });
-
-            // Update Trading Journal
-            if (existingPosition.journalId) {
-              try {
-                await setDoc(doc(db, 'trading_journal', existingPosition.journalId), {
-                  exitPrice: currentPrice,
-                  pnl: pnl,
-                  status: 'CLOSED',
-                  closedAt: new Date().toISOString(),
-                  closeReason: closeReason
-                }, { merge: true });
-              } catch (journalErr) {
-                console.error('[PAPER] Error updating journal on close:', journalErr);
-              }
-            }
-
-            await deleteDoc(doc(db, 'paper_positions', existingPosition.id));
-
-            // Update Wallet
-            wallet.balance += pnl;
-            wallet.equity = wallet.balance;
-            wallet.freeMargin = wallet.balance;
-            wallet.updatedAt = new Date().toISOString();
-            await setDoc(walletRef, wallet);
-
-            await sendTelegramMessage(`[PAPER] 💰 <b>Closed ${existingPosition.side} ${symbol}</b>\nReason: ${closeReason}\nPnL: $${pnl.toFixed(2)}`);
-          } else {
-            // Update Unrealized PnL
-            await setDoc(doc(db, 'paper_positions', existingPosition.id), {
-              unrealizedPnl: pnl
+        // Helper to close position
+        const closePos = async (pos: any, reason: string) => {
+          await setDoc(doc(db, 'paper_history', pos.id), {
+            ...pos, exitPrice: currentPrice, pnl: pos.currentPnl, reason, closedAt: new Date().toISOString(), status: 'CLOSED'
+          });
+          if (pos.journalId) {
+            await setDoc(doc(db, 'trading_journal', pos.journalId), {
+              exitPrice: currentPrice, pnl: pos.currentPnl, status: 'CLOSED', closedAt: new Date().toISOString(), closeReason: reason
             }, { merge: true });
           }
-        } 
-        // Handle Entries using AI Signals
-        else {
-          if (freshSignal) {
-            // Check if we already have a recently closed trade for this exact signal to avoid re-entry
-            const historySnap = await getDocs(query(
-              collection(db, 'paper_history'), 
-              where('symbol', '==', symbol),
-              orderBy('closedAt', 'desc'),
-              limit(1)
-            ));
-            
-            let alreadyTraded = false;
-            if (!historySnap.empty) {
-              const lastTrade = historySnap.docs[0].data();
-              // If the last trade was opened after this signal was generated, we've already used it
-              if (new Date(lastTrade.openedAt).getTime() >= new Date(freshSignal.timestamp).getTime()) {
-                alreadyTraded = true;
-              }
+          await deleteDoc(doc(db, 'paper_positions', pos.id));
+          wallet.balance += pos.currentPnl;
+          wallet.equity = wallet.balance;
+          wallet.freeMargin = wallet.balance;
+          wallet.updatedAt = new Date().toISOString();
+          await setDoc(walletRef, wallet);
+          await sendTelegramMessage(`[PAPER] 💰 <b>Closed ${pos.side} ${symbol}</b>\nReason: ${reason}\nPnL: $${pos.currentPnl.toFixed(2)}`);
+        };
+
+        // Helper to open position
+        const openPos = async (side: string, size: number, reason: string, signalId: string = '') => {
+          const newPosRef = doc(collection(db, 'paper_positions'));
+          const journalId = `journal_${Date.now()}_${symbol.replace('/', '')}`;
+          const journalEntry = {
+            id: journalId, timestamp: new Date().toISOString(), symbol, side, entryPrice: currentPrice,
+            stopLoss: 0, target1: 0, target2: 0, reason, sentiment: 'NEUTRAL', status: 'OPEN', source: 'PAPER_BOT', pnl: 0
+          };
+          await setDoc(doc(db, 'trading_journal', journalId), journalEntry);
+
+          const newPos = {
+            id: newPosRef.id, symbol, side, entryPrice: currentPrice, size, unrealizedPnl: 0,
+            takeProfit: side === 'LONG' ? currentPrice * (1 + takeProfitPct/100) : currentPrice * (1 - takeProfitPct/100),
+            stopLoss: 0, status: 'OPEN', openedAt: new Date().toISOString(), signalId, journalId,
+            isHedge: reason.includes('Lock') || reason.includes('Hedge')
+          };
+          await setDoc(newPosRef, newPos);
+          
+          wallet.freeMargin -= (size * currentPrice);
+          wallet.updatedAt = new Date().toISOString();
+          await setDoc(walletRef, wallet);
+          await sendTelegramMessage(`[PAPER] 🟢 <b>Opened ${side} ${symbol}</b>\nReason: ${reason}\nEntry: $${currentPrice.toFixed(4)}\nSize: ${size.toFixed(4)}`);
+          return { ...newPos, currentPnl: 0, pnlPct: 0 };
+        };
+
+        // Helper to add size to position
+        const addSize = async (pos: any, additionalSize: number, reason: string, signalId: string) => {
+          const newTotalSize = pos.size + additionalSize;
+          const newAvgEntry = ((pos.size * pos.entryPrice) + (additionalSize * currentPrice)) / newTotalSize;
+          
+          await setDoc(doc(db, 'paper_positions', pos.id), {
+            size: newTotalSize, entryPrice: newAvgEntry, lastSignalId: signalId
+          }, { merge: true });
+
+          wallet.freeMargin -= (additionalSize * currentPrice);
+          wallet.updatedAt = new Date().toISOString();
+          await setDoc(walletRef, wallet);
+          await sendTelegramMessage(`[PAPER] ➕ <b>Added to ${pos.side} ${symbol}</b>\nReason: ${reason}\nNew Avg Entry: $${newAvgEntry.toFixed(4)}\nNew Size: ${newTotalSize.toFixed(4)}`);
+          
+          pos.size = newTotalSize;
+          pos.entryPrice = newAvgEntry;
+          pos.lastSignalId = signalId;
+        };
+
+        // --- 1. EXIT LOGIC ---
+        if (longPos && shortPos) {
+          const initialSize = Math.max(longPos.size, shortPos.size);
+          const targetNetProfit = (initialSize * currentPrice) * (takeProfitPct / 100);
+          
+          if (totalUnrealizedPnl >= targetNetProfit && totalUnrealizedPnl > 0) {
+            await closePos(longPos, 'Net Take Profit (Hedge Resolved)');
+            await closePos(shortPos, 'Net Take Profit (Hedge Resolved)');
+            longPos = undefined; shortPos = undefined;
+          } else {
+            if (longPos.pnlPct >= takeProfitPct) {
+              await closePos(longPos, 'Take Profit (Unlock)');
+              longPos = undefined;
             }
+            if (shortPos && shortPos.pnlPct >= takeProfitPct) {
+              await closePos(shortPos, 'Take Profit (Unlock)');
+              shortPos = undefined;
+            }
+          }
+        } else {
+          if (longPos && longPos.pnlPct >= takeProfitPct) {
+            await closePos(longPos, 'Take Profit');
+            longPos = undefined;
+          }
+          if (shortPos && shortPos.pnlPct >= takeProfitPct) {
+            await closePos(shortPos, 'Take Profit');
+            shortPos = undefined;
+          }
+        }
 
-            if (!alreadyTraded) {
-              const side = freshSignal.side === 'BUY' ? 'LONG' : 'SHORT';
-              // Allocate 10% of free margin per trade (simplified)
-              const tradeAmount = wallet.freeMargin * 0.1;
-              const size = tradeAmount / currentPrice;
+        // --- 2. HEDGE LOGIC (LOCK 1:1) ---
+        const lockTrigger = setting.lockTriggerPct || 2.0;
+        if (setting.lock11Mode) {
+          if (longPos && !shortPos && longPos.pnlPct <= -lockTrigger) {
+            shortPos = await openPos('SHORT', longPos.size, 'Lock 1:1 (Hedge)');
+          } else if (shortPos && !longPos && shortPos.pnlPct <= -lockTrigger) {
+            longPos = await openPos('LONG', shortPos.size, 'Lock 1:1 (Hedge)');
+          }
+        }
 
-              if (tradeAmount > 10) { // Minimum trade size
-                const newPosRef = doc(collection(db, 'paper_positions'));
-                const journalId = `journal_${Date.now()}_${symbol.replace('/', '')}`;
-                
-                // Create Trading Journal Entry
-                const journalEntry = {
-                  id: journalId,
-                  timestamp: new Date().toISOString(),
-                  symbol: symbol,
-                  side: side,
-                  entryPrice: currentPrice,
-                  stopLoss: freshSignal.stop_loss || 0,
-                  target1: freshSignal.targets?.t1 || 0,
-                  target2: freshSignal.targets?.t2 || 0,
-                  reason: freshSignal.why_this_pair || '',
-                  sentiment: freshSignal.sentiment?.status || 'NEUTRAL',
-                  status: 'OPEN',
-                  source: 'PAPER_BOT',
-                  pnl: 0
-                };
-
-                try {
-                  await setDoc(doc(db, 'trading_journal', journalId), journalEntry);
-                } catch (journalErr) {
-                  console.error('[PAPER] Error creating journal entry:', journalErr);
+        // --- 3. ENTRY & ADD LOGIC (AI SIGNAL) ---
+        if (freshSignal) {
+          const hasActed = (longPos?.signalId === freshSignal.id || shortPos?.signalId === freshSignal.id || longPos?.lastSignalId === freshSignal.id || shortPos?.lastSignalId === freshSignal.id);
+          
+          if (!hasActed) {
+            const historySnap = await getDocs(query(collection(db, 'paper_history'), where('signalId', '==', freshSignal.id), limit(1)));
+            if (historySnap.empty) {
+              const sideUpper = String(freshSignal.side).toUpperCase();
+              const signalSide = (sideUpper === 'BUY' || sideUpper === 'LONG') ? 'LONG' : 'SHORT';
+              
+              if (!longPos && !shortPos) {
+                // New Entry
+                const tradeAmount = wallet.freeMargin * 0.1;
+                if (tradeAmount > 10) {
+                  const size = tradeAmount / currentPrice;
+                  if (signalSide === 'LONG') longPos = await openPos('LONG', size, 'AI Signal Entry', freshSignal.id);
+                  else shortPos = await openPos('SHORT', size, 'AI Signal Entry', freshSignal.id);
                 }
-
-                await setDoc(newPosRef, {
-                  symbol,
-                  side,
-                  entryPrice: currentPrice,
-                  size,
-                  unrealizedPnl: 0,
-                  takeProfit: side === 'LONG' ? currentPrice * (1 + takeProfitPct/100) : currentPrice * (1 - takeProfitPct/100),
-                  stopLoss: 0, // Simplified for now
-                  status: 'OPEN',
-                  openedAt: new Date().toISOString(),
-                  signalId: freshSignal.id, // Track which signal opened this
-                  journalId: journalId // Link to journal
-                });
-
-                wallet.freeMargin -= tradeAmount;
-                wallet.updatedAt = new Date().toISOString();
-                await setDoc(walletRef, wallet);
-
-                await sendTelegramMessage(`[PAPER] 🟢 <b>Opened ${side} ${symbol} (AI Signal)</b>\nEntry: $${currentPrice.toFixed(4)}\nSize: ${size.toFixed(4)}`);
+              } else if (longPos && shortPos && (setting.add05Mode || setting.structure21Mode)) {
+                // Hedged, add to structure
+                const baseSize = Math.min(longPos.size, shortPos.size);
+                const addRatio = setting.add05Mode ? 0.5 : 1.0;
+                const additionalSize = baseSize * addRatio;
+                
+                if (signalSide === 'LONG' && longPos.size < baseSize * 2) {
+                  await addSize(longPos, additionalSize, `Add ${addRatio}x to Long (Structure)`, freshSignal.id);
+                } else if (signalSide === 'SHORT' && shortPos.size < baseSize * 2) {
+                  await addSize(shortPos, additionalSize, `Add ${addRatio}x to Short (Structure)`, freshSignal.id);
+                }
               }
             }
           }
         }
+
+        // Update Unrealized PnL in DB
+        if (longPos) await setDoc(doc(db, 'paper_positions', longPos.id), { unrealizedPnl: longPos.currentPnl }, { merge: true });
+        if (shortPos) await setDoc(doc(db, 'paper_positions', shortPos.id), { unrealizedPnl: shortPos.currentPnl }, { merge: true });
+
+        // Update Monitoring Plan
+        let plan = 'Waiting for AI Signal...';
+        if (longPos && shortPos) {
+          plan = `Hedged (Lock 1:1). Net PnL: $${totalUnrealizedPnl.toFixed(2)}. Waiting for Net TP or Add Signal.`;
+        } else if (longPos || shortPos) {
+          const pos = longPos || shortPos;
+          plan = `Monitoring ${pos.side} for TP (+${takeProfitPct}%). PnL: $${pos.currentPnl.toFixed(2)}. Lock Trigger: -${lockTrigger}%.`;
+        }
+        await setDoc(monitoringRef, { symbol, timeframe, currentPrice, plan, updatedAt: new Date().toISOString() }, { merge: true });
+
       } catch (err) {
         console.error(`[PAPER] Error processing ${symbol}:`, err);
       }
@@ -3190,6 +3250,17 @@ app.post('/api/backtest/approve', async (req, res) => {
     res.json({ success: true, message: `Settings approved for ${symbol}` });
   } catch (error: any) {
     console.error("Failed to save approved settings:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/backtest/approved', async (req, res) => {
+  try {
+    const settingsSnap = await getDocs(collection(db, 'approved_settings'));
+    const approvedSettings = settingsSnap.docs.map(doc => doc.data());
+    res.json(approvedSettings);
+  } catch (error: any) {
+    console.error("Failed to fetch approved settings:", error);
     res.status(500).json({ error: error.message });
   }
 });

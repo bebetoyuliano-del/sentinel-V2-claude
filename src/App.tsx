@@ -78,6 +78,7 @@ interface Signal {
   id: string;
   timestamp: string;
   content: string;
+  type?: string;
 }
 
 interface AccountData {
@@ -693,14 +694,14 @@ export default function App() {
             <div className="flex-1 overflow-y-auto min-h-0">
               {activeTab === 'signals' ? (
                 <div className="space-y-4">
-                  {signals.length === 0 ? (
+                  {signals.filter(s => s.type !== 'scanner_signal').length === 0 ? (
                     <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-12 text-center text-zinc-500">
                       <MessageSquare className="w-8 h-8 mx-auto mb-3 opacity-20" />
                       <p className="text-sm">No signals generated yet.</p>
                       <p className="text-xs mt-1">Start the bot or force a run to generate analysis.</p>
                     </div>
                   ) : (
-                    signals.map(signal => (
+                    signals.filter(s => s.type !== 'scanner_signal').map(signal => (
                       <div key={signal.id} className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
                         <div className="text-xs text-zinc-500 mb-4 font-mono">
                           {new Date(signal.timestamp).toLocaleString()}

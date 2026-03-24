@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area 
 } from 'recharts';
@@ -59,6 +59,23 @@ const BacktestView: React.FC = () => {
   const [analyzing, setAnalyzing] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [approvedSettings, setApprovedSettings] = useState<any[]>([]);
+
+  useEffect(() => {
+    fetchApprovedSettings();
+  }, []);
+
+  const fetchApprovedSettings = async () => {
+    try {
+      const response = await fetch('/api/backtest/approved');
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        setApprovedSettings(data);
+      }
+    } catch (err) {
+      console.error("Failed to fetch approved settings:", err);
+    }
+  };
 
   const runBacktest = async () => {
     setLoading(true);
@@ -135,6 +152,7 @@ const BacktestView: React.FC = () => {
       const data = await response.json();
       if (data.error) throw new Error(data.error);
       setSaveSuccess(true);
+      fetchApprovedSettings();
       setTimeout(() => setSaveSuccess(false), 3000);
     } catch (err: any) {
       setError(err.message);
@@ -154,6 +172,41 @@ const BacktestView: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      {/* Approved Settings List */}
+      {approvedSettings.length > 0 && (
+        <div className="bg-zinc-900/50 border border-emerald-500/20 rounded-2xl p-6 mb-4">
+          <h3 className="text-sm font-bold flex items-center gap-2 text-emerald-400 mb-4 uppercase tracking-widest">
+            <CheckCircle2 className="w-4 h-4" />
+            Approved Settings
+          </h3>
+          <div className="flex flex-wrap gap-2">
+            {approvedSettings.map((s, i) => (
+              <button
+                key={i}
+                onClick={() => {
+                  setSymbol(s.symbol);
+                  setTimeframe(s.timeframe);
+                  setDays(s.days);
+                  setTakeProfitPct(s.takeProfitPct);
+                  setLock11Mode(s.lock11Mode);
+                  setLockTriggerPct(s.lockTriggerPct);
+                  setAdd05Mode(s.add05Mode);
+                  setStructure21Mode(s.structure21Mode);
+                  setMaxMrPct(s.maxMrPct);
+                }}
+                className="bg-black/40 border border-white/5 hover:border-emerald-500/30 rounded-xl px-3 py-2 text-xs text-zinc-300 transition-all flex items-center gap-2 group"
+              >
+                <span className="font-bold text-white">{s.symbol}</span>
+                <span className="text-[10px] text-zinc-500">{s.timeframe}</span>
+                <span className="text-[10px] text-emerald-500/70 font-mono">
+                  {s.summary?.winRate?.toFixed(1)}% WR
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Configuration Header */}
       <div className="bg-zinc-900/50 border border-white/10 rounded-2xl p-6 mb-8">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-6">
