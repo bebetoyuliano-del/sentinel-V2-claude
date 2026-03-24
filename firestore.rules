@@ -113,12 +113,18 @@ service cloud.firestore {
     }
 
     function isValidSignal(data) {
-      return hasOnlyAllowedFields(['id', 'content', 'timestamp', 'type', 'symbol']) &&
+      return hasOnlyAllowedFields(['id', 'content', 'timestamp', 'type', 'symbol', 'side', 'entry', 'stop_loss', 'targets', 'why_this_pair', 'sentiment']) &&
              data.content is string && data.content.size() > 0 && data.content.size() < 10000 &&
              data.timestamp is string && data.timestamp.size() < 50 &&
              (!('id' in data) || (data.id is string && data.id.size() < 100)) &&
              (!('type' in data) || data.type == null || (data.type is string && data.type.size() < 50)) &&
-             (!('symbol' in data) || data.symbol == null || (data.symbol is string && data.symbol.size() < 50));
+             (!('symbol' in data) || data.symbol == null || (data.symbol is string && data.symbol.size() < 50)) &&
+             (!('side' in data) || data.side == null || (data.side is string && data.side.size() < 20)) &&
+             (!('entry' in data) || data.entry == null || data.entry is number || data.entry is string) &&
+             (!('stop_loss' in data) || data.stop_loss == null || data.stop_loss is number || data.stop_loss is string) &&
+             (!('targets' in data) || data.targets == null || data.targets is map || data.targets is list) &&
+             (!('why_this_pair' in data) || data.why_this_pair == null || (data.why_this_pair is string && data.why_this_pair.size() < 10000)) &&
+             (!('sentiment' in data) || data.sentiment == null || data.sentiment is map);
     }
 
     function isValidChat(data) {
@@ -189,6 +195,16 @@ service cloud.firestore {
                       isAdmin()
                     );
       allow delete: if isAdmin();
+    }
+
+    match /system/{document} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /test/{document} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
     }
 
     match /signals/{signalId} {
