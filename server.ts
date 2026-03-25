@@ -69,6 +69,60 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
 let db: any = null;
 let auth: any = null;
 
+// Caches for Paper Trading Engine
+let cachedApprovedSettings: any[] = [];
+let cachedPaperPositions: any[] = [];
+let cachedPaperWallet: any = { balance: 10000, equity: 10000, freeMargin: 10000, updatedAt: new Date().toISOString() };
+let cachedPaperHistory: any[] = [];
+let cachedPaperMonitoring: any[] = [];
+let isRealtimeListenersSetup = false;
+let lastDbSyncTime = 0;
+
+import { onSnapshot } from 'firebase/firestore';
+
+function setupRealtimeListeners() {
+  if (!db || isRealtimeListenersSetup) return;
+  
+  try {
+    onSnapshot(collection(db, 'approved_settings'), (snap) => {
+      cachedApprovedSettings = snap.docs.map(doc => doc.data());
+    }, (error) => {
+      console.error("Error in approved_settings snapshot:", error);
+    });
+
+    onSnapshot(collection(db, 'paper_positions'), (snap) => {
+      cachedPaperPositions = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    }, (error) => {
+      console.error("Error in paper_positions snapshot:", error);
+    });
+
+    onSnapshot(doc(db, 'paper_wallet', 'main'), (snap) => {
+      if (snap.exists()) {
+        cachedPaperWallet = snap.data();
+      }
+    }, (error) => {
+      console.error("Error in paper_wallet snapshot:", error);
+    });
+
+    onSnapshot(collection(db, 'paper_history'), (snap) => {
+      cachedPaperHistory = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    }, (error) => {
+      console.error("Error in paper_history snapshot:", error);
+    });
+
+    onSnapshot(collection(db, 'paper_monitoring'), (snap) => {
+      cachedPaperMonitoring = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    }, (error) => {
+      console.error("Error in paper_monitoring snapshot:", error);
+    });
+
+    isRealtimeListenersSetup = true;
+    console.log("✅ Real-time Firestore listeners setup for Paper Trading");
+  } catch (e) {
+    console.error("Failed to setup real-time listeners:", e);
+  }
+}
+
 async function initFirebase() {
   try {
     const firebaseConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf8'));
@@ -130,6 +184,7 @@ async function initFirebase() {
         const { getDocFromServer } = await import('firebase/firestore');
         await getDocFromServer(doc(db, 'test', 'connection'));
         console.log("✅ Firestore connection verified");
+        setupRealtimeListeners();
       } catch (error: any) {
         if (error.message.includes('the client is offline')) {
           console.error("❌ Firestore connection failed: Client is offline. Check configuration.");
@@ -1330,8 +1385,7 @@ async function monitorMarkets(force = false) {
     let approvedSettingsSymbols: string[] = [];
     let approvedSettings: any[] = [];
     try {
-      const settingsSnap = await getDocs(collection(db, 'approved_settings'));
-      approvedSettings = settingsSnap.docs.map(doc => doc.data());
+      approvedSettings = [...cachedApprovedSettings];
       approvedSettingsSymbols = approvedSettings.map(s => s.symbol);
     } catch (e) {
       console.error('Error fetching approved settings:', e);
@@ -2546,17 +2600,10 @@ async function runPaperTradingEngine() {
   try {
     // 1. Ensure Paper Wallet exists
     const walletRef = doc(db, 'paper_wallet', 'main');
-    const walletSnap = await getDoc(walletRef);
-    let wallet = { balance: 10000, equity: 10000, freeMargin: 10000, updatedAt: new Date().toISOString() };
-    if (!walletSnap.exists()) {
-      await setDoc(walletRef, wallet);
-    } else {
-      wallet = walletSnap.data() as any;
-    }
+    let wallet = { ...cachedPaperWallet };
 
     // 2. Fetch Approved Settings
-    const settingsSnap = await getDocs(collection(db, 'approved_settings'));
-    const approvedSettings = settingsSnap.docs.map(doc => doc.data());
+    const approvedSettings = [...cachedApprovedSettings];
 
     if (approvedSettings.length === 0) {
       console.log('[PAPER] No approved settings found. Skipping cycle.');
@@ -2564,8 +2611,15 @@ async function runPaperTradingEngine() {
     }
 
     // 3. Fetch Open Positions
-    const positionsSnap = await getDocs(collection(db, 'paper_positions'));
-    const openPositions = positionsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() } as any));
+    const openPositions = [...cachedPaperPositions];
+
+    // Track if we need to sync DB this cycle
+    let needsDbSync = false;
+    const now = Date.now();
+    if (now - lastDbSyncTime > 5 * 60 * 1000) {
+      needsDbSync = true;
+      lastDbSyncTime = now;
+    }
 
     // 4. Process each approved setting
     for (const setting of approvedSettings) {
@@ -2749,8 +2803,8 @@ async function runPaperTradingEngine() {
           const hasActed = (longPos?.signalId === freshSignal.id || shortPos?.signalId === freshSignal.id || longPos?.lastSignalId === freshSignal.id || shortPos?.lastSignalId === freshSignal.id);
           
           if (!hasActed) {
-            const historySnap = await getDocs(query(collection(db, 'paper_history'), where('signalId', '==', freshSignal.id), limit(1)));
-            if (historySnap.empty) {
+            const historyExists = cachedPaperHistory.some(h => h.signalId === freshSignal.id);
+            if (!historyExists) {
               const sideUpper = String(freshSignal.side).toUpperCase();
               const signalSide = (sideUpper === 'BUY' || sideUpper === 'LONG') ? 'LONG' : 'SHORT';
               
@@ -2829,8 +2883,10 @@ async function runPaperTradingEngine() {
         }
 
         // Update Unrealized PnL in DB
-        if (longPos) await setDoc(doc(db, 'paper_positions', longPos.id), { unrealizedPnl: longPos.currentPnl }, { merge: true });
-        if (shortPos) await setDoc(doc(db, 'paper_positions', shortPos.id), { unrealizedPnl: shortPos.currentPnl }, { merge: true });
+        if (needsDbSync) {
+          if (longPos) await setDoc(doc(db, 'paper_positions', longPos.id), { unrealizedPnl: longPos.currentPnl }, { merge: true });
+          if (shortPos) await setDoc(doc(db, 'paper_positions', shortPos.id), { unrealizedPnl: shortPos.currentPnl }, { merge: true });
+        }
 
         // Update Monitoring Plan
         let plan = 'Waiting for AI Signal...';
@@ -2844,7 +2900,10 @@ async function runPaperTradingEngine() {
           const totalNetProfit = pos.currentPnl + realizedHedgeProfit;
           plan = `Monitoring ${pos.side} for TP (+${takeProfitPct}%). Net PnL: $${totalNetProfit.toFixed(2)}. Lock Trigger: -${lockTrigger}%.`;
         }
-        await setDoc(monitoringRef, { symbol, timeframe, currentPrice, plan, updatedAt: new Date().toISOString() }, { merge: true });
+        
+        if (needsDbSync) {
+          await setDoc(monitoringRef, { symbol, timeframe, currentPrice, plan, updatedAt: new Date().toISOString() }, { merge: true });
+        }
 
       } catch (err) {
         console.error(`[PAPER] Error processing ${symbol}:`, err);
@@ -3331,9 +3390,7 @@ app.post('/api/backtest/approve', async (req, res) => {
 
 app.get('/api/backtest/approved', async (req, res) => {
   try {
-    const settingsSnap = await getDocs(collection(db, 'approved_settings'));
-    const approvedSettings = settingsSnap.docs.map(doc => doc.data());
-    res.json(approvedSettings);
+    res.json(cachedApprovedSettings);
   } catch (error: any) {
     console.error("Failed to fetch approved settings:", error);
     res.status(500).json({ error: error.message });
@@ -3496,8 +3553,7 @@ app.get('/api/paper/status', (req, res) => {
 app.get('/api/paper/wallet', async (req, res) => {
   try {
     await ensureAuth();
-    const walletSnap = await getDoc(doc(db, 'paper_wallet', 'main'));
-    res.json(walletSnap.exists() ? walletSnap.data() : { balance: 10000, equity: 10000, freeMargin: 10000 });
+    res.json(cachedPaperWallet);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -3506,8 +3562,7 @@ app.get('/api/paper/wallet', async (req, res) => {
 app.get('/api/paper/positions', async (req, res) => {
   try {
     await ensureAuth();
-    const positionsSnap = await getDocs(collection(db, 'paper_positions'));
-    res.json(positionsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    res.json(cachedPaperPositions);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -3516,8 +3571,7 @@ app.get('/api/paper/positions', async (req, res) => {
 app.get('/api/paper/history', async (req, res) => {
   try {
     await ensureAuth();
-    const historySnap = await getDocs(collection(db, 'paper_history'));
-    res.json(historySnap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    res.json(cachedPaperHistory);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -3526,8 +3580,7 @@ app.get('/api/paper/history', async (req, res) => {
 app.get('/api/paper/monitoring', async (req, res) => {
   try {
     await ensureAuth();
-    const monitoringSnap = await getDocs(collection(db, 'paper_monitoring'));
-    res.json(monitoringSnap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    res.json(cachedPaperMonitoring);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

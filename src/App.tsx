@@ -110,6 +110,11 @@ export default function App() {
   const [journal, setJournal] = useState<any[]>([]);
   const [journalFilter, setJournalFilter] = useState<'ALL' | 'AI' | 'PAPER_BOT' | 'USER'>('ALL');
   const [isSyncing, setIsSyncing] = useState(false);
+  const [appError, setAppError] = useState<Error | null>(null);
+
+  if (appError) {
+    throw appError;
+  }
 
   const handleSync = async () => {
     setIsSyncing(true);
@@ -132,9 +137,11 @@ export default function App() {
     async function testConnection() {
       try {
         await getDocFromServer(doc(db, 'test', 'connection'));
-      } catch (error) {
+      } catch (error: any) {
         if(error instanceof Error && error.message.includes('the client is offline')) {
           console.error("Please check your Firebase configuration. ");
+        } else if (error?.message?.includes('Quota limit exceeded')) {
+          setAppError(new Error(JSON.stringify({ error: error.message })));
         }
       }
     }
@@ -144,16 +151,23 @@ export default function App() {
       setUser(currentUser);
       if (currentUser) {
         // Ensure user document exists in Firestore
-        const { doc, setDoc, getDoc } = await import('firebase/firestore');
-        const userDocRef = doc(db, 'users', currentUser.uid);
-        const userDoc = await getDoc(userDocRef);
-        if (!userDoc.exists()) {
-          await setDoc(userDocRef, {
-            name: currentUser.displayName || '',
-            email: currentUser.email || '',
-            role: currentUser.email === 'bebetoyuliano@gmail.com' ? 'admin' : 'user',
-            createdAt: new Date().toISOString()
-          });
+        try {
+          const { doc, setDoc, getDoc } = await import('firebase/firestore');
+          const userDocRef = doc(db, 'users', currentUser.uid);
+          const userDoc = await getDoc(userDocRef);
+          if (!userDoc.exists()) {
+            await setDoc(userDocRef, {
+              name: currentUser.displayName || '',
+              email: currentUser.email || '',
+              role: currentUser.email === 'bebetoyuliano@gmail.com' ? 'admin' : 'user',
+              createdAt: new Date().toISOString()
+            });
+          }
+        } catch (err: any) {
+          console.error("Error fetching user doc:", err);
+          if (err.message && err.message.includes('Quota limit exceeded')) {
+            setAppError(new Error(JSON.stringify({ error: err.message })));
+          }
         }
       }
       setAuthLoading(false);
@@ -173,7 +187,11 @@ export default function App() {
       })) as Signal[];
       setSignals(fetchedSignals);
     }, (err) => {
-      handleFirestoreError(err, OperationType.GET, 'signals');
+      try {
+        handleFirestoreError(err, OperationType.GET, 'signals');
+      } catch (e: any) {
+        setAppError(e);
+      }
     });
 
     // Listen to chat messages
@@ -185,7 +203,11 @@ export default function App() {
       }));
       setChatMessages(fetchedChats as any);
     }, (err) => {
-      handleFirestoreError(err, OperationType.GET, 'chats');
+      try {
+        handleFirestoreError(err, OperationType.GET, 'chats');
+      } catch (e: any) {
+        setAppError(e);
+      }
     });
 
     // Listen to journal
@@ -197,7 +219,11 @@ export default function App() {
       }));
       setJournal(fetchedJournal);
     }, (err) => {
-      handleFirestoreError(err, OperationType.GET, 'trading_journal');
+      try {
+        handleFirestoreError(err, OperationType.GET, 'trading_journal');
+      } catch (e: any) {
+        setAppError(e);
+      }
     });
 
     return () => {
@@ -326,7 +352,11 @@ export default function App() {
           timestamp: new Date().toISOString()
         });
       } catch (err) {
-        handleFirestoreError(err, OperationType.WRITE, 'chats');
+        try {
+          handleFirestoreError(err, OperationType.WRITE, 'chats');
+        } catch (e: any) {
+          setAppError(e);
+        }
       }
 
       const res = await fetch('/api/chat', {
@@ -344,7 +374,11 @@ export default function App() {
             timestamp: new Date().toISOString()
           });
         } catch (err) {
-          handleFirestoreError(err, OperationType.WRITE, 'chats');
+          try {
+            handleFirestoreError(err, OperationType.WRITE, 'chats');
+          } catch (e: any) {
+            setAppError(e);
+          }
         }
       }
     } catch (err) {
