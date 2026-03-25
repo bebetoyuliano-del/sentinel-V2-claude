@@ -1,5 +1,5 @@
 {
   "name": "Crypto Sentinel",
   "description": "24/7 Binance crypto trading bot and signal generator with Telegram integration.",
-  "requestFramePermissions": []
+  "requestFramePermissions": ["microphone"]
 }

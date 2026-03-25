@@ -104,17 +104,14 @@ function setupRealtimeListeners() {
       console.error("Error in paper_wallet snapshot:", error);
     });
 
-    onSnapshot(collection(db, 'paper_history'), (snap) => {
+    const historyQuery = query(collection(db, 'paper_history'), orderBy('closedAt', 'desc'), limit(200));
+    onSnapshot(historyQuery, (snap) => {
       cachedPaperHistory = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     }, (error) => {
       console.error("Error in paper_history snapshot:", error);
     });
 
-    onSnapshot(collection(db, 'paper_monitoring'), (snap) => {
-      cachedPaperMonitoring = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    }, (error) => {
-      console.error("Error in paper_monitoring snapshot:", error);
-    });
+    // Removed paper_monitoring onSnapshot to save reads. We will maintain this purely in memory.
 
     isRealtimeListenersSetup = true;
     console.log("✅ Real-time Firestore listeners setup for Paper Trading");
@@ -2613,14 +2610,6 @@ async function runPaperTradingEngine() {
     // 3. Fetch Open Positions
     const openPositions = [...cachedPaperPositions];
 
-    // Track if we need to sync DB this cycle
-    let needsDbSync = false;
-    const now = Date.now();
-    if (now - lastDbSyncTime > 5 * 60 * 1000) {
-      needsDbSync = true;
-      lastDbSyncTime = now;
-    }
-
     // 4. Process each approved setting
     for (const setting of approvedSettings) {
       const { symbol, timeframe, takeProfitPct } = setting;
@@ -2882,13 +2871,17 @@ async function runPaperTradingEngine() {
           }
         }
 
-        // Update Unrealized PnL in DB
-        if (needsDbSync) {
-          if (longPos) await setDoc(doc(db, 'paper_positions', longPos.id), { unrealizedPnl: longPos.currentPnl }, { merge: true });
-          if (shortPos) await setDoc(doc(db, 'paper_positions', shortPos.id), { unrealizedPnl: shortPos.currentPnl }, { merge: true });
+        // Update Unrealized PnL in Memory ONLY (Saves massive Firestore writes/reads)
+        if (longPos) {
+          const idx = cachedPaperPositions.findIndex(p => p.id === longPos.id);
+          if (idx >= 0) cachedPaperPositions[idx].unrealizedPnl = longPos.currentPnl;
+        }
+        if (shortPos) {
+          const idx = cachedPaperPositions.findIndex(p => p.id === shortPos.id);
+          if (idx >= 0) cachedPaperPositions[idx].unrealizedPnl = shortPos.currentPnl;
         }
 
-        // Update Monitoring Plan
+        // Update Monitoring Plan in Memory ONLY
         let plan = 'Waiting for AI Signal...';
         if (longPos && shortPos) {
           const realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + (shortPos.realizedHedgeProfit || 0);
@@ -2901,8 +2894,14 @@ async function runPaperTradingEngine() {
           plan = `Monitoring ${pos.side} for TP (+${takeProfitPct}%). Net PnL: $${totalNetProfit.toFixed(2)}. Lock Trigger: -${lockTrigger}%.`;
         }
         
-        if (needsDbSync) {
-          await setDoc(monitoringRef, { symbol, timeframe, currentPrice, plan, updatedAt: new Date().toISOString() }, { merge: true });
+        const monitorId = symbol.replace('/', '_');
+        const existingMonitorIndex = cachedPaperMonitoring.findIndex(m => m.id === monitorId);
+        const monitorData = { id: monitorId, symbol, timeframe, currentPrice, plan, updatedAt: new Date().toISOString() };
+        
+        if (existingMonitorIndex >= 0) {
+          cachedPaperMonitoring[existingMonitorIndex] = { ...cachedPaperMonitoring[existingMonitorIndex], ...monitorData };
+        } else {
+          cachedPaperMonitoring.push(monitorData);
         }
 
       } catch (err) {

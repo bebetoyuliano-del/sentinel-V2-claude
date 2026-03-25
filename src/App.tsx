@@ -7,6 +7,7 @@ import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { collection, query, orderBy, limit, onSnapshot, addDoc, serverTimestamp, getDocFromServer, doc } from 'firebase/firestore';
 import BacktestView from './components/BacktestView';
 import PaperTradingView from './components/PaperTradingView';
+import VoiceAssistant from './components/VoiceAssistant';
 
 enum OperationType {
   CREATE = 'create',
@@ -1001,6 +1002,8 @@ export default function App() {
           </div>
         </div>
       )}
+      
+      <VoiceAssistant />
     </div>
   );
 }
