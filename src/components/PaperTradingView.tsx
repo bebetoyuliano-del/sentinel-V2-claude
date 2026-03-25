@@ -152,7 +152,7 @@ export default function PaperTradingView() {
                   </td>
                 </tr>
               ) : (
-                monitoring.map((m) => (
+                monitoring.filter(m => m.symbol).map((m) => (
                   <tr key={m.id} className="border-b border-slate-700/50 last:border-0">
                     <td className="px-4 py-3 font-medium text-white">
                       <div className="flex flex-col">
@@ -164,20 +164,20 @@ export default function PaperTradingView() {
                       <span className={`px-2 py-1 rounded text-xs font-medium ${
                         m.trend === 'UP' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500'
                       }`}>
-                        {m.trend}
+                        {m.trend || 'N/A'}
                       </span>
                     </td>
-                    <td className="px-4 py-3 text-slate-300">${m.currentPrice?.toFixed(4)}</td>
+                    <td className="px-4 py-3 text-slate-300">${m.currentPrice?.toFixed(4) || '0.0000'}</td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
                         <div className={`w-2 h-2 rounded-full animate-pulse ${
                           m.plan?.includes('Waiting') ? 'bg-yellow-500' : 'bg-blue-500'
                         }`} />
-                        <span className="text-slate-200">{m.plan}</span>
+                        <span className="text-slate-200">{m.plan || 'N/A'}</span>
                       </div>
                     </td>
                     <td className="px-4 py-3 text-slate-400 text-xs">
-                      {new Date(m.updatedAt).toLocaleTimeString()}
+                      {m.updatedAt ? new Date(m.updatedAt).toLocaleTimeString() : 'N/A'}
                     </td>
                   </tr>
                 ))
@@ -213,7 +213,7 @@ export default function PaperTradingView() {
                   </td>
                 </tr>
               ) : (
-                positions.map((pos) => (
+                positions.filter(pos => pos.symbol).map((pos) => (
                   <tr key={pos.id} className="border-b border-slate-700/50 last:border-0">
                     <td className="px-4 py-3 font-medium text-white">{pos.symbol}</td>
                     <td className="px-4 py-3">
@@ -223,15 +223,15 @@ export default function PaperTradingView() {
                         {pos.side}
                       </span>
                     </td>
-                    <td className="px-4 py-3 text-slate-300">{pos.size?.toFixed(4)}</td>
-                    <td className="px-4 py-3 text-slate-300">${pos.entryPrice?.toFixed(4)}</td>
+                    <td className="px-4 py-3 text-slate-300">{pos.size?.toFixed(4) || '0.0000'}</td>
+                    <td className="px-4 py-3 text-slate-300">${pos.entryPrice?.toFixed(4) || '0.0000'}</td>
                     <td className={`px-4 py-3 font-medium ${
-                      pos.unrealizedPnl >= 0 ? 'text-emerald-500' : 'text-red-500'
+                      (pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-500' : 'text-red-500'
                     }`}>
-                      {pos.unrealizedPnl >= 0 ? '+' : ''}{pos.unrealizedPnl?.toFixed(2)}
+                      {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{(pos.unrealizedPnl || 0).toFixed(2)}
                     </td>
                     <td className="px-4 py-3 text-slate-400">
-                      {new Date(pos.openedAt).toLocaleString()}
+                      {pos.openedAt ? new Date(pos.openedAt).toLocaleString() : 'N/A'}
                     </td>
                   </tr>
                 ))
@@ -267,7 +267,7 @@ export default function PaperTradingView() {
                   </td>
                 </tr>
               ) : (
-                history.map((trade) => (
+                history.filter(trade => trade.symbol).map((trade) => (
                   <tr key={trade.id} className="border-b border-slate-700/50 last:border-0">
                     <td className="px-4 py-3 font-medium text-white">{trade.symbol}</td>
                     <td className="px-4 py-3">
@@ -278,16 +278,16 @@ export default function PaperTradingView() {
                       </span>
                     </td>
                     <td className="px-4 py-3 text-slate-300">
-                      ${trade.entryPrice?.toFixed(4)} / ${trade.exitPrice?.toFixed(4)}
+                      ${trade.entryPrice?.toFixed(4) || '0.0000'} / ${trade.exitPrice?.toFixed(4) || '0.0000'}
                     </td>
                     <td className={`px-4 py-3 font-medium ${
-                      trade.pnl >= 0 ? 'text-emerald-500' : 'text-red-500'
+                      (trade.pnl || 0) >= 0 ? 'text-emerald-500' : 'text-red-500'
                     }`}>
-                      {trade.pnl >= 0 ? '+' : ''}{trade.pnl?.toFixed(2)}
+                      {(trade.pnl || 0) >= 0 ? '+' : ''}{(trade.pnl || 0).toFixed(2)}
                     </td>
                     <td className="px-4 py-3 text-slate-400">{trade.reason}</td>
                     <td className="px-4 py-3 text-slate-400">
-                      {new Date(trade.closedAt).toLocaleString()}
+                      {trade.closedAt ? new Date(trade.closedAt).toLocaleString() : 'N/A'}
                     </td>
                   </tr>
                 ))
