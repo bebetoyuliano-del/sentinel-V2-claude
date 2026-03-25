@@ -112,6 +112,7 @@ export default function App() {
   const [journalFilter, setJournalFilter] = useState<'ALL' | 'AI' | 'PAPER_BOT' | 'USER'>('ALL');
   const [isSyncing, setIsSyncing] = useState(false);
   const [appError, setAppError] = useState<Error | null>(null);
+  const [isOfflineMode, setIsOfflineMode] = useState(false);
 
   if (appError) {
     throw appError;
@@ -142,7 +143,8 @@ export default function App() {
         if(error instanceof Error && error.message.includes('the client is offline')) {
           console.error("Please check your Firebase configuration. ");
         } else if (error?.message?.includes('Quota limit exceeded')) {
-          setAppError(new Error(JSON.stringify({ error: error.message })));
+          console.warn("Firebase Quota Exceeded. Running in offline mode.");
+          setIsOfflineMode(true);
         }
       }
     }
@@ -167,7 +169,8 @@ export default function App() {
         } catch (err: any) {
           console.error("Error fetching user doc:", err);
           if (err.message && err.message.includes('Quota limit exceeded')) {
-            setAppError(new Error(JSON.stringify({ error: err.message })));
+            console.warn("Firebase Quota Exceeded. Running in offline mode.");
+            setIsOfflineMode(true);
           }
         }
       }
@@ -179,6 +182,42 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
     
+    if (isOfflineMode) {
+      // Fetch signals from API instead
+      const fetchSignals = async () => {
+        try {
+          const res = await fetch('/api/signals');
+          if (res.ok) {
+            const data = await res.json();
+            setSignals(data);
+          }
+        } catch (e) {
+          console.error("Error fetching signals in offline mode", e);
+        }
+      };
+      
+      const fetchJournal = async () => {
+        try {
+          const res = await fetch('/api/journal');
+          if (res.ok) {
+            const data = await res.json();
+            setJournal(data.journal || []);
+          }
+        } catch (e) {
+          console.error("Error fetching journal in offline mode", e);
+        }
+      };
+
+      fetchSignals();
+      fetchJournal();
+      const interval = setInterval(() => {
+        fetchSignals();
+        fetchJournal();
+      }, 10000);
+      
+      return () => clearInterval(interval);
+    }
+
     // Listen to signals from Firestore
     const qSignals = query(collection(db, 'signals'), orderBy('timestamp', 'desc'), limit(50));
     const unsubSignals = onSnapshot(qSignals, (snapshot) => {
@@ -191,7 +230,12 @@ export default function App() {
       try {
         handleFirestoreError(err, OperationType.GET, 'signals');
       } catch (e: any) {
-        setAppError(e);
+        if (e.message && e.message.includes('Quota limit exceeded')) {
+          console.warn("Firebase Quota Exceeded. Switching to offline mode.");
+          setIsOfflineMode(true);
+        } else {
+          setAppError(e);
+        }
       }
     });
 
@@ -207,7 +251,12 @@ export default function App() {
       try {
         handleFirestoreError(err, OperationType.GET, 'chats');
       } catch (e: any) {
-        setAppError(e);
+        if (e.message && e.message.includes('Quota limit exceeded')) {
+          console.warn("Firebase Quota Exceeded. Switching to offline mode.");
+          setIsOfflineMode(true);
+        } else {
+          setAppError(e);
+        }
       }
     });
 
@@ -223,7 +272,12 @@ export default function App() {
       try {
         handleFirestoreError(err, OperationType.GET, 'trading_journal');
       } catch (e: any) {
-        setAppError(e);
+        if (e.message && e.message.includes('Quota limit exceeded')) {
+          console.warn("Firebase Quota Exceeded. Switching to offline mode.");
+          setIsOfflineMode(true);
+        } else {
+          setAppError(e);
+        }
       }
     });
 
@@ -232,7 +286,7 @@ export default function App() {
       unsubChats();
       unsubJournal();
     };
-  }, [user]);
+  }, [user, isOfflineMode]);
 
   // Helper to format CCXT symbol to TradingView Futures symbol
   const getTVSymbol = (sym: string) => {
@@ -346,17 +400,27 @@ export default function App() {
     
     try {
       // Save user message to Firestore
-      try {
-        await addDoc(collection(db, 'chats'), {
-          role: 'user',
-          content: userMsg,
-          timestamp: new Date().toISOString()
-        });
-      } catch (err) {
+      if (isOfflineMode) {
+        setChatMessages(prev => [...prev, { role: 'user', content: userMsg }]);
+      } else {
         try {
-          handleFirestoreError(err, OperationType.WRITE, 'chats');
-        } catch (e: any) {
-          setAppError(e);
+          await addDoc(collection(db, 'chats'), {
+            role: 'user',
+            content: userMsg,
+            timestamp: new Date().toISOString()
+          });
+        } catch (err) {
+          try {
+            handleFirestoreError(err, OperationType.WRITE, 'chats');
+          } catch (e: any) {
+            if (e.message && e.message.includes('Quota limit exceeded')) {
+              console.warn("Firebase Quota Exceeded. Switching to offline mode.");
+              setIsOfflineMode(true);
+              setChatMessages(prev => [...prev, { role: 'user', content: userMsg }]);
+            } else {
+              setAppError(e);
+            }
+          }
         }
       }
 
@@ -368,17 +432,27 @@ export default function App() {
       const data = await res.json();
       if (data.reply) {
         // Save AI reply to Firestore
-        try {
-          await addDoc(collection(db, 'chats'), {
-            role: 'ai',
-            content: data.reply,
-            timestamp: new Date().toISOString()
-          });
-        } catch (err) {
+        if (isOfflineMode) {
+          setChatMessages(prev => [...prev, { role: 'ai', content: data.reply }]);
+        } else {
           try {
-            handleFirestoreError(err, OperationType.WRITE, 'chats');
-          } catch (e: any) {
-            setAppError(e);
+            await addDoc(collection(db, 'chats'), {
+              role: 'ai',
+              content: data.reply,
+              timestamp: new Date().toISOString()
+            });
+          } catch (err) {
+            try {
+              handleFirestoreError(err, OperationType.WRITE, 'chats');
+            } catch (e: any) {
+              if (e.message && e.message.includes('Quota limit exceeded')) {
+                console.warn("Firebase Quota Exceeded. Switching to offline mode.");
+                setIsOfflineMode(true);
+                setChatMessages(prev => [...prev, { role: 'ai', content: data.reply }]);
+              } else {
+                setAppError(e);
+              }
+            }
           }
         }
       }

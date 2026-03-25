@@ -85,7 +85,18 @@ export default function VoiceAssistant() {
           contextString = `\n\n=== KONTEKS SAAT INI ===\n[Posisi Terbuka]:\n${openPositions || 'Tidak ada posisi terbuka.'}\n\n[3 Sinyal/Decision Card Terakhir]:\n${recentSignals || 'Belum ada sinyal.'}\n\n[3 Chat Terakhir dengan High Level AI]:\n${recentChats || 'Belum ada chat.'}\n========================\n\nGunakan konteks di atas untuk menjawab pertanyaan pengguna agar lebih relevan dengan kondisi trading mereka saat ini.`;
         }
       } catch (e) {
-        console.error("Failed to fetch context for Voice AI", e);
+        console.error("Failed to fetch context for Voice AI from Firestore, falling back to API", e);
+        try {
+          const res = await fetch('/api/signals');
+          if (res.ok) {
+            const data = await res.json();
+            const truncate = (str: string, maxLen: number) => str.length > maxLen ? str.substring(0, maxLen) + '...' : str;
+            const recentSignals = data.slice(0, 3).map((d: any) => truncate(d.content || '', 300)).join('\n---\n');
+            contextString = `\n\n=== KONTEKS SAAT INI (OFFLINE MODE) ===\n[3 Sinyal/Decision Card Terakhir]:\n${recentSignals || 'Belum ada sinyal.'}\n========================\n\nGunakan konteks di atas untuk menjawab pertanyaan pengguna agar lebih relevan dengan kondisi trading mereka saat ini.`;
+          }
+        } catch (apiErr) {
+          console.error("Failed to fetch context from API", apiErr);
+        }
       }
 
       // API Key is injected by the platform
