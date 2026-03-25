@@ -171,7 +171,7 @@ export default function PaperTradingView() {
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
                         <div className={`w-2 h-2 rounded-full animate-pulse ${
-                          m.plan.includes('Waiting') ? 'bg-yellow-500' : 'bg-blue-500'
+                          m.plan?.includes('Waiting') ? 'bg-yellow-500' : 'bg-blue-500'
                         }`} />
                         <span className="text-slate-200">{m.plan}</span>
                       </div>

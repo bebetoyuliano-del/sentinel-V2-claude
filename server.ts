@@ -3409,6 +3409,33 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+app.get('/api/debug/db-check', async (req, res) => {
+  if (!db) return res.status(500).json({ error: 'DB not initialized' });
+  try {
+    const snap = await getDocs(collection(db, 'approved_settings'));
+    const dbSettings = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    
+    const snapPos = await getDocs(collection(db, 'paper_positions'));
+    const dbPositions = snapPos.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    res.json({
+      cache: {
+        approvedSettings: typeof cachedApprovedSettings !== 'undefined' ? cachedApprovedSettings : 'undefined',
+        paperPositions: typeof cachedPaperPositions !== 'undefined' ? cachedPaperPositions : 'undefined',
+        paperWallet: typeof cachedPaperWallet !== 'undefined' ? cachedPaperWallet : 'undefined'
+      },
+      database: {
+        approvedSettingsCount: dbSettings.length,
+        approvedSettings: dbSettings,
+        paperPositionsCount: dbPositions.length,
+        paperPositions: dbPositions
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const logBuffer: string[] = [];
 function addLog(msg: string) {
   logBuffer.push(`[${new Date().toISOString()}] ${msg}`);

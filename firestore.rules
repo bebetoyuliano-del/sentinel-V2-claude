@@ -135,7 +135,7 @@ service cloud.firestore {
     }
 
     function isValidJournal(data) {
-      return hasOnlyAllowedFields(['id', 'symbol', 'side', 'entryPrice', 'exitPrice', 'pnl', 'reason', 'timestamp', 'stopLoss', 'target1', 'target2', 'sentiment', 'status', 'source']) &&
+      return hasOnlyAllowedFields(['id', 'symbol', 'side', 'entryPrice', 'exitPrice', 'pnl', 'reason', 'timestamp', 'stopLoss', 'target1', 'target2', 'sentiment', 'status', 'source', 'closedAt', 'closeReason']) &&
              data.symbol is string && data.symbol.size() > 0 && data.symbol.size() < 50 &&
              data.side is string && data.side.size() > 0 && data.side.size() < 50 &&
              data.pnl is number &&
@@ -149,7 +149,9 @@ service cloud.firestore {
              (!('sentiment' in data) || data.sentiment == null || data.sentiment is string) &&
              (!('status' in data) || data.status == null || data.status is string) &&
              (!('source' in data) || data.source == null || data.source is string) &&
-             (!('reason' in data) || data.reason == null || (data.reason is string && data.reason.size() < 10000));
+             (!('reason' in data) || data.reason == null || (data.reason is string && data.reason.size() < 10000)) &&
+             (!('closedAt' in data) || data.closedAt == null || (data.closedAt is string && data.closedAt.size() < 50)) &&
+             (!('closeReason' in data) || data.closeReason == null || (data.closeReason is string && data.closeReason.size() < 10000));
     }
 
     function isValidJournalSummary(data) {
