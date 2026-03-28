@@ -27,6 +27,7 @@ import { escapeHtml, renderDecisionCardsToTelegram } from './src/renderers/Teleg
 import { sendTelegramMessage, sendInteractiveMenu, sendTradingMenu, sendHedgeMenu } from './src/services/TelegramService';
 import { uploadAnalysisToGCS } from './src/services/GCSService';
 import { PolicyMapper } from './src/core/PolicyMapper';
+import { PolicyContextData } from './src/core/PolicyContext';
 
 enum OperationType {
   CREATE = 'create',
@@ -1127,8 +1128,14 @@ async function monitorMarkets(force = false) {
          - Kondisi di mana qty long ≈ qty short.
          - Net exposure ≈ 0 → risiko pergerakan harga dibekukan.
       5. Add 0.5:
-         - Penambahan posisi kecil, setengah dari ukuran standar,
-         - Digunakan hanya setelah ada konfirmasi trend baru.
+         - Add 0.5 berarti penambahan posisi sebesar 50% dari ukuran leg dalam struktur lock aktif (ActiveLockBaseQty), BUKAN angka absolut kecil,
+         - Definisi ini bersifat proporsional terhadap ukuran lock yang sedang aktif.
+         - Contoh:
+           jika struktur lock aktif saat ini adalah 1:1 dengan qty 1242 vs 1242,     
+           maka:
+           - 1.0 = 1242
+           - 0.5 = 621
+           - Add 0.5 hanya digunakan setelah ada konfirmasi trend baru.
       6. Struktur 2:1:
          - Misalnya: Long2 vs Short1 (Net LONG) atau Short2 vs Long1 (Net SHORT).
          - Hanya digunakan ketika:
@@ -1164,6 +1171,19 @@ async function monitorMarkets(force = false) {
       - chop / ambiguous market.
 
       ============================================================
+      SECTION 2AA – KONVENSI UKURAN “1.0” DAN “0.5” (WAJIB) 
+      ============================================================
+      - Dalam seluruh SOP ini, notasi ukuran “1.0” dan “0.5” bersifat RELATIF, bukan absolut.
+      - 1.0 = ukuran penuh leg dalam struktur lock aktif (ActiveLockBaseQty).
+      - 0.5 = 50% dari ActiveLockBaseQty.
+      - “0.5” TIDAK BOLEH diartikan sebagai 0.5 coin, 0.5 lot kecil, atau ukuran absolut tetap.
+      Contoh:
+      jika struktur lock aktif saat ini adalah 1242 vs 1242, 
+      maka:
+      - 1.0 = 1242
+      - 0.5 = 621
+
+      ============================================================
       SECTION 2B – STATUS TREND RESMI (WAJIB
       ============================================================
       Setiap pair WAJIB diklasifikasikan ke salah satu status berikut:
@@ -1193,7 +1213,7 @@ async function monitorMarkets(force = false) {
            • indikator institusional yang dimiliki sentinel memberikan konfirmasi kuat
          - Dalam kondisi ini, Sentinel boleh masuk ke logika REVERSAL DEFENSE:
            • gunakan profit leg hijau untuk REDUCE bertahap ke Lock 1:1,
-           • baru pertimbangkan pergeseran ke 2:1 arah baru dengan Reduce Leg SHORT atau LONG  dengan syarat green atau profit jika struktur mendukung.
+           • baru pertimbangkan pergeseran ke 2:1 arah baru dengan Add 0.5 (50% posisi ActiveLockBaseQty) bila kedua Leg merah atau Reduce 0.5 (50% posisi ActiveLockBaseQty) dengan syarat green atau profit di Leg yang di Reduce 0.5.
        4) CHOP
          - Jika arah tidak jelas, indikator sekunder saling bertentangan, follow-through lemah,
            atau pair hanya bergerak bolak-balik tanpa continuation yang sehat,
@@ -1275,6 +1295,10 @@ SECTION 2E – CHOP / DEAD MARKET FILTER
 
 Jika pair berada dalam kondisi CHOP berkepanjangan atau DEAD MARKET,
 maka pair masuk mode RECOVERY_SUSPENDED.
+ATURAN DEFINISI:
+- RECOVERY_SUSPENDED BUKAN ContextMode utama.
+- RECOVERY_SUSPENDED adalah ExecutionOverride / Operational Override yang memblok ekspansi recovery baru saat market dianggap tidak recoverable.
+- Saat RECOVERY_SUSPENDED aktif, AI tetap boleh membaca TrendStatus dan ContextMode, tetapi keputusan final wajib tunduk pada override ini
 
 Definisi DEAD MARKET / NON-RECOVERABLE CONTEXT:
 - RF 4H tidak memberi arah continuation recovery yang sehat,
@@ -1363,7 +1387,53 @@ Untuk setiap pair dengan posisi terbuka, AI WAJIB secara internal memahami minim
 
 AI tidak wajib menampilkan semua field di output akhir JSON,
 tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel tetap konsisten.
-   
+
+      ============================================================
+      SECTION 2I – RULE PRECEDENCE / HIRARKI KEPUTUSAN (WAJIB) 
+      ============================================================   
+      Untuk menghindari konflik antar-rule, seluruh modul Sentinel WAJIB memakai urutan prioritas berikut:
+      1.	GOLDEN RULE (PRIORITAS TERTINGGI)
+         •	No cut loss on red leg.
+         •	Reduce hanya pada leg hijau.
+         •	Unlock hanya jika hedge leg profit.
+         •	Jika ada rule lain yang bertentangan dengan Golden Rule, maka Golden Rule HARUS menang.
+      2. MR HARD GUARD
+         •	Jika MRProjected > 25%, maka ekspansi DILARANG.
+         •	Dalam kondisi ini, hanya boleh aksi defensif seperti HOLD, LOCK_NEUTRAL, TAKE_PROFIT defensif, atau REDUCE pada leg hijau bila valid.
+      3.	NO EXPANSION IF AMBIGUOUS
+         •	Jika trend utama, status trend, projected MR, hedge leg, atau struktur posisi tidak jelas, maka AI DILARANG melakukan ekspansi.
+         •	Default jatuh ke HOLD / WAIT & SEE / LOCK_NEUTRAL / TAKE_PROFIT defensif.
+      4.	RECOVERY_SUSPENDED / DEAD MARKET OVERRIDE
+         •	Jika pair masuk kondisi CHOP berat atau DEAD MARKET, maka RECOVERY_SUSPENDED bertindak sebagai execution override yang memblok ekspansi recovery baru.
+         •	Dalam kondisi ini, meskipun ada sinyal teknikal yang tampak menarik, AI tetap harus defensif.
+      5.	ENTRY-ANCHOR PROTECTIVE STOP (6.4C)
+         •	Rule 6.4C adalah proteksi defensif tambahan yang boleh aktif saat LOCK 1:1 WAIT & SEE dan satu leg sudah hijau >= 2%.
+         •	Rule ini tidak boleh diperlakukan sebagai ekspansi, sinyal entry baru, atau override terhadap Golden Rule.
+      6.	CONTEXT MODE + TREND STATUS
+         •	Setelah seluruh guard di atas lolos, baru AI boleh menilai pair berdasarkan:
+            o	TrendStatus
+            o	ContextMode
+         •	CONTINUATION_CONFIRMED dan CONTINUATION_RECOVERY tidak boleh mengalahkan MR guard, ambiguity guard, atau RECOVERY_SUSPENDED.
+         •	REVERSAL_DEFENSE tidak boleh mengalahkan Golden Rule.
+     7.	STRUCTURAL MANEUVER RULES
+         •	Rule 6.4A, 6.4B, 6.4C, dan 6.5 hanya boleh dijalankan jika tidak bertentangan dengan prioritas 1 sampai 6.
+         •	Secara khusus:
+           o	Rule 6.5 (revert ke 1:1 dari 2:1) TIDAK BOLEH dijalankan otomatis jika itu berarti menyentuh leg merah.
+           o	Jika leg dominan yang ingin direduce ternyata sedang merah, maka 6.5 harus ditunda dan default kembali ke WAIT & SEE / defensive handling.
+     8.	APPROVED SETTINGS
+        •	approvedSettings hanya boleh mengubah parameter numerik.
+        •	approvedSettings tidak boleh mengalahkan Golden Rule, MR guard, ambiguity guard, RECOVERY_SUSPENDED, atau Rule Precedence ini.
+     9.	FALLBACK DEFAULT
+        •	Jika masih ada konflik rule setelah seluruh evaluasi di atas, maka fallback default adalah:
+          o	HOLD
+          o	WAIT & SEE
+          o	atau LOCK_NEUTRAL bila valid
+        •	AI tidak boleh memaksakan aksi agresif saat precedence belum jelas.
+    ATURAN WAJIB:
+    •	Seluruh engine, policy layer, prompt AI, renderer, dan chat explanation WAJIB mengikuti Rule Precedence ini.
+    •	Jika ada konflik antara narasi AI vs Rule Precedence, maka Rule Precedence HARUS menang.
+    •	FinalAction harus selalu ditentukan berdasarkan precedence ini, bukan berdasarkan prompt AI mentah.
+
       ============================================================
       SECTION 3 – PARAMETER RISIKO GLOBAL
       ============================================================
@@ -1371,7 +1441,7 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
 
       - MRGlobal < 15%  → kondisi aman untuk:
           • entry baru,
-          • add kecil (0.5),
+          • add (0.5),
           • struktur 2:1 bila trend jelas.
       - MRGlobal 15–25% → zona waspada:
           • fokus pengurangan risiko, 
@@ -1431,9 +1501,9 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
       - Jika posisi utama (LONG atau SHORT) profit dan tidak menyentuh StopHedge:
         - Sentinel boleh mengusulkan pendekatan lanjutan:
           - Menambah posisi searah trend (2:1),
-          - Atau menambah hedge kecil (0.5) untuk stabilitas.
+          - Atau menambah add (0.5) untuk stabilitas.
 
-      - Namun, taki utama:
+      - Namun, kaki utama:
         - Setiap EXIT long/short dilakukan dengan prinsip:
           • Profit sisi trend ≥ kerugian sisi lawan + biaya trading.
         - Tujuan:
@@ -1482,10 +1552,10 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
       6.1 KONDISI MASUK MODE LOCK
       - Lock 1:1 terjadi jika:
         - Posisi utama + hedge seimbang (LongQty ≈ ShortQty).
-      - Begitu lock terjadi:
-        - JANGAN langsung unlock,
-        - JANGAN langsung add besar,
-        - Fokus: observasi & konfirmasi.
+        - Begitu lock terjadi:
+          • JANGAN langsung unlock,
+          • JANGAN langsung add besar,
+          • Fokus: observasi & konfirmasi.
 
       6.2 TUGAS SENTINEL DALAM MODE LOCK
       - Bacalah:
@@ -1506,9 +1576,9 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
       - Jangan reduce dulu.
       - Tunggu konfirmasi trend baru:
         - Jika konfirmasi trend DOWN:
-             → ADD_SHORT kecil (0.5) bertahap pada pullback ke Supply/resistance sampai struktur menjadi maksimal 2:1 (Short 2, Long 1).
+             → ADD_SHORT (0.5) bertahap pada pullback ke Supply/resistance sampai struktur menjadi maksimal 2:1 (Short 2, Long 1).
         - Jika konfirmasi trend UP:
-             → ADD_LONG kecil (0.5) bertahap pada pullback ke Demand/support sampai struktur menjadi maksimal 2:1 (Long 2, Short 1).
+             → ADD_LONG (0.5) bertahap pada pullback ke Demand/support sampai struktur menjadi maksimal 2:1 (Long 2, Short 1).
 
       - ADD 0.5 hanya boleh jika:
         - MRProjected setelah ADD tetap < 25%,
@@ -1526,13 +1596,13 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
 
         6.4A CONTINUATION CASE
          Jika leg yang sedang profit masih SEARAH dengan trend baru yang terkonfirmasi:
-         - Boleh ADD 0.5 kecil pada pullback sehat searah trend.
+         - Boleh ADD 0.5 pada pullback sehat searah trend.
          - Tujuan: membangun struktur 2:1 sesuai arah trend dominan.
          - Jika trend baru DOWN dan SHORT profit sementara LONG rugi:
-           → boleh ADD_SHORT kecil sampai struktur menjadi LONG 1 / SHORT 2,
+           → boleh ADD_SHORT 0.5 sampai struktur menjadi LONG 1 / SHORT 2,
              lalu targetkan BEP dan EXIT penuh.
          - Jika trend baru UP dan LONG profit sementara SHORT rugi:
-           → boleh ADD_LONG kecil sampai struktur menjadi LONG 2 / SHORT 1,
+           → boleh ADD_LONG 0.5 sampai struktur menjadi LONG 2 / SHORT 1,
              lalu targetkan BEP dan EXIT penuh.
          - ADD 0.5 hanya boleh jika:
            • trend benar-benar terkonfirmasi,
@@ -1542,27 +1612,68 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
 
         6.4B REVERSAL DEFENSE CASE
          Jika leg yang sedang profit mulai TERANCAM karena reversal kuat berlawanan arah:
-         - Gunakan profit dari leg hijau untuk REDUCE bertahap leg yang dominan,
+         - Gunakan profit dari leg hijau untuk REDUCE bertahap leg yang profit,
            dengan tujuan kembali ke LOCK 1:1 terlebih dahulu.
          - Jika SHORT profit dan LONG rugi, lalu reversal kuat ke arah UP terkonfirmasi:
            → REDUCE_SHORT bertahap ke Lock 1:1.
-           → Jika reversal makin kuat dan struktur mendukung, posisi dapat bergeser ke LONG 2 / SHORT 1.
+           → Jika reversal makin kuat dan struktur mendukung, REDUCE_SHORT 0.5 kembali hingga posisi dapat bergeser ke LONG 2 / SHORT 1.
          - Jika LONG profit dan SHORT rugi, lalu reversal kuat ke arah DOWN terkonfirmasi:
            → REDUCE_LONG bertahap ke Lock 1:1.
-           → Jika reversal makin kuat dan struktur mendukung, posisi dapat bergeser ke LONG 1 / SHORT 2.
+           → Jika reversal makin kuat dan struktur mendukung,REDUCE_LONG 0.5 sehingga posisi dapat bergeser ke LONG 1 / SHORT 2.
          - REVERSAL DEFENSE tidak boleh langsung membalik struktur tanpa konfirmasi kuat.
-         - Jika reversal belum terkonfirmasi kuat, masuk mode WAIT & SEE dan tahan ekspansi baru.
+         - Jika reversal belum terkonfirmasi kuat, masuk mode WAIT & SEE LOCK 1:1 dan tahan ekspansi baru.
 
         Catatan:
         - 6.4A digunakan untuk continuation recovery.
         - 6.4B digunakan untuk reversal defense.
         - Jika situasi belum jelas termasuk continuation atau reversal, default masuk WAIT & SEE.
 
+       6.4C ENTRY-ANCHOR PROTECTIVE STOP (KHUSUS REVERSAL DEFENSE SAAT LOCK 1:1 WAIT & SEE)
+        •	Filosofi: ini BUKAN ekspansi baru, BUKAN cut loss pada leg merah, dan BUKAN override SOP. Ini adalah proteksi defensif pada leg yang sedang HIJAU untuk menghadapi spike atau reversal mendadak.
+        •	HANYA berlaku jika SEMUA syarat berikut terpenuhi:
+          o	Structure = LOCK 1:1
+          o	ContextMode = LOCK_WAIT_SEE atau REVERSAL_DEFENSE
+          o	Satu leg MERAH dan leg lawan HIJAU
+          o	Profit leg hijau sudah >= 2% (default; boleh dibuat parameter pair-specific)
+          o	Belum ada continuation yang valid untuk ADD baru
+        •	Aksi defensif yang diizinkan:
+          o	Letakkan PROTECTIVE STOP pada LEG HIJAU tepat di harga ENTRY leg hijau tersebut
+          o	Boleh diberi buffer kecil untuk fee / tick / spread agar tidak mudah tersentuh noise
+        •	Aturan ukuran proteksi:
+          o	Jika struktur awal = LOCK 1:1, maka ukuran protective stop maksimum = 50% dari ukuran leg dalam struktur lock aktif (0.5 × ActiveLockBaseQty), BUKAN angka absolut kecil.
+          o	Contoh:
+            jika struktur lock aktif = 1242 vs 1242,    
+            maka:
+            - 1.0 = 1242
+            - 0.5 = 621
+        •	Tujuan:
+          o	mencegah leg hijau yang tadinya sudah memberi bantalan profit berubah menjadi merah akibat spike mendadak
+          o	memberi kesempatan leg merah untuk menjadi kaki yang bekerja jika reversal atau spike benar-benar berlanjut
+        •	Aturan mutlak:
+          o	STOP ini HANYA untuk leg HIJAU
+          o	DILARANG meletakkan stop protektif pada leg MERAH
+          o	DILARANG memakai rule ini sebagai alasan untuk ADD, ROLE, atau ekspansi agresif
+        •	Jika protective stop tersentuh:
+          o	tutup atau reduce leg hijau sesuai ukuran proteksi yang ditetapkan
+          o	leg merah tetap dipertahankan
+          o	jika struktur saat itu tidak lagi seimbang, maka prioritas pertama adalah normalkan kembali ke 1:1
+          o	state WAJIB direklasifikasi ulang oleh AI/policy layer berdasarkan struktur terbaru
+          o	setelah trigger, default posture = WAIT & SEE sampai context baru jelas
+        •	False retracement rule:
+          o	Jika protective stop tersentuh tetapi market kemudian terbukti hanya mengalami false retracement,
+            maka posisi BOLEH dikembalikan lagi ke struktur LOCK 1:1
+
+
       6.5 MANUVER REVERT KE LOCK NEUTRAL 1:1 (DARI 2:1)
       Jika struktur saat ini tidak seimbang (misal Long 2, Short 1) dan trend berbalik arah sebelum mencapai target BEP:
-      - AKSI: REVERT KE 1:1 dengan cara MENUTUP POSISI EKSTRA (REDUCE leg yang dominan), BUKAN menambah posisi baru.
-      - Tutup posisi ekstra tersebut TEPAT DI ATAS PROFIT (sedikit profit) untuk menutupi biaya trading dan memotong risiko floating lebih cepat.
+      - AKSI: REVERT KE 1:1 dengan cara MENUTUP POSISI EKSTRA (REDUCE leg yang profit atau green), BUKAN menambah posisi baru.
+      - Tutup posisi ekstra tersebut TEPAT DI ATAS entry Leg yang PROFIT (sedikit profit) untuk menutupi biaya trading dan memotong risiko floating lebih cepat.
       - Sisa posisi akan kembali menjadi LOCK NEUTRAL 1:1.
+      •	Tujuan revert ke 1:1:
+        o	menghindari floating loss berlebihan pada salah satu leg,
+        o	menormalkan exposure,
+        o	membekukan risiko kembali,
+        o	memberi ruang observasi ulang terhadap trend yang benar.
       - Setelah itu:
         - sisa posisi kembali menjadi LOCK NEUTRAL 1:1,
         - masuk mode WAIT & SEE,
@@ -3645,7 +3756,7 @@ async function startServer() {
     console.log("[EXEC INPUT BEFORE NORMALIZE]", { symbol: rawSymbol, action: rawAction, percentage: rawPercentage, targetPrice, stopHedgePrice, rawQty });
     
     const normAction = normalizeActionInput(rawAction);
-    const action = normAction.action;
+    let action = normAction.action;
     const symbol = normalizeSymbolInput(rawSymbol || normAction.extractedSymbol);
     let percentage = rawPercentage || normAction.extractedPercentage || 100;
     let absoluteQty = rawQty || normAction.extractedQty;
@@ -3782,6 +3893,43 @@ async function startServer() {
 
       const longQty = longRow ? Math.abs(Number(longRow.positionAmt || 0)) : 0;
       const shortQty = shortRow ? Math.abs(Number(shortRow.positionAmt || 0)) : 0;
+
+      // --- POLICY LAYER INTEGRATION ---
+      const accountRisk = await fetchAccountRisk();
+      const marketDataMap = await fetchMarketDataWithIndicators([symbol]);
+      const symbolData = marketDataMap[symbol] || {};
+      
+      const contextData: PolicyContextData = {
+          symbol,
+          action,
+          accountMrDecimal: (accountRisk.marginRatio || 0) / 100,
+          mrProjected: null, // Will be calculated if needed
+          trendStatus: symbolData.trend_4h || 'NEUTRAL',
+          contextMode: 'LIVE',
+          longPos: longRow,
+          shortPos: shortRow,
+          netDirection: (longQty > shortQty) ? 'LONG' : (shortQty > longQty ? 'SHORT' : 'NEUTRAL'),
+          netBEP: null, // Can be calculated from rows
+          atr4h: symbolData.atr_4h || null,
+          volatilityRegime: symbolData.volatility_regime || 'NORMAL'
+      };
+
+      const finalAction = PolicyMapper.mapAction(action, contextData);
+      
+      if (finalAction.blocked_by) {
+          const violationMsg = `⚠️ <b>SOP VIOLATION</b> [${finalAction.blocked_by}]\n\n` +
+                             `AI Action: ${action}\n` +
+                             `Final Action: ${finalAction.action}\n` +
+                             `Reason: ${finalAction.reason}\n\n` +
+                             `Symbol: ${symbol}`;
+          
+          if (finalAction.action === 'HOLD') {
+              return violationMsg;
+          }
+          // If it's not HOLD but modified, we continue with the new action
+          console.log(`[POLICY] Action modified from ${action} to ${finalAction.action} due to ${finalAction.blocked_by}`);
+          action = finalAction.action; // Update action for subsequent logic
+      }
 
       let side: "buy" | "sell" | undefined;
       let targetLeg: "LONG" | "SHORT" | undefined;

@@ -14,7 +14,7 @@ export class SopPolicy {
 
     // 1. Ambiguous / Invalid Action
     if (!['LONG', 'SHORT', 'ADD_LONG', 'ADD_SHORT', 'REDUCE_LONG', 'REDUCE_SHORT', 'LOCK_LONG', 'LOCK_SHORT', 'UNLOCK_LONG', 'UNLOCK_SHORT', 'HOLD', 'TP', 'SL'].includes(action)) {
-      return { action: 'HOLD', original_action, blocked_by: 'SOP_AMBIGUOUS', reason: 'Action is ambiguous or not recognized.' };
+      return { action: 'HOLD', original_action, blocked_by: 'RISK_DENIED', reason: 'Action is ambiguous or not recognized.' };
     }
 
     // 2. No Cut Loss (SL is denied)
