@@ -96,9 +96,37 @@ let lastDbSyncTime = 0;
 
 import { onSnapshot } from 'firebase/firestore';
 
+async function loadPaperTradingData() {
+  if (!db) return;
+  try {
+    const walletSnap = await getDoc(doc(db, 'paper_wallet', 'main'));
+    if (walletSnap.exists()) {
+      cachedPaperWallet = walletSnap.data();
+    } else {
+      cachedPaperWallet = { balance: 10000, equity: 10000, freeMargin: 10000, marginRatio: 0, updatedAt: new Date().toISOString() };
+    }
+
+    const posSnap = await getDocs(collection(db, 'paper_positions'));
+    cachedPaperPositions = posSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    const historyQuery = query(collection(db, 'paper_history'), orderBy('closedAt', 'desc'), limit(200));
+    const histSnap = await getDocs(historyQuery);
+    cachedPaperHistory = histSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    console.log("[PAPER] Loaded initial paper trading data from Firestore.");
+  } catch (error: any) {
+    console.error("[PAPER] Failed to load initial paper trading data from Firestore. Using empty/default cache.", error.message);
+    if (!cachedPaperWallet.balance) {
+      cachedPaperWallet = { balance: 10000, equity: 10000, freeMargin: 10000, marginRatio: 0, updatedAt: new Date().toISOString() };
+    }
+  }
+}
+
 function setupRealtimeListeners() {
   if (!db || isRealtimeListenersSetup) return;
-  
+  isRealtimeListenersSetup = true;
+
+  loadPaperTradingData();
+
   try {
     onSnapshot(collection(db, 'approved_settings'), (snap) => {
       cachedApprovedSettings = snap.docs.map(doc => doc.data());
@@ -106,26 +134,8 @@ function setupRealtimeListeners() {
       console.error("Error in approved_settings snapshot:", error);
     });
 
-    onSnapshot(collection(db, 'paper_positions'), (snap) => {
-      cachedPaperPositions = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    }, (error) => {
-      console.error("Error in paper_positions snapshot:", error);
-    });
-
-    onSnapshot(doc(db, 'paper_wallet', 'main'), (snap) => {
-      if (snap.exists()) {
-        cachedPaperWallet = snap.data();
-      }
-    }, (error) => {
-      console.error("Error in paper_wallet snapshot:", error);
-    });
-
-    const historyQuery = query(collection(db, 'paper_history'), orderBy('closedAt', 'desc'), limit(200));
-    onSnapshot(historyQuery, (snap) => {
-      cachedPaperHistory = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    }, (error) => {
-      console.error("Error in paper_history snapshot:", error);
-    });
+    // Removed paper_positions, paper_wallet, paper_history onSnapshots for In-Memory First architecture.
+    // They are loaded once in loadPaperTradingData().
 
     const journalQuery = query(collection(db, 'trading_journal'), orderBy('timestamp', 'desc'), limit(100));
     onSnapshot(journalQuery, (snap) => {
@@ -2402,6 +2412,17 @@ Contoh:
 // =========================================================
 // Extracted to src/renderers/TelegramRenderer.ts
 
+// Helper for background sync
+function backgroundSyncFirestore(promise: Promise<any>) {
+  promise.catch(error => {
+    if (error.message && error.message.includes('Quota limit exceeded')) {
+      // Ignore quota errors for paper trading background sync
+    } else {
+      console.error("[PAPER] Background sync error:", error.message);
+    }
+  });
+}
+
 // Paper Trading Engine Logic
 async function runPaperTradingEngine() {
   await ensureAuth();
@@ -2412,10 +2433,10 @@ async function runPaperTradingEngine() {
   try {
     // 1. Ensure Paper Wallet exists
     const walletRef = doc(db, 'paper_wallet', 'main');
-    let wallet = { ...cachedPaperWallet };
+    let wallet = cachedPaperWallet;
 
     // 2. Fetch Open Positions
-    const openPositions = [...cachedPaperPositions];
+    const openPositions = cachedPaperPositions;
 
     // 3. Determine symbols to process
     const freshSignals = signals.filter(s => 
@@ -2447,29 +2468,40 @@ async function runPaperTradingEngine() {
     wallet.equity = wallet.balance + totalUnrealized;
     wallet.freeMargin = wallet.equity - totalMarginUsed;
     wallet.marginRatio = wallet.equity > 0 ? (totalMarginUsed / wallet.equity) * 100 : 0;
-    await setDoc(walletRef, wallet);
+    
+    backgroundSyncFirestore(setDoc(walletRef, wallet));
 
     // Liquidation Check
     if (wallet.equity <= 0 && openPositions.length > 0) {
       console.log(`[PAPER] 🚨 LIQUIDATION TRIGGERED! Equity is ${wallet.equity}`);
       for (const pos of openPositions) {
         if (pos.status === 'OPEN') {
-          await setDoc(doc(db, 'paper_history', pos.id), {
+          const historyEntry = {
             ...pos, exitPrice: pos.currentPrice || pos.entryPrice, pnl: pos.unrealizedPnl, reason: 'LIQUIDATION', closedAt: new Date().toISOString(), status: 'CLOSED'
-          });
+          };
+          
+          cachedPaperHistory.unshift(historyEntry);
+          if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
+          
+          backgroundSyncFirestore(setDoc(doc(db, 'paper_history', pos.id), historyEntry));
+          
           if (pos.journalId) {
-            await setDoc(doc(db, 'trading_journal', pos.journalId), {
+            backgroundSyncFirestore(setDoc(doc(db, 'trading_journal', pos.journalId), {
               exitPrice: pos.currentPrice || pos.entryPrice, pnl: pos.unrealizedPnl, status: 'CLOSED', closedAt: new Date().toISOString(), closeReason: 'LIQUIDATION'
-            }, { merge: true });
+            }, { merge: true }));
           }
-          await deleteDoc(doc(db, 'paper_positions', pos.id));
+          backgroundSyncFirestore(deleteDoc(doc(db, 'paper_positions', pos.id)));
         }
       }
+      
+      // Clear local positions
+      cachedPaperPositions.length = 0;
+      
       wallet.balance = 0;
       wallet.equity = 0;
       wallet.freeMargin = 0;
       wallet.updatedAt = new Date().toISOString();
-      await setDoc(walletRef, wallet);
+      backgroundSyncFirestore(setDoc(walletRef, wallet));
       await sendTelegramMessage(`[PAPER] 🚨 <b>LIQUIDATION ALERT</b>\nYour paper trading account has been liquidated due to negative equity.`);
       return; // Stop processing this cycle
     }
@@ -2525,7 +2557,7 @@ async function runPaperTradingEngine() {
         }
 
         // Helper to update wallet state accurately
-        const updateWalletState = async () => {
+        const updateWalletState = () => {
           let totalUnrealized = 0;
           let totalMarginUsed = 0;
           for (const p of openPositions) {
@@ -2538,42 +2570,55 @@ async function runPaperTradingEngine() {
           wallet.freeMargin = wallet.equity - totalMarginUsed;
           wallet.marginRatio = wallet.equity > 0 ? (totalMarginUsed / wallet.equity) * 100 : 0;
           wallet.updatedAt = new Date().toISOString();
-          await setDoc(walletRef, wallet);
+          backgroundSyncFirestore(setDoc(walletRef, wallet));
         };
 
         // Helper to close position
         const closePos = async (pos: any, reason: string) => {
-          await setDoc(doc(db, 'paper_history', pos.id), {
+          const historyEntry = {
             ...pos, exitPrice: currentPrice, pnl: pos.currentPnl, reason, closedAt: new Date().toISOString(), status: 'CLOSED'
-          });
+          };
+          
+          cachedPaperHistory.unshift(historyEntry);
+          if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
+          
+          backgroundSyncFirestore(setDoc(doc(db, 'paper_history', pos.id), historyEntry));
+          
           if (pos.journalId) {
-            await setDoc(doc(db, 'trading_journal', pos.journalId), {
+            backgroundSyncFirestore(setDoc(doc(db, 'trading_journal', pos.journalId), {
               exitPrice: currentPrice, pnl: pos.currentPnl, status: 'CLOSED', closedAt: new Date().toISOString(), closeReason: reason
-            }, { merge: true });
+            }, { merge: true }));
           }
-          await deleteDoc(doc(db, 'paper_positions', pos.id));
+          backgroundSyncFirestore(deleteDoc(doc(db, 'paper_positions', pos.id)));
           
           const index = openPositions.findIndex(p => p.id === pos.id);
-          if (index > -1) openPositions[index].status = 'CLOSED';
+          if (index > -1) {
+            openPositions.splice(index, 1);
+          }
           
           wallet.balance += pos.currentPnl;
-          await updateWalletState();
+          updateWalletState();
           await sendTelegramMessage(`[PAPER] 💰 <b>Closed ${pos.side} ${symbol}</b>\nReason: ${reason}\nPnL: $${pos.currentPnl.toFixed(2)}`);
         };
 
-        // Helper to partially close position
+        // Helper to partial close position
         const partialClosePos = async (pos: any, sizeToClose: number, reason: string) => {
           const proportion = sizeToClose / pos.size;
           const realizedPnl = pos.currentPnl * proportion;
           
           const historyId = `${pos.id}_partial_${Date.now()}`;
-          await setDoc(doc(db, 'paper_history', historyId), {
+          const historyEntry = {
             ...pos, size: sizeToClose, exitPrice: currentPrice, pnl: realizedPnl, reason, closedAt: new Date().toISOString(), status: 'CLOSED'
-          });
+          };
+          
+          cachedPaperHistory.unshift(historyEntry);
+          if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
+          
+          backgroundSyncFirestore(setDoc(doc(db, 'paper_history', historyId), historyEntry));
           
           pos.size -= sizeToClose;
           pos.currentPnl -= realizedPnl;
-          await setDoc(doc(db, 'paper_positions', pos.id), { size: pos.size, unrealizedPnl: pos.currentPnl }, { merge: true });
+          backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', pos.id), { size: pos.size, unrealizedPnl: pos.currentPnl }, { merge: true }));
           
           const index = openPositions.findIndex(p => p.id === pos.id);
           if (index > -1) {
@@ -2582,7 +2627,7 @@ async function runPaperTradingEngine() {
           }
           
           wallet.balance += realizedPnl;
-          await updateWalletState();
+          updateWalletState();
           await sendTelegramMessage(`[PAPER] 💰 <b>Partial Close ${pos.side} ${symbol}</b>\nReason: ${reason}\nPnL: $${realizedPnl.toFixed(2)}`);
         };
 
@@ -2609,7 +2654,7 @@ async function runPaperTradingEngine() {
             id: journalId, timestamp: new Date().toISOString(), symbol, side, entryPrice: currentPrice,
             stopLoss: slPrice, target1: signalData?.targets?.t1 ? (parseFloat(String(signalData.targets.t1)) || 0) : 0, target2: tpPrice, reason, sentiment: signalData?.sentiment || 'NEUTRAL', status: 'OPEN', source: 'PAPER_BOT', pnl: 0
           };
-          await setDoc(doc(db, 'trading_journal', journalId), journalEntry);
+          backgroundSyncFirestore(setDoc(doc(db, 'trading_journal', journalId), journalEntry));
 
           const newPos = {
             id: newPosRef.id, symbol, side, entryPrice: currentPrice, size, unrealizedPnl: 0,
@@ -2620,11 +2665,11 @@ async function runPaperTradingEngine() {
             isHedge: reason.includes('Lock') || reason.includes('Hedge'),
             realizedHedgeProfit: 0
           };
-          await setDoc(newPosRef, newPos);
+          backgroundSyncFirestore(setDoc(newPosRef, newPos));
           
           const posWithPnl = { ...newPos, currentPnl: 0, pnlPct: 0 };
           openPositions.push(posWithPnl);
-          await updateWalletState();
+          updateWalletState();
           
           await sendTelegramMessage(`[PAPER] 🟢 <b>Opened ${side} ${symbol}</b>\nReason: ${reason}\nEntry: $${currentPrice.toFixed(4)}\nTP: $${tpPrice.toFixed(4)}\nSL: $${slPrice.toFixed(4)}`);
           return posWithPnl;
@@ -2635,9 +2680,9 @@ async function runPaperTradingEngine() {
           const newTotalSize = pos.size + additionalSize;
           const newAvgEntry = ((pos.size * pos.entryPrice) + (additionalSize * currentPrice)) / newTotalSize;
           
-          await setDoc(doc(db, 'paper_positions', pos.id), {
+          backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', pos.id), {
             size: newTotalSize, entryPrice: newAvgEntry, lastSignalId: signalId
-          }, { merge: true });
+          }, { merge: true }));
 
           pos.size = newTotalSize;
           pos.entryPrice = newAvgEntry;
@@ -2649,7 +2694,7 @@ async function runPaperTradingEngine() {
             openPositions[index].entryPrice = newAvgEntry;
           }
           
-          await updateWalletState();
+          updateWalletState();
           await sendTelegramMessage(`[PAPER] ➕ <b>Added to ${pos.side} ${symbol}</b>\nReason: ${reason}\nNew Avg Entry: $${newAvgEntry.toFixed(4)}\nNew Size: ${newTotalSize.toFixed(4)}`);
         };
 
@@ -2750,10 +2795,10 @@ async function runPaperTradingEngine() {
                   if (longPos) {
                     longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + realized;
                     longPos.lastSignalId = freshSignal.id;
-                    await setDoc(doc(db, 'paper_positions', longPos.id), { 
+                    backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { 
                       realizedHedgeProfit: longPos.realizedHedgeProfit,
                       lastSignalId: freshSignal.id
-                    }, { merge: true });
+                    }, { merge: true }));
                   }
                 } else if (signalSide === 'SHORT' && longPos.currentPnl > 0) {
                   const realized = longPos.currentPnl;
@@ -2762,10 +2807,10 @@ async function runPaperTradingEngine() {
                   if (shortPos) {
                     shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + realized;
                     shortPos.lastSignalId = freshSignal.id;
-                    await setDoc(doc(db, 'paper_positions', shortPos.id), { 
+                    backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { 
                       realizedHedgeProfit: shortPos.realizedHedgeProfit,
                       lastSignalId: freshSignal.id
-                    }, { merge: true });
+                    }, { merge: true }));
                   }
                 }
                 
@@ -2789,10 +2834,10 @@ async function runPaperTradingEngine() {
                         await partialClosePos(longPos, excessSize, 'Reduce Long (Trend Reversed DOWN)');
                         longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + excessPnl;
                         longPos.lastSignalId = freshSignal.id;
-                        await setDoc(doc(db, 'paper_positions', longPos.id), { 
+                        backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { 
                           realizedHedgeProfit: longPos.realizedHedgeProfit,
                           lastSignalId: freshSignal.id
-                        }, { merge: true });
+                        }, { merge: true }));
                       }
                     } else if (isShortProfit && isLongLoss && setting.structure21Mode) {
                       // Trend DOWN, SHORT profit. ADD_SHORT untuk struktur 2:1 (LONG 1, SHORT 2).
@@ -2809,10 +2854,10 @@ async function runPaperTradingEngine() {
                         await partialClosePos(shortPos, excessSize, 'Reduce Short (Trend Reversed UP)');
                         shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + excessPnl;
                         shortPos.lastSignalId = freshSignal.id;
-                        await setDoc(doc(db, 'paper_positions', shortPos.id), { 
+                        backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { 
                           realizedHedgeProfit: shortPos.realizedHedgeProfit,
                           lastSignalId: freshSignal.id
-                        }, { merge: true });
+                        }, { merge: true }));
                       }
                     } else if (isLongProfit && isShortLoss && setting.structure21Mode) {
                       // Trend UP, LONG profit. ADD_LONG untuk struktur 2:1 (LONG 2, SHORT 1).
