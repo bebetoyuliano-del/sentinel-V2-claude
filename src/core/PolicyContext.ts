@@ -11,6 +11,7 @@ export interface PolicyContextData {
   netBEP: number | null;
   atr4h: number | null;
   volatilityRegime: string;
+  currentPrice?: number;
 }
 
 export class PolicyContext {
@@ -32,32 +33,47 @@ export class PolicyContext {
   get netBEP() { return this.data.netBEP; }
   get atr4h() { return this.data.atr4h; }
   get volatilityRegime() { return this.data.volatilityRegime; }
+  get currentPrice() { return this.data.currentPrice; }
 
   isLocked11(): boolean {
-    return this.data.longPos?.qty > 0 && this.data.longPos?.qty === this.data.shortPos?.qty;
+    const longQty = parseFloat(this.data.longPos?.positionAmt || '0');
+    const shortQty = Math.abs(parseFloat(this.data.shortPos?.positionAmt || '0'));
+    return longQty > 0 && longQty === shortQty;
   }
 
   isNetLong(): boolean {
-    return (this.data.longPos?.qty || 0) > (this.data.shortPos?.qty || 0);
+    const longQty = parseFloat(this.data.longPos?.positionAmt || '0');
+    const shortQty = Math.abs(parseFloat(this.data.shortPos?.positionAmt || '0'));
+    return longQty > shortQty;
   }
 
   isNetShort(): boolean {
-    return (this.data.shortPos?.qty || 0) > (this.data.longPos?.qty || 0);
+    const longQty = parseFloat(this.data.longPos?.positionAmt || '0');
+    const shortQty = Math.abs(parseFloat(this.data.shortPos?.positionAmt || '0'));
+    return shortQty > longQty;
   }
 
   hasLong(): boolean {
-    return (this.data.longPos?.qty || 0) > 0;
+    return parseFloat(this.data.longPos?.positionAmt || '0') > 0;
   }
 
   hasShort(): boolean {
-    return (this.data.shortPos?.qty || 0) > 0;
+    return Math.abs(parseFloat(this.data.shortPos?.positionAmt || '0')) > 0;
   }
 
   isLongGreen(): boolean {
-    return this.hasLong() && (this.data.longPos?.pnl || 0) > 0;
+    if (!this.hasLong()) return false;
+    const entryPrice = parseFloat(this.data.longPos?.entryPrice || '0');
+    const markPrice = this.data.currentPrice || parseFloat(this.data.longPos?.markPrice || '0');
+    if (entryPrice === 0 || markPrice === 0) return false;
+    return markPrice > entryPrice;
   }
 
   isShortGreen(): boolean {
-    return this.hasShort() && (this.data.shortPos?.pnl || 0) > 0;
+    if (!this.hasShort()) return false;
+    const entryPrice = parseFloat(this.data.shortPos?.entryPrice || '0');
+    const markPrice = this.data.currentPrice || parseFloat(this.data.shortPos?.markPrice || '0');
+    if (entryPrice === 0 || markPrice === 0) return false;
+    return markPrice < entryPrice;
   }
 }

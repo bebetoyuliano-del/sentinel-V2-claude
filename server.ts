@@ -3946,9 +3946,12 @@ async function generateAiReply(userMessage: string, chatId: string = 'default', 
 
     2. HANYA JIKA pengguna secara eksplisit meminta analisa koin, saran recovery, atau bertanya "bagaimana portofolio saya?":
        -> Barulah Anda boleh menggunakan data di bawah ini dan membalas dengan format "ANALISA KOIN BARU" atau "RECOVERY POSISI".
+       -> PENTING: Anda memiliki DUA jenis data akun: "LIVE BINANCE" dan "PAPER TRADING (SIMULASI)".
+       -> Jika pengguna menyebut "paper", "simulasi", "bot", atau merujuk pada paper trading, gunakan DATA PAPER TRADING.
+       -> Jika pengguna menyebut "live", "binance", "asli", atau tidak menyebutkan secara spesifik, asumsikan mereka bertanya tentang DATA LIVE BINANCE (kecuali konteks sebelumnya membahas paper trading).
 
     ========================================================
-    DATA AKUN & PASAR (HANYA GUNAKAN JIKA DIMINTA ANALISA)
+    DATA AKUN & PASAR - LIVE BINANCE (HANYA GUNAKAN JIKA DIMINTA ANALISA)
     ========================================================
     Fokus Utama: HEDGING RECOVERY BY ZONE.
     Gaya Trading Pengguna: HEDGING RECOVERY MODE. Pengguna MEMINIMALKAN CUT LOSS dan lebih memilih melakukan Hedging (membuka posisi Long dan Short bersamaan) untuk melakukan recovery pada posisi yang sedang floating loss.
@@ -3976,6 +3979,20 @@ async function generateAiReply(userMessage: string, chatId: string = 'default', 
     Order Terbuka:
     ${JSON.stringify(openOrders.map((o: any) => ({symbol: o.symbol, side: o.side, type: o.type, price: o.price})), null, 2)}
     
+    ========================================================
+    DATA PAPER TRADING / SIMULASI (HANYA GUNAKAN JIKA DIMINTA)
+    ========================================================
+    Status Bot Paper Trading: ${isPaperTradingRunning ? 'AKTIF' : 'NON-AKTIF'}
+    Saldo Wallet Paper: $${cachedPaperWallet?.balance?.toFixed(2) || 0}
+    Equity Paper: $${cachedPaperWallet?.equity?.toFixed(2) || 0}
+    Margin Tersedia Paper: $${cachedPaperWallet?.freeMargin?.toFixed(2) || 0}
+    
+    Posisi Terbuka Paper Trading:
+    ${JSON.stringify(cachedPaperPositions.map((p: any) => ({symbol: p.symbol, side: p.side, size: p.size, entryPrice: p.entryPrice, pnl: p.unrealizedPnl})), null, 2)}
+    
+    Riwayat Paper Trading Terakhir (5 Trade):
+    ${JSON.stringify(cachedPaperHistory.slice(0, 5).map((h: any) => ({symbol: h.symbol, side: h.side, pnl: h.pnl, reason: h.reason})), null, 2)}
+
     Analisis Terakhir Anda: ${latestSignal}
 
     ${historyText}
@@ -4288,9 +4305,9 @@ async function startServer() {
     }
   }
 
-  async function executeTrade(rawSymbol: string, rawAction: string, rawPercentage: number, targetPrice?: number, stopHedgePrice?: number, rawQty?: number) {
+  async function executeTrade(rawSymbol: string, rawAction: string, rawPercentage: number, targetPrice?: number, stopHedgePrice?: number, rawQty?: number, isPaperTradingContext: boolean = false) {
     const modeLabel = getValidationModeLabel();
-    console.log(`[EXECUTE_TRADE] Mode: ${VALIDATION_MODE} (${modeLabel})`);
+    console.log(`[EXECUTE_TRADE] Mode: ${VALIDATION_MODE} (${modeLabel}), PaperContext: ${isPaperTradingContext}`);
     
     console.log("[EXEC INPUT BEFORE NORMALIZE]", { symbol: rawSymbol, action: rawAction, percentage: rawPercentage, targetPrice, stopHedgePrice, rawQty });
     
@@ -4316,6 +4333,240 @@ async function startServer() {
     if (action !== 'HOLD' && !targetPrice && !stopHedgePrice) {
         return `❌ Aksi ${action} ditolak: Eksekusi instan (MARKET) dinonaktifkan. Harap sertakan harga target (targetPrice) atau harga stop (stopHedgePrice) untuk mengeksekusi sebagai STOP-LIMIT atau STOP_MARKET.`;
     }
+
+    // --- PAPER TRADING EXECUTION PATH ---
+    if (isPaperTradingContext) {
+      console.log(`[EXECUTE_TRADE] Routing to Paper Trading Engine for ${symbol} ${action}`);
+      try {
+        // Fetch current price
+        const ticker = await binance.fetchTicker(symbol);
+        const currentPrice = ticker.last;
+        if (!currentPrice || currentPrice <= 0) throw new Error("Could not fetch valid market price for paper trading");
+
+        // Find existing positions in paper trading
+        const symbolPositions = cachedPaperPositions.filter((p: any) => p.symbol === symbol && p.status === 'OPEN');
+        let longPos = symbolPositions.find((p: any) => p.side === 'LONG');
+        let shortPos = symbolPositions.find((p: any) => p.side === 'SHORT');
+
+        const longQty = longPos ? longPos.size : 0;
+        const shortQty = shortPos ? shortPos.size : 0;
+        
+        // --- POLICY LAYER INTEGRATION FOR PAPER TRADING ---
+        const marketDataMap = await fetchMarketDataWithIndicators([symbol]);
+        const symbolData = marketDataMap[symbol] || {};
+        
+        const contextData: PolicyContextData = {
+            symbol,
+            action,
+            accountMrDecimal: (cachedPaperWallet?.marginRatio || 0) / 100,
+            mrProjected: null,
+            trendStatus: symbolData.trend_4h || 'NEUTRAL',
+            contextMode: 'PAPER',
+            longPos: longPos ? { positionAmt: String(longQty), entryPrice: String(longPos.entryPrice) } : undefined,
+            shortPos: shortPos ? { positionAmt: String(shortQty), entryPrice: String(shortPos.entryPrice) } : undefined,
+            netDirection: (longQty > shortQty) ? 'LONG' : (shortQty > longQty ? 'SHORT' : 'NEUTRAL'),
+            netBEP: null,
+            atr4h: symbolData.atr_4h || null,
+            volatilityRegime: symbolData.volatility_regime || 'NORMAL',
+            currentPrice: currentPrice
+        };
+
+        const finalAction = PolicyMapper.mapAction(action, contextData);
+        
+        if (finalAction.blocked_by) {
+            const violationMsg = `⚠️ <b>[PAPER] SOP VIOLATION</b> [${finalAction.blocked_by}]\n\n` +
+                               `AI Action: ${action}\n` +
+                               `Final Action: ${finalAction.action}\n` +
+                               `Reason: ${finalAction.reason}\n\n` +
+                               `Symbol: ${symbol}`;
+            
+            if (finalAction.action === 'HOLD') {
+                return violationMsg;
+            }
+            console.log(`[PAPER POLICY] Action modified from ${action} to ${finalAction.action} due to ${finalAction.blocked_by}`);
+            action = finalAction.action;
+        }
+
+        let side: "buy" | "sell" | undefined;
+        let targetLeg: "LONG" | "SHORT" | undefined;
+        let quantity = 0;
+        let msgAction = "";
+
+        if (isNaN(percentage) || percentage <= 0) percentage = 100;
+
+        // Determine Action Logic (similar to live, but simplified for paper)
+        if (action === "HEDGE_ON" || action === "HO") {
+          if (longQty === 0 && shortQty === 0) return `❌ [PAPER] No open positions to hedge.`;
+          if (longQty >= shortQty) {
+            side = "sell"; targetLeg = "SHORT";
+            const delta = Math.max(0, longQty - shortQty);
+            quantity = delta > 0 ? delta : (0.25 * longQty);
+            msgAction = "HEDGE_ON: add SHORT to lock/cover LONG";
+          } else {
+            side = "buy"; targetLeg = "LONG";
+            const delta = Math.max(0, shortQty - longQty);
+            quantity = delta > 0 ? delta : (0.25 * shortQty);
+            msgAction = "HEDGE_ON: add LONG to lock/cover SHORT";
+          }
+        } else if (action === "LOCK_NEUTRAL" || action === "LN") {
+          if (longQty === 0 && shortQty === 0) return `❌ [PAPER] No open positions to lock.`;
+          if (longQty > shortQty) {
+            side = "sell"; targetLeg = "SHORT"; quantity = longQty - shortQty; msgAction = "LOCK_NEUTRAL: add SHORT to match LONG";
+          } else if (shortQty > longQty) {
+            side = "buy"; targetLeg = "LONG"; quantity = shortQty - longQty; msgAction = "LOCK_NEUTRAL: add LONG to match SHORT";
+          } else {
+            return `✅ <b>[PAPER] LOCK_NEUTRAL</b>\n\nPosition is already 1:1 neutral for ${symbol}.`;
+          }
+        } else if (action === 'UNLOCK' || action === 'UL') {
+          if (longQty === 0 && shortQty === 0) return `❌ [PAPER] No positions to unlock.`;
+          if (longQty <= shortQty && longQty > 0) {
+            side = 'sell'; targetLeg = 'LONG'; quantity = longQty; msgAction = `UNLOCK: close LONG (wrong leg)`;
+          } else if (shortQty < longQty && shortQty > 0) {
+            side = 'buy'; targetLeg = 'SHORT'; quantity = shortQty; msgAction = `UNLOCK: close SHORT (wrong leg)`;
+          } else return `ℹ️ [PAPER] Already effectively unlocked.`;
+        } else if (action === 'ROLE' || action === 'RR') {
+          if (longQty > shortQty && longQty > 0) {
+            side = 'sell'; targetLeg = 'LONG'; quantity = longQty; msgAction = `ROLE: close LONG (promote SHORT)`;
+          } else if (shortQty > longQty && shortQty > 0) {
+            side = 'buy'; targetLeg = 'SHORT'; quantity = shortQty; msgAction = `ROLE: close SHORT (promote LONG)`;
+          } else return `❌ [PAPER] Role failed: cannot determine primary.`;
+        } else if (action === "REDUCE_LONG" || action === "RL") {
+          side = "sell"; targetLeg = "LONG";
+          quantity = absoluteQty || (longQty * (percentage / 100));
+          msgAction = absoluteQty ? `REDUCE_LONG ${absoluteQty} units` : `REDUCE_LONG ${percentage}%`;
+        } else if (action === "REDUCE_SHORT" || action === "RS") {
+          side = "buy"; targetLeg = "SHORT";
+          quantity = absoluteQty || (shortQty * (percentage / 100));
+          msgAction = absoluteQty ? `REDUCE_SHORT ${absoluteQty} units` : `REDUCE_SHORT ${percentage}%`;
+        } else if (action === "ADD_LONG" || action === "AL") {
+          side = "buy"; targetLeg = "LONG";
+          quantity = absoluteQty || (15 / (targetPrice || currentPrice));
+          msgAction = absoluteQty ? `ADD_LONG ${absoluteQty} units` : "ADD_LONG fixed 15 USDT";
+        } else if (action === "ADD_SHORT" || action === "AS") {
+          side = "sell"; targetLeg = "SHORT";
+          quantity = absoluteQty || (15 / (targetPrice || currentPrice));
+          msgAction = absoluteQty ? `ADD_SHORT ${absoluteQty} units` : "ADD_SHORT fixed 15 USDT";
+        } else if (action === "TAKE_PROFIT" || action === "TP") {
+          if (longQty > 0 && (!shortQty || longQty >= shortQty)) {
+            side = "sell"; targetLeg = "LONG"; quantity = longQty * (percentage / 100); msgAction = `TAKE_PROFIT LONG ${percentage}%`;
+          } else if (shortQty > 0) {
+            side = "buy"; targetLeg = "SHORT"; quantity = shortQty * (percentage / 100); msgAction = `TAKE_PROFIT SHORT ${percentage}%`;
+          } else {
+            return `❌ [PAPER] No open position for TAKE_PROFIT`;
+          }
+        } else if (action === 'HOLD') {
+          return `✅ <b>[PAPER] HOLD</b>\n\nNo trade executed for ${symbol}.`;
+        } else {
+          return `❌ [PAPER] Unsupported action: ${action}`;
+        }
+
+        if (!side || !targetLeg) throw new Error("Invalid trade parameters for paper trading");
+
+        const isReducing = ["REDUCE_LONG", "RL", "REDUCE_SHORT", "RS", "UNLOCK", "UL", "ROLE", "RR", "TAKE_PROFIT", "TP"].includes(action);
+        const openQtyAbs = targetLeg === "LONG" ? longQty : shortQty;
+        
+        if (isReducing) {
+          quantity = Math.min(quantity, openQtyAbs);
+          if (quantity <= 0) return `❌ [PAPER] Cannot reduce: quantity is 0 or no open position.`;
+        }
+
+        // --- Execute in Paper Memory ---
+        // Helper to update wallet (simplified)
+        const updateWallet = () => {
+           let totalUnrealized = 0;
+           let totalMarginUsed = 0;
+           for (const p of cachedPaperPositions) {
+             if (p.status === 'OPEN') {
+               totalUnrealized += p.currentPnl !== undefined ? p.currentPnl : (p.unrealizedPnl || 0);
+               totalMarginUsed += (p.size * p.entryPrice) / 20; // Assuming 20x leverage
+             }
+           }
+           cachedPaperWallet.equity = cachedPaperWallet.balance + totalUnrealized;
+           cachedPaperWallet.freeMargin = cachedPaperWallet.equity - totalMarginUsed;
+           cachedPaperWallet.marginRatio = cachedPaperWallet.equity > 0 ? (totalMarginUsed / cachedPaperWallet.equity) * 100 : 0;
+           cachedPaperWallet.updatedAt = new Date().toISOString();
+           if (db) setDoc(doc(db, 'paper_wallet', 'main'), cachedPaperWallet).catch(console.error);
+        };
+
+        const notional = quantity * currentPrice;
+
+        if (isReducing) {
+            // Partial Close
+            const posToReduce = targetLeg === 'LONG' ? longPos : shortPos;
+            if (posToReduce) {
+                const proportion = quantity / posToReduce.size;
+                const realizedPnl = (posToReduce.currentPnl || posToReduce.unrealizedPnl || 0) * proportion;
+                
+                posToReduce.size -= quantity;
+                if (posToReduce.currentPnl !== undefined) posToReduce.currentPnl -= realizedPnl;
+                if (posToReduce.unrealizedPnl !== undefined) posToReduce.unrealizedPnl -= realizedPnl;
+                
+                cachedPaperWallet.balance += realizedPnl;
+                
+                if (posToReduce.size <= 0.000001) { // Effectively closed
+                    posToReduce.status = 'CLOSED';
+                    const idx = cachedPaperPositions.findIndex(p => p.id === posToReduce.id);
+                    if (idx > -1) cachedPaperPositions.splice(idx, 1);
+                    if (db) deleteDoc(doc(db, 'paper_positions', posToReduce.id)).catch(console.error);
+                } else {
+                    if (db) setDoc(doc(db, 'paper_positions', posToReduce.id), { size: posToReduce.size, unrealizedPnl: posToReduce.unrealizedPnl }, { merge: true }).catch(console.error);
+                }
+                
+                const historyEntry = {
+                    id: `${posToReduce.id}_partial_${Date.now()}`,
+                    symbol, side: targetLeg, size: quantity, entryPrice: posToReduce.entryPrice, exitPrice: currentPrice, pnl: realizedPnl, reason: `Manual ${action}`, closedAt: new Date().toISOString(), status: 'CLOSED'
+                };
+                cachedPaperHistory.unshift(historyEntry);
+                if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
+                if (db) setDoc(doc(db, 'paper_history', historyEntry.id), historyEntry).catch(console.error);
+                
+                updateWallet();
+            }
+        } else {
+            // Open or Add
+            const existingPos = targetLeg === 'LONG' ? longPos : shortPos;
+            if (existingPos) {
+                // Add
+                const newTotalSize = existingPos.size + quantity;
+                const newAvgEntry = ((existingPos.size * existingPos.entryPrice) + (quantity * currentPrice)) / newTotalSize;
+                existingPos.size = newTotalSize;
+                existingPos.entryPrice = newAvgEntry;
+                if (db) setDoc(doc(db, 'paper_positions', existingPos.id), { size: newTotalSize, entryPrice: newAvgEntry }, { merge: true }).catch(console.error);
+                updateWallet();
+            } else {
+                // Open New
+                const newPosRefId = `paper_pos_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+                const newPos = {
+                    id: newPosRefId, symbol, side: targetLeg, entryPrice: currentPrice, size: quantity, unrealizedPnl: 0, currentPnl: 0,
+                    takeProfit: targetPrice || (targetLeg === 'LONG' ? currentPrice * 1.04 : currentPrice * 0.96), // Default 4% TP if not provided
+                    stopLoss: stopHedgePrice || 0,
+                    status: 'OPEN', openedAt: new Date().toISOString(), isHedge: action.includes('LOCK') || action.includes('HEDGE')
+                };
+                cachedPaperPositions.push(newPos);
+                if (db) setDoc(doc(db, 'paper_positions', newPosRefId), newPos).catch(console.error);
+                updateWallet();
+            }
+        }
+
+        return (
+          `✅ <b>[PAPER TRADING] ORDER SUCCESS!</b>\n\n` +
+          `Action: ${msgAction}\n` +
+          `Symbol: ${symbol}\n` +
+          `Side: ${side!.toUpperCase()}\n` +
+          `Leg: ${targetLeg}\n` +
+          `Qty: ${quantity.toFixed(6)}\n` +
+          `Notional≈ ${notional.toFixed(4)} USDT\n` +
+          `Price: ${currentPrice}\n` +
+          `Target Price: ${targetPrice || 'Market'}\n` +
+          `Stop Hedge: ${stopHedgePrice || 'N/A'}`
+        );
+
+      } catch (e: any) {
+         console.error("[PAPER EXEC ERROR]", e);
+         return `❌ <b>[PAPER] EXECUTION FAILED</b>\n\nError: ${escapeHtml(e.message || String(e))}`;
+      }
+    }
+    // --- END PAPER TRADING EXECUTION PATH ---
 
     const activeClient = VALIDATION_MODE === "DEMO_TRADING" ? binanceDemo : binance;
 
@@ -4450,7 +4701,8 @@ async function startServer() {
           netDirection: (longQty > shortQty) ? 'LONG' : (shortQty > longQty ? 'SHORT' : 'NEUTRAL'),
           netBEP: null, // Can be calculated from rows
           atr4h: symbolData.atr_4h || null,
-          volatilityRegime: symbolData.volatility_regime || 'NORMAL'
+          volatilityRegime: symbolData.volatility_regime || 'NORMAL',
+          currentPrice: currentPrice
       };
 
       const finalAction = PolicyMapper.mapAction(action, contextData);
@@ -4479,8 +4731,6 @@ async function startServer() {
 
       // 4) LOGIKA AKSI
       if (action === "HEDGE_ON" || action === "HO") {
-        const ok = await ensureMrGuardForAdd();
-        if (!ok.ok) return ok.msg!;
         if (longQty === 0 && shortQty === 0) return `❌ No open positions to hedge.`;
 
         if (longQty >= shortQty) {
@@ -4522,8 +4772,6 @@ async function startServer() {
           quantity = shortQty; msgAction = `UNLOCK: close SHORT (wrong leg)`;
         } else return `ℹ️ Already effectively unlocked.`;
       } else if (action === 'ROLE' || action === 'RR') {
-        const ok = await ensureMrGuardForAdd();
-        if (!ok.ok) return ok.msg!;
         if (longQty > shortQty && longQty > 0) {
           side = 'sell'; targetLeg = 'LONG';
           quantity = longQty; msgAction = `ROLE: close LONG (promote SHORT)`;
@@ -5054,6 +5302,14 @@ async function pollTelegram() {
             }
 
             const parsed = parseTelegramCallbackData(rawData);
+            
+            // Determine context from callback data or message text if available
+            const isPaperTradingContext = rawData.includes('PAPER_') || 
+                                          (callback.message?.text && (
+                                              callback.message.text.toLowerCase().includes('paper') || 
+                                              callback.message.text.toLowerCase().includes('simulasi')
+                                          )) || false;
+
             console.log(`\n--- TG EVENT ---`);
             console.log(`[TG UPDATE ID] ${update.update_id}`);
             console.log(`[TG CALLBACK ID] ${callback.id}`);
@@ -5085,7 +5341,8 @@ async function pollTelegram() {
                 parsed.percentage || 100, 
                 parsed.targetPrice, 
                 parsed.stopHedgePrice,
-                undefined // rawQty not in callback data yet
+                undefined, // rawQty not in callback data yet
+                isPaperTradingContext
             );
             
             // Send Result
@@ -5262,10 +5519,12 @@ Format balasan WAJIB berupa JSON:
                                          parsedText.action && parsedText.extractedSymbol;
 
             if (isLikelyTradeCommand) {
+                const isPaperTradingContext = userText.toLowerCase().includes('paper') || userText.toLowerCase().includes('simulasi');
+                
                 console.log(`\n--- TG EVENT ---`);
                 console.log(`[TG UPDATE ID] ${update.update_id}`);
                 console.log(`[TG MESSAGE ID] ${update.message.message_id}`);
-                console.log(`[TG EXEC TRACE] Executing ${parsedText.action} on ${parsedText.extractedSymbol} via Text`);
+                console.log(`[TG EXEC TRACE] Executing ${parsedText.action} on ${parsedText.extractedSymbol} via Text (Paper: ${isPaperTradingContext})`);
                 console.log(`----------------\n`);
                 
                 const resultMsg = await executeTrade(
@@ -5274,7 +5533,8 @@ Format balasan WAJIB berupa JSON:
                     parsedText.extractedPercentage || 100,
                     parsedText.extractedTargetPrice,
                     undefined, // stopHedgePrice
-                    parsedText.extractedQty
+                    parsedText.extractedQty,
+                    isPaperTradingContext
                 );
                 await sendTelegramMessage(resultMsg);
                 continue;
