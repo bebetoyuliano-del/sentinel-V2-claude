@@ -2459,15 +2459,36 @@ async function runPaperTradingEngine() {
     let totalUnrealized = 0;
     let totalMarginUsed = 0;
     const LEVERAGE = 20; // Default leverage for paper trading
+    const symbolMargins: Record<string, { long: number, short: number }> = {};
+    
     for (const pos of openPositions) {
       if (pos.status === 'OPEN') {
-        totalMarginUsed += (pos.size * pos.entryPrice) / LEVERAGE;
         totalUnrealized += pos.unrealizedPnl || 0;
+        if (!symbolMargins[pos.symbol]) symbolMargins[pos.symbol] = { long: 0, short: 0 };
+        const margin = (pos.size * pos.entryPrice) / LEVERAGE;
+        if (pos.side === 'LONG') symbolMargins[pos.symbol].long += margin;
+        else symbolMargins[pos.symbol].short += margin;
       }
     }
+    
+    for (const sym in symbolMargins) {
+      totalMarginUsed += Math.max(symbolMargins[sym].long, symbolMargins[sym].short);
+    }
+    
     wallet.equity = wallet.balance + totalUnrealized;
     wallet.freeMargin = wallet.equity - totalMarginUsed;
     wallet.marginRatio = wallet.equity > 0 ? (totalMarginUsed / wallet.equity) * 100 : 0;
+    
+    // Check if we need to start or stop emergency de-risk
+    if (wallet.marginRatio > 25 && !wallet.isEmergencyDeRisking) {
+      wallet.isEmergencyDeRisking = true;
+      console.log(`[PAPER] 🚨 EMERGENCY DE-RISK CYCLE INITIATED! Initial MR: ${wallet.marginRatio.toFixed(2)}%`);
+      await sendTelegramMessage(`[PAPER] 🚨 <b>EMERGENCY DE-RISK INITIATED</b>\nMargin Ratio is ${wallet.marginRatio.toFixed(2)}% (> 25%).\nSentinel will automatically realize profits to reduce margin exposure to below 15%.`);
+    } else if (wallet.marginRatio < 15 && wallet.isEmergencyDeRisking) {
+      wallet.isEmergencyDeRisking = false;
+      console.log(`[PAPER] ✅ EMERGENCY DE-RISK RESOLVED! Current MR: ${wallet.marginRatio.toFixed(2)}%`);
+      await sendTelegramMessage(`[PAPER] ✅ <b>EMERGENCY DE-RISK RESOLVED</b>\nMargin Ratio is now safely below 15% (${wallet.marginRatio.toFixed(2)}%).\nNormal trading operations resumed.`);
+    }
     
     backgroundSyncFirestore(setDoc(walletRef, wallet));
 
@@ -2560,12 +2581,23 @@ async function runPaperTradingEngine() {
         const updateWalletState = () => {
           let totalUnrealized = 0;
           let totalMarginUsed = 0;
+          const symbolMargins: Record<string, { long: number, short: number }> = {};
+          
           for (const p of openPositions) {
             if (p.status === 'OPEN') {
               totalUnrealized += p.currentPnl !== undefined ? p.currentPnl : (p.unrealizedPnl || 0);
-              totalMarginUsed += (p.size * p.entryPrice) / LEVERAGE;
+              
+              if (!symbolMargins[p.symbol]) symbolMargins[p.symbol] = { long: 0, short: 0 };
+              const margin = (p.size * p.entryPrice) / LEVERAGE;
+              if (p.side === 'LONG') symbolMargins[p.symbol].long += margin;
+              else symbolMargins[p.symbol].short += margin;
             }
           }
+          
+          for (const sym in symbolMargins) {
+            totalMarginUsed += Math.max(symbolMargins[sym].long, symbolMargins[sym].short);
+          }
+          
           wallet.equity = wallet.balance + totalUnrealized;
           wallet.freeMargin = wallet.equity - totalMarginUsed;
           wallet.marginRatio = wallet.equity > 0 ? (totalMarginUsed / wallet.equity) * 100 : 0;
@@ -2698,6 +2730,54 @@ async function runPaperTradingEngine() {
           await sendTelegramMessage(`[PAPER] ➕ <b>Added to ${pos.side} ${symbol}</b>\nReason: ${reason}\nNew Avg Entry: $${newAvgEntry.toFixed(4)}\nNew Size: ${newTotalSize.toFixed(4)}`);
         };
 
+        // --- 0. EMERGENCY DE-RISK (MR > 25%) ---
+        if (wallet.isEmergencyDeRisking && wallet.marginRatio > 15) {
+          if (longPos && shortPos) {
+            // Hedged position: Unlock or Reduce the profitable leg
+            if (longPos.currentPnl > 0) {
+              if (longPos.size > shortPos.size) {
+                const excessSize = longPos.size - shortPos.size;
+                await partialClosePos(longPos, excessSize, 'Emergency De-Risk (Reduce Long to 1:1)');
+              } else {
+                await closePos(longPos, 'Emergency De-Risk (Unlock Long)');
+                longPos = undefined;
+                // Update shortPos SL to prevent immediate re-hedge
+                if (shortPos) {
+                  const newSl = currentPrice * (1 + (setting.lockTriggerPct || 2.0) / 100);
+                  shortPos.stopLoss = newSl;
+                  backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { stopLoss: newSl }, { merge: true }));
+                }
+              }
+            } else if (shortPos.currentPnl > 0) {
+              if (shortPos.size > longPos.size) {
+                const excessSize = shortPos.size - longPos.size;
+                await partialClosePos(shortPos, excessSize, 'Emergency De-Risk (Reduce Short to 1:1)');
+              } else {
+                await closePos(shortPos, 'Emergency De-Risk (Unlock Short)');
+                shortPos = undefined;
+                // Update longPos SL to prevent immediate re-hedge
+                if (longPos) {
+                  const newSl = currentPrice * (1 - (setting.lockTriggerPct || 2.0) / 100);
+                  longPos.stopLoss = newSl;
+                  backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { stopLoss: newSl }, { merge: true }));
+                }
+              }
+            }
+          } else if (longPos && !shortPos) {
+            // Single leg: Close if profitable
+            if (longPos.currentPnl > 0) {
+              await closePos(longPos, 'Emergency De-Risk (Take Profit Long)');
+              longPos = undefined;
+            }
+          } else if (shortPos && !longPos) {
+            // Single leg: Close if profitable
+            if (shortPos.currentPnl > 0) {
+              await closePos(shortPos, 'Emergency De-Risk (Take Profit Short)');
+              shortPos = undefined;
+            }
+          }
+        }
+
         // --- 1. EXIT LOGIC (Sentinel Targets) ---
         if (longPos && shortPos) {
           const primaryPos = longPos.openedAt < shortPos.openedAt ? longPos : shortPos;
@@ -2757,7 +2837,7 @@ async function runPaperTradingEngine() {
         }
 
         // --- 3. ENTRY & ADD LOGIC (AI SIGNAL) ---
-        if (freshSignal) {
+        if (freshSignal && !wallet.isEmergencyDeRisking) {
           const hasActed = (longPos?.signalId === freshSignal.id || shortPos?.signalId === freshSignal.id || longPos?.lastSignalId === freshSignal.id || shortPos?.lastSignalId === freshSignal.id);
           
           if (!hasActed) {
