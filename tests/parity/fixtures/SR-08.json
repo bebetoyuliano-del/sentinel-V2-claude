@@ -1,0 +1,51 @@
+{
+  "scenario_id": "SR-08",
+  "meta": {
+    "title": "Reduce Request on Red Leg Must Be Blocked",
+    "priority": "P0",
+    "category": "golden_rule_block"
+  },
+  "input_state": {
+    "market": {
+      "symbol": "SOL/USDT",
+      "price": 146,
+      "PrimaryTrend4H": "DOWN",
+      "TrendStatus": "REVERSAL_WATCH",
+      "Bias4H": "DOWN",
+      "Bias1H": "DOWN",
+      "spot_adverse_move_pct": 1.1,
+      "recovery_suspended": false,
+      "ambiguity_flags": []
+    },
+    "position": {
+      "Structure": "LOCK_1TO1",
+      "StructureOrigin": "REVERSAL_DEFENSE",
+      "ContextMode": "REVERSAL_DEFENSE",
+      "GreenLeg": "SHORT",
+      "RedLeg": "LONG",
+      "HedgeLegStatus": "HEDGE_FULL",
+      "long": { "qty": 1000, "entry": 152, "pnl": -210 },
+      "short": { "qty": 1000, "entry": 149, "pnl": 130 },
+      "requested_action": "REDUCE_0.5_LONG"
+    },
+    "risk": {
+      "MRNow": 10.0,
+      "MRProjected": 10.4,
+      "RiskOverride": "NONE"
+    }
+  },
+  "expected": {
+    "final_action": "HOLD",
+    "fallback_action": "HOLD",
+    "blocked_actions": [
+      "REDUCE_0.5_LONG"
+    ],
+    "expected_post_state": {
+      "Structure": "LOCK_1TO1",
+      "ContextMode": "REVERSAL_DEFENSE",
+      "HedgeLegStatus": "HEDGE_FULL",
+      "RiskOverride": "NONE",
+      "WhyBlocked": "GOLDEN_RULE_NO_REDUCE_ON_RED_LEG"
+    }
+  }
+}

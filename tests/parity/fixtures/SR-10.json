@@ -1,0 +1,51 @@
+{
+  "scenario_id": "SR-10",
+  "meta": {
+    "title": "Revert to 1:1 via Reduce Green Leg",
+    "priority": "P0",
+    "category": "reversal_revert"
+  },
+  "input_state": {
+    "market": {
+      "symbol": "BTC/USDT",
+      "price": 62000,
+      "PrimaryTrend4H": "DOWN",
+      "TrendStatus": "REVERSAL_CONFIRMED_STRONG",
+      "Bias4H": "DOWN",
+      "Bias1H": "DOWN",
+      "spot_adverse_move_pct": 3.5,
+      "recovery_suspended": false,
+      "ambiguity_flags": []
+    },
+    "position": {
+      "Structure": "LONG_1P5_SHORT_1",
+      "ContextMode": "CONTINUATION_RECOVERY",
+      "GreenLeg": "LONG",
+      "RedLeg": "SHORT",
+      "HedgeLegStatus": "RESIDUAL_OPPOSING_LEG",
+      "requested_action": "REVERT_TO_1TO1",
+      "operational_action": "REDUCE_0.5_LONG"
+    },
+    "risk": {
+      "MRNow": 18.0,
+      "MRProjected": 15.0,
+      "RiskOverride": "NONE"
+    }
+  },
+  "expected": {
+    "final_action": "REVERT_TO_1TO1",
+    "operational_action": "REDUCE_0.5_LONG",
+    "fallback_action": "HOLD",
+    "blocked_actions": [
+      "ADD_0.5_LONG",
+      "UNLOCK"
+    ],
+    "expected_post_state": {
+      "Structure": "LOCK_1TO1",
+      "ContextMode": "REVERSAL_DEFENSE",
+      "HedgeLegStatus": "HEDGE_FULL",
+      "RiskOverride": "NONE",
+      "WhyAllowed": "REVERT_VIA_REDUCE_GREEN_LEG"
+    }
+  }
+}

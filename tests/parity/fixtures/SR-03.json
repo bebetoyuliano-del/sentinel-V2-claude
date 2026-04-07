@@ -1,0 +1,55 @@
+{
+  "scenario_id": "SR-03",
+  "meta": {
+    "title": "Hedge Trigger → Lock 1:1 → Wait & See",
+    "priority": "P0",
+    "category": "lock_transition"
+  },
+  "input_state": {
+    "market": {
+      "symbol": "BTC/USDT",
+      "price": 64800,
+      "PrimaryTrend4H": "UP",
+      "TrendStatus": "REVERSAL_WATCH",
+      "Bias4H": "UP",
+      "Bias1H": "DOWN",
+      "spot_adverse_move_pct": 1.8,
+      "recovery_suspended": false,
+      "ambiguity_flags": []
+    },
+    "position": {
+      "Structure": "SINGLE",
+      "StructureOrigin": "NEW_INDEPENDENT_TREND_SIGNAL",
+      "ContextMode": "CONTINUATION_RECOVERY",
+      "GreenLeg": "NONE",
+      "RedLeg": "LONG",
+      "HedgeLegStatus": "NONE",
+      "long": { "qty": 1000, "entry": 65000, "pnl": -200 },
+      "short": { "qty": 0, "entry": 0, "pnl": 0 },
+      "stop_hedge_hit": true
+    },
+    "risk": {
+      "MRNow": 12.0,
+      "MRProjected": 14.0,
+      "RiskOverride": "NONE"
+    }
+  },
+  "expected": {
+    "final_action": "LOCK_NEUTRAL",
+    "blocked_actions": [
+      "IMMEDIATE_UNLOCK",
+      "IMMEDIATE_ADD_0.5_LONG",
+      "IMMEDIATE_ADD_0.5_SHORT"
+    ],
+    "expected_post_state": {
+      "Structure": "LOCK_1TO1",
+      "ContextMode": "LOCK_WAIT_SEE",
+      "HedgeLegStatus": "HEDGE_FULL",
+      "GreenLeg": "NONE",
+      "RedLeg": "NONE",
+      "RiskOverride": "NONE",
+      "long": { "qty": 1000 },
+      "short": { "qty": 1000 }
+    }
+  }
+}

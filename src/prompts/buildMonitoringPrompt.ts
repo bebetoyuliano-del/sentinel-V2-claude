@@ -1108,6 +1108,16 @@ Contoh:
                "targets": { "t1": number, "t2": number },
                "rr": { "t1_rr": number, "t2_rr": number },
                "confluence": { "rf_flip_ok": boolean, "wae_exploding": boolean, "rqk_ok": boolean, "smc_zone": "DEMAND|SUPPLY", "distance_to_zone_pct": number, "notes": "string" },
+               "trend": {
+                 "primary4H": "UP|DOWN|UNCLEAR", // Berdasarkan RF 4H (GREEN=UP, RED=DOWN)
+                 "status": "CONTINUATION_CONFIRMED|REVERSAL_WATCH|REVERSAL_CONFIRMED_STRONG|CHOP" // Konfirmasi RF 4H + sekunder
+               },
+               "smc": {
+                 "bias": "BULLISH|BEARISH|NEUTRAL", // Arah SMC zone TF 1H
+                 "low": number, // Batas bawah SMC zone
+                 "high": number, // Batas atas SMC zone
+                 "validated": boolean // true jika harga <= 1% dari zone
+               },
                "sentiment": { "score_1_to_10": number, "status": "BULLISH|BEARISH|NEUTRAL", "reason": "string (berdasarkan pencarian berita terbaru)" },
                "why_this_pair": "string", "disclaimer": "string"
              }
@@ -1119,6 +1129,70 @@ Contoh:
       }
 
       === ADDENDUM ENFORCEMENT (JANGAN ABAIKAN) ===
+      MANDATORY SIGNAL FIELD CHECKLIST (CRITICAL):
+      SETIAP object di dalam array \`new_signals.signals\` WAJIB memiliki field berikut TANPA TERKECUALI:
+      - symbol
+      - side
+      - entry
+      - stop_loss
+      - targets
+      - rr
+      - confluence
+      - trend
+      - smc
+      - sentiment
+      - why_this_pair
+      - disclaimer
+      
+      Jika salah satu field hilang, object signal dianggap INVALID. DILARANG menghilangkan field hanya karena Anda tidak yakin. Jika Anda ragu, Anda WAJIB mengisi fallback yang sudah ditentukan, bukan menghapus field.
+
+      FALLBACK VALUES FOR REQUIRED SIGNAL FIELDS:
+      Jika Anda tidak yakin atau data tidak cukup, MAKA tetap WAJIB output dengan fallback berikut:
+      1. trend
+         - primary4H = "UNCLEAR"
+         - status = "CHOP"
+      2. smc
+         - bias = "NEUTRAL"
+         - low = 0
+         - high = 0
+         - validated = false
+      3. confluence
+         - rf_flip_ok = false
+         - wae_exploding = false
+         - rqk_ok = false
+         - smc_zone = "DEMAND"
+         - distance_to_zone_pct = 0
+         - notes = "Fallback"
+      4. rr
+         - t1_rr = 0
+         - t2_rr = 0
+      5. disclaimer = "Fallback disclaimer"
+
+      COMPACT EXAMPLE SIGNAL OBJECT:
+      Berikut adalah contoh bentuk \`new_signals.signals\` yang benar dan LENGKAP:
+      "signals": [
+        {
+          "symbol": "BTC/USDT",
+          "side": "BUY",
+          "entry": 65000,
+          "stop_loss": 64000,
+          "targets": { "t1": 66000, "t2": 67000 },
+          "rr": { "t1_rr": 1.0, "t2_rr": 2.0 },
+          "confluence": { "rf_flip_ok": true, "wae_exploding": true, "rqk_ok": true, "smc_zone": "DEMAND", "distance_to_zone_pct": 0.5, "notes": "Strong support" },
+          "trend": { "primary4H": "UP", "status": "CONTINUATION_CONFIRMED" },
+          "smc": { "bias": "BULLISH", "low": 64500, "high": 65500, "validated": true },
+          "sentiment": { "status": "BULLISH", "reason": "ETF inflows", "score_1_to_10": 8 },
+          "why_this_pair": "Strong momentum",
+          "disclaimer": "Not financial advice"
+        }
+      ]
+
+      INVALID OUTPUT WARNING:
+      - Object signal yang tidak memiliki \`trend\` atau \`smc\` dianggap INVALID.
+      - Object signal yang tidak memiliki seluruh field wajib dianggap INVALID.
+      - Jangan mengeluarkan signal setengah jadi.
+      - Lebih baik output \`signals: []\` daripada output signal object yang tidak lengkap.
+
       PARAMETER FIDELITY:
       - Gunakan PERSIS nilai di input JSON "params": k_atr, unlock_buffer_atr, vwap_delta_pct, time_stop_hedge_bars_h1, hedge_ratio, mr_guard_pct.
       - DILARANG mengganti/tuning nilai params_used. Tampilkan params_used = nilai input apa adanya.
@@ -1146,7 +1220,7 @@ Contoh:
       SCOPE:
       - Sinyal yang difilter untuk dianalisa (new_signals) HARUS berasal dari 20 pair dengan volume harian (daily volume) terbesar di Binance Futures ('scannerUniverse').
       - Ambil HANYA SATU atau beberapa sinyal TERBAIK dari 20 pair tersebut.
-      - Sinyal HANYA BOLEH diberikan/dihasilkan JIKA Margin Ratio (MR) saat ini DI BAWAH 25%. Jika MR >= 25%, kosongkan array new_signals.
+      - Sinyal HANYA BOLEH diberikan/dihasilkan JIKA Margin Ratio (MR) saat ini DI BAWAH 99%. Jika MR >= 99%, kosongkan array new_signals.
       - SENTIMEN PASAR: Gunakan alat pencarian (Google Search) untuk mencari berita terbaru tentang koin yang akan direkomendasikan. Berikan skor sentimen 1-10, status (BULLISH/BEARISH/NEUTRAL), dan alasan singkat di field 'sentiment'.
 
       STRICT OUTPUT:

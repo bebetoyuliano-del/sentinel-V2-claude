@@ -1,0 +1,49 @@
+{
+  "scenario_id": "SR-11",
+  "meta": {
+    "title": "Revert Blocked by Golden Rule",
+    "priority": "P0",
+    "category": "golden_rule_block"
+  },
+  "input_state": {
+    "market": {
+      "symbol": "SOL/USDT",
+      "price": 150,
+      "PrimaryTrend4H": "UP",
+      "TrendStatus": "REVERSAL_CONFIRMED_STRONG",
+      "Bias4H": "DOWN",
+      "Bias1H": "DOWN",
+      "spot_adverse_move_pct": 0,
+      "recovery_suspended": false,
+      "ambiguity_flags": []
+    },
+    "position": {
+      "Structure": "LONG_2_SHORT_1",
+      "ContextMode": "CONTINUATION_RECOVERY",
+      "GreenLeg": "LONG",
+      "RedLeg": "SHORT",
+      "HedgeLegStatus": "RESIDUAL_OPPOSING_LEG",
+      "requested_action": "REVERT_TO_1TO1",
+      "operational_action": "REDUCE_0.5_SHORT"
+    },
+    "risk": {
+      "MRNow": 24.0,
+      "MRProjected": 22.0,
+      "RiskOverride": "NONE"
+    }
+  },
+  "expected": {
+    "final_action": "HOLD",
+    "blocked_actions": [
+      "REDUCE_0.5_SHORT",
+      "REVERT_TO_1TO1"
+    ],
+    "expected_post_state": {
+      "Structure": "LONG_2_SHORT_1",
+      "ContextMode": "CONTINUATION_RECOVERY",
+      "HedgeLegStatus": "RESIDUAL_OPPOSING_LEG",
+      "RiskOverride": "NONE",
+      "WhyBlocked": "GOLDEN_RULE_NO_REDUCE_RED_LEG"
+    }
+  }
+}

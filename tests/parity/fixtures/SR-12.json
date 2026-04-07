@@ -1,0 +1,48 @@
+{
+  "scenario_id": "SR-12",
+  "meta": {
+    "title": "CHOP / Recovery Suspended Blocks Expansion",
+    "priority": "P0",
+    "category": "recovery_suspended_block"
+  },
+  "input_state": {
+    "market": {
+      "symbol": "BNB/USDT",
+      "price": 600,
+      "PrimaryTrend4H": "UP",
+      "TrendStatus": "CHOP",
+      "Bias4H": "UP",
+      "Bias1H": "DOWN",
+      "spot_adverse_move_pct": 1.8,
+      "recovery_suspended": true,
+      "ambiguity_flags": []
+    },
+    "position": {
+      "Structure": "LONG_1P5_SHORT_1",
+      "ContextMode": "CONTINUATION_RECOVERY",
+      "GreenLeg": "NONE",
+      "RedLeg": "LONG",
+      "HedgeLegStatus": "RESIDUAL_OPPOSING_LEG",
+      "requested_action": "ADD_0.5_LONG"
+    },
+    "risk": {
+      "MRNow": 15.0,
+      "MRProjected": 16.5,
+      "RiskOverride": "NONE"
+    }
+  },
+  "expected": {
+    "final_action": "HOLD",
+    "fallback_action": "HOLD",
+    "blocked_actions": [
+      "ADD_0.5_LONG"
+    ],
+    "expected_post_state": {
+      "Structure": "LONG_1P5_SHORT_1",
+      "ContextMode": "CONTINUATION_RECOVERY",
+      "HedgeLegStatus": "RESIDUAL_OPPOSING_LEG",
+      "RiskOverride": "RECOVERY_SUSPENDED",
+      "WhyBlocked": "RECOVERY_SUSPENDED"
+    }
+  }
+}

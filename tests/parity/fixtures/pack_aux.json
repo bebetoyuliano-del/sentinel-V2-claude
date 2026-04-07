@@ -1,0 +1,15 @@
+{
+  "pack_id": "pack_aux_v1",
+  "title": "Auxiliary Scenario Fixture Pack — AUX-01, 02, 03 (PAPER-SOP-PT-1)",
+  "phase": "PAPER-SOP-PT-1",
+  "meta": {
+    "description": "Auxiliary Scenario Fixture Pack — AUX-01, 02, 03 (PAPER-SOP-PT-1)",
+    "lane": "PAPER-SOP-PT-1",
+    "version": "1.0"
+  },
+  "fixtures": [
+    "AUX-01.json",
+    "AUX-02.json",
+    "AUX-03.json"
+  ]
+}

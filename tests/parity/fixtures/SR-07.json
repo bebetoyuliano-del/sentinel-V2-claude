@@ -1,0 +1,50 @@
+{
+  "scenario_id": "SR-07",
+  "meta": {
+    "title": "LOCK 1:1, Long Hijau, Short Merah, Reversal DOWN Kuat",
+    "priority": "P0",
+    "category": "reversal_defense"
+  },
+  "input_state": {
+    "market": {
+      "symbol": "ETH/USDT",
+      "price": 3180,
+      "PrimaryTrend4H": "DOWN",
+      "TrendStatus": "REVERSAL_CONFIRMED_STRONG",
+      "Bias4H": "DOWN",
+      "Bias1H": "DOWN",
+      "spot_adverse_move_pct": 2.1,
+      "recovery_suspended": false,
+      "ambiguity_flags": []
+    },
+    "position": {
+      "Structure": "LOCK_1TO1",
+      "StructureOrigin": "REVERSAL_DEFENSE",
+      "ContextMode": "REVERSAL_DEFENSE",
+      "GreenLeg": "LONG",
+      "RedLeg": "SHORT",
+      "HedgeLegStatus": "HEDGE_FULL",
+      "long": { "qty": 1000, "entry": 3060, "pnl": 120 },
+      "short": { "qty": 1000, "entry": 3210, "pnl": -160 }
+    },
+    "risk": {
+      "MRNow": 14.0,
+      "MRProjected": 14.8,
+      "RiskOverride": "NONE"
+    }
+  },
+  "expected": {
+    "final_action": "REDUCE_0.5_LONG",
+    "blocked_actions": [
+      "REDUCE_0.5_SHORT",
+      "CUT_SHORT",
+      "DIRECT_ADD_0.5_SHORT_WITHOUT_REDUCE_PHASE"
+    ],
+    "expected_post_state": {
+      "Structure": "LONG_1P5_SHORT_1",
+      "ContextMode": "REVERSAL_DEFENSE",
+      "HedgeLegStatus": "RESIDUAL_OPPOSING_LEG",
+      "RiskOverride": "NONE"
+    }
+  }
+}

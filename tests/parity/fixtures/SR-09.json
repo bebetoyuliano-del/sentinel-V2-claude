@@ -1,0 +1,54 @@
+{
+  "scenario_id": "SR-09",
+  "meta": {
+    "title": "Structure 2:1, Trend Masih Sehat, Full Cycle Exit Near BEP",
+    "priority": "P0",
+    "category": "full_cycle_exit"
+  },
+  "input_state": {
+    "market": {
+      "symbol": "BNB/USDT",
+      "price": 642,
+      "PrimaryTrend4H": "UP",
+      "TrendStatus": "CONTINUATION_CONFIRMED",
+      "Bias4H": "UP",
+      "Bias1H": "UP",
+      "spot_adverse_move_pct": 0.9,
+      "recovery_suspended": false,
+      "ambiguity_flags": []
+    },
+    "position": {
+      "Structure": "LONG_2_SHORT_1",
+      "StructureOrigin": "CONTINUATION_BUILD",
+      "ContextMode": "EXIT_READY",
+      "GreenLeg": "LONG",
+      "RedLeg": "SHORT",
+      "HedgeLegStatus": "RESIDUAL_OPPOSING_LEG",
+      "long": { "qty": 2000, "entry": 620, "pnl": 440 },
+      "short": { "qty": 1000, "entry": 638, "pnl": -90 },
+      "BEPType": "GROSS",
+      "NearBEP": true
+    },
+    "risk": {
+      "MRNow": 11.0,
+      "MRProjected": 12.0,
+      "RiskOverride": "NONE"
+    }
+  },
+  "expected": {
+    "final_action": "FULL_CYCLE_EXIT",
+    "blocked_actions": [
+      "REVERT_TO_1TO1_WITHOUT_REASON",
+      "ADD_0.5_LONG_EXTRA",
+      "REDUCE_0.5_SHORT_RED_LEG"
+    ],
+    "expected_post_state": {
+      "Structure": "NONE",
+      "ContextMode": "WAIT_AND_SEE",
+      "GreenLeg": "NONE",
+      "RedLeg": "NONE",
+      "HedgeLegStatus": "NONE",
+      "RiskOverride": "NONE"
+    }
+  }
+}

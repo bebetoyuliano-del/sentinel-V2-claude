@@ -1,0 +1,47 @@
+{
+  "scenario_id": "AUX-03",
+  "meta": {
+    "title": "Ambiguity Flags Block Expansion",
+    "priority": "P0",
+    "category": "ambiguity_block"
+  },
+  "input_state": {
+    "market": {
+      "symbol": "BNB/USDT",
+      "price": 600,
+      "PrimaryTrend4H": "UP",
+      "TrendStatus": "CONTINUATION_CONFIRMED",
+      "Bias4H": "UP",
+      "Bias1H": "DOWN",
+      "spot_adverse_move_pct": 0,
+      "recovery_suspended": false,
+      "ambiguity_flags": ["CONFLICTING_TIMEFRAMES"]
+    },
+    "position": {
+      "Structure": "LONG_1P5_SHORT_1",
+      "ContextMode": "CONTINUATION_RECOVERY",
+      "GreenLeg": "LONG",
+      "RedLeg": "SHORT",
+      "HedgeLegStatus": "RESIDUAL_OPPOSING_LEG",
+      "requested_action": "ADD_0.5_LONG"
+    },
+    "risk": {
+      "MRNow": 15.0,
+      "MRProjected": 16.5,
+      "RiskOverride": "NONE"
+    }
+  },
+  "expected": {
+    "final_action": "HOLD",
+    "blocked_actions": [
+      "ADD_0.5_LONG"
+    ],
+    "expected_post_state": {
+      "Structure": "LONG_1P5_SHORT_1",
+      "ContextMode": "CONTINUATION_RECOVERY",
+      "HedgeLegStatus": "RESIDUAL_OPPOSING_LEG",
+      "RiskOverride": "AMBIGUITY_BLOCK",
+      "WhyBlocked": "AMBIGUOUS_MARKET"
+    }
+  }
+}

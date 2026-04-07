@@ -1,0 +1,52 @@
+{
+  "scenario_id": "SR-06",
+  "meta": {
+    "title": "Continuation Recovery Valid",
+    "priority": "P0",
+    "category": "continuation_recovery"
+  },
+  "input_state": {
+    "market": {
+      "symbol": "BTC/USDT",
+      "price": 64800,
+      "PrimaryTrend4H": "UP",
+      "TrendStatus": "CONTINUATION_CONFIRMED",
+      "Bias4H": "UP",
+      "Bias1H": "UP",
+      "spot_adverse_move_pct": 1.2,
+      "recovery_suspended": false,
+      "ambiguity_flags": [],
+      "PullbackValid": true
+    },
+    "position": {
+      "Structure": "LOCK_1TO1",
+      "ContextMode": "CONTINUATION_RECOVERY",
+      "StructureOrigin": "CONTINUATION_BUILD",
+      "GreenLeg": "LONG",
+      "RedLeg": "SHORT",
+      "HedgeLeg": "SHORT",
+      "HedgeLegStatus": "HEDGE_FULL",
+      "requested_action": "ADD_0.5_LONG"
+    },
+    "risk": {
+      "MRNow": 12.0,
+      "MRProjected": 17.0,
+      "RiskOverride": "NONE"
+    }
+  },
+  "expected": {
+    "final_action": "ADD_0.5_LONG",
+    "blocked_actions": [
+      "REDUCE_0.5_SHORT",
+      "CUT_SHORT",
+      "UNLOCK"
+    ],
+    "expected_post_state": {
+      "Structure": "LONG_1P5_SHORT_1",
+      "ContextMode": "CONTINUATION_RECOVERY",
+      "HedgeLegStatus": "RESIDUAL_OPPOSING_LEG",
+      "RiskOverride": "NONE",
+      "WhyAllowed": "CONTINUATION_RECOVERY_ADD_GREEN_LEG"
+    }
+  }
+}

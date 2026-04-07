@@ -1,11 +1,17 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 
+import type { PaperPosition, PaperWallet, PaperHistory } from './src/paper-engine/types';
+import { calculateMarginUsed, computeMRProjectedAfterAdd } from './src/paper-engine/valuation';
+import { isParityV2Mode, evaluateParityPaper } from './src/paper-engine/parity_runtime';
+import { executeParityPaperDecision } from './src/paper-engine/parity_execute';
+import { withFirestoreFailSoft, jsonDegraded, markFirestoreUnavailable } from './src/paper-engine/firestore_failsoft';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import axios from 'axios';
 import ccxt from 'ccxt';
 import cors from 'cors';
 import express from 'express';
+import { ParityAdapter } from './tests/parity/ParityAdapter';
 import { createServer as createViteServer } from 'vite';
 import { RSI, MACD, EMA, BollingerBands, SMA } from 'technicalindicators';
 import { Storage } from '@google-cloud/storage';
@@ -91,9 +97,9 @@ let db: any = null;
 let auth: any = null;
 
 // Caches for Paper Trading Engine
-let cachedPaperPositions: any[] = [];
-let cachedPaperWallet: any = { balance: 10000, equity: 10000, freeMargin: 10000, updatedAt: new Date().toISOString() };
-let cachedPaperHistory: any[] = [];
+let cachedPaperPositions: PaperPosition[] = [];
+let cachedPaperWallet: PaperWallet = { balance: 10000, equity: 10000, freeMargin: 10000, updatedAt: new Date().toISOString() };
+let cachedPaperHistory: PaperHistory[] = [];
 let cachedPaperMonitoring: any[] = [];
 let cachedTradingJournal: any[] = [];
 let cachedChats: any[] = [];
@@ -107,17 +113,17 @@ async function loadPaperTradingData() {
   try {
     const walletSnap = await getDoc(doc(db, 'paper_wallet', 'main'));
     if (walletSnap.exists()) {
-      cachedPaperWallet = walletSnap.data();
+      cachedPaperWallet = walletSnap.data() as PaperWallet;
     } else {
       cachedPaperWallet = { balance: 10000, equity: 10000, freeMargin: 10000, marginRatio: 0, updatedAt: new Date().toISOString() };
     }
 
     const posSnap = await getDocs(collection(db, 'paper_positions'));
-    cachedPaperPositions = posSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    cachedPaperPositions = posSnap.docs.map(doc => ({ ...doc.data(), id: doc.id } as PaperPosition));
 
     const historyQuery = query(collection(db, 'paper_history'), orderBy('closedAt', 'desc'), limit(200));
     const histSnap = await getDocs(historyQuery);
-    cachedPaperHistory = histSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    cachedPaperHistory = histSnap.docs.map(doc => ({ ...doc.data(), id: doc.id } as PaperHistory));
     console.log("[PAPER] Loaded initial paper trading data from Firestore.");
   } catch (error: any) {
     console.error("[PAPER] Failed to load initial paper trading data from Firestore. Using empty/default cache.", error.message);
@@ -172,22 +178,34 @@ function setupRealtimeListeners() {
 
     const journalQuery = query(collection(db, 'trading_journal'), orderBy('timestamp', 'desc'), limit(100));
     onSnapshot(journalQuery, (snap) => {
-      cachedTradingJournal = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      cachedTradingJournal = snap.docs.map(doc => ({ ...doc.data(), id: doc.id }));
     }, (error) => {
+      const msg = String(error?.message || error || '').toLowerCase();
+      if (msg.includes('quota') || msg.includes('resource exhausted') || msg.includes('deadline exceeded')) {
+        markFirestoreUnavailable(60_000);
+      }
       console.error("Error in trading_journal snapshot:", error);
     });
 
     const signalsQuery = query(collection(db, 'signals'), orderBy('timestamp', 'desc'), limit(100));
     onSnapshot(signalsQuery, (snap) => {
-      signals = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      signals = snap.docs.map(doc => ({ ...doc.data(), id: doc.id }));
     }, (error) => {
+      const msg = String(error?.message || error || '').toLowerCase();
+      if (msg.includes('quota') || msg.includes('resource exhausted') || msg.includes('deadline exceeded')) {
+        markFirestoreUnavailable(60_000);
+      }
       console.error("Error in signals snapshot:", error);
     });
 
     const chatsQuery = query(collection(db, 'chats'), orderBy('timestamp', 'asc'), limit(100));
     onSnapshot(chatsQuery, (snap) => {
-      cachedChats = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      cachedChats = snap.docs.map(doc => ({ ...doc.data(), id: doc.id }));
     }, (error) => {
+      const msg = String(error?.message || error || '').toLowerCase();
+      if (msg.includes('quota') || msg.includes('resource exhausted') || msg.includes('deadline exceeded')) {
+        markFirestoreUnavailable(60_000);
+      }
       console.error("Error in chats snapshot:", error);
     });
 
@@ -599,6 +617,7 @@ function getAI() {
 
 // In-memory storage for signals
 let signals: any[] = [];
+let lastRawNewSignals: any = null;
 let isBotRunning = false;
 let monitorInterval: NodeJS.Timeout | null = null;
 let isPaperTradingRunning = false;
@@ -1175,6 +1194,7 @@ async function monitorMarkets(force = false) {
     }
     
     let cards = analysisData.decision_cards || [];
+    lastRawNewSignals = analysisData.new_signals || null;
     
     // Deduplicate cards by symbol to prevent spam
     const uniqueCards = [];
@@ -1292,7 +1312,9 @@ async function monitorMarkets(force = false) {
                   stop_loss: sig.stop_loss,
                   targets: sig.targets,
                   why_this_pair: sig.why_this_pair,
-                  sentiment: sig.sentiment
+                  sentiment: sig.sentiment,
+                  trend: sig.trend,
+                  smc: sig.smc
                 };
                 signals.unshift(newSignal);
 
@@ -1326,7 +1348,9 @@ async function monitorMarkets(force = false) {
 // Helper for background sync
 function backgroundSyncFirestore(promise: Promise<any>) {
   promise.catch(error => {
-    if (error.message && error.message.includes('Quota limit exceeded')) {
+    const msg = String(error?.message || error || '').toLowerCase();
+    if (msg.includes('quota') || msg.includes('resource exhausted') || msg.includes('deadline exceeded')) {
+      markFirestoreUnavailable(60_000);
       // Ignore quota errors for paper trading background sync
     } else {
       console.error("[PAPER] Background sync error:", error.message);
@@ -1335,12 +1359,7 @@ function backgroundSyncFirestore(promise: Promise<any>) {
 }
 
 // Helper to calculate margin used based on current notional value (Binance Hedge Mode logic)
-function calculateMarginUsed(pos: any, leverage: number): number {
-  const entryNotional = pos.size * pos.entryPrice;
-  const pnl = pos.currentPnl !== undefined ? pos.currentPnl : (pos.unrealizedPnl || 0);
-  const currentNotional = pos.side === 'LONG' ? entryNotional + pnl : entryNotional - pnl;
-  return Math.max(0, currentNotional) / leverage;
-}
+// Moved to src/paper-engine/valuation.ts
 
 // SOP Helper: Classify Structure with tolerance (SOP 2AB)
 function classifyStructure(longSize: number, shortSize: number): string {
@@ -1363,35 +1382,7 @@ function classifyStructure(longSize: number, shortSize: number): string {
 }
 
 // SOP Helper: Compute Projected MR after adding size (Consistent with Proxy MR)
-function computeMRProjectedAfterAdd(wallet: any, openPositions: any[], posToModifyId: string, additionalSize: number, currentPrice: number, leverage: number): number {
-  let totalProjectedMargin = 0;
-  let targetFound = false;
-  
-  for (const p of openPositions) {
-    if (p.status === 'OPEN') {
-      if (p.id === posToModifyId) {
-        // Posisi TARGET: Gunakan projected margin (size + additional) * currentPrice / leverage
-        totalProjectedMargin += ((p.size + additionalSize) * currentPrice) / leverage;
-        targetFound = true;
-      } else {
-        // Posisi NON-target: Gunakan currentPrice jika ada (Iterasi 5), fallback ke calculateMarginUsed
-        if (p.currentPrice !== undefined && p.currentPrice !== null) {
-          totalProjectedMargin += (p.size * p.currentPrice) / leverage;
-        } else {
-          totalProjectedMargin += calculateMarginUsed(p, leverage);
-        }
-      }
-    }
-  }
-  
-  // Jika posToModifyId tidak ditemukan (misal: entry baru), tambahkan projected margin
-  if (!targetFound) {
-    totalProjectedMargin += (additionalSize * currentPrice) / leverage;
-  }
-  
-  const equity = (wallet.equity && wallet.equity > 0) ? wallet.equity : wallet.balance;
-  return equity > 0 ? (totalProjectedMargin / equity) * 100 : 0;
-}
+// Moved to src/paper-engine/valuation.ts
 
 // SOP Helper: Check Spot Adverse Move > 4% (Legacy Only - SOP 4.2)
 function checkSpotAdverseMove(pos: any, currentPrice: number, resetTime: number): boolean {
@@ -1568,14 +1559,15 @@ async function runPaperTradingEngine() {
       console.log(`[PAPER] 🚨 LIQUIDATION TRIGGERED! Equity is ${wallet.equity}`);
       for (const pos of openPositions) {
         if (pos.status === 'OPEN') {
+          const historyId = `${pos.id}_liq_${Date.now()}`;
           const historyEntry = {
-            ...pos, exitPrice: pos.currentPrice || pos.entryPrice, pnl: pos.unrealizedPnl, reason: 'LIQUIDATION', closedAt: new Date().toISOString(), status: 'CLOSED'
-          };
+            ...pos, id: historyId, exitPrice: pos.currentPrice || pos.entryPrice, pnl: pos.unrealizedPnl, reason: 'LIQUIDATION', closedAt: new Date().toISOString(), status: 'CLOSED' as const
+          } as PaperHistory;
           
           cachedPaperHistory.unshift(historyEntry);
           if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
           
-          backgroundSyncFirestore(setDoc(doc(db, 'paper_history', pos.id), historyEntry));
+          backgroundSyncFirestore(setDoc(doc(db, 'paper_history', historyId), historyEntry));
           
           if (pos.journalId) {
             backgroundSyncFirestore(setDoc(doc(db, 'trading_journal', pos.journalId), {
@@ -1661,14 +1653,15 @@ async function runPaperTradingEngine() {
 
         // Helper to close position
         const closePos = async (pos: any, reason: string) => {
+          const historyId = `${pos.id}_close_${Date.now()}`;
           const historyEntry = {
-            ...pos, exitPrice: currentPrice, pnl: pos.currentPnl, reason, closedAt: new Date().toISOString(), status: 'CLOSED'
-          };
+            ...pos, id: historyId, exitPrice: currentPrice, pnl: pos.currentPnl, reason, closedAt: new Date().toISOString(), status: 'CLOSED' as const
+          } as PaperHistory;
           
           cachedPaperHistory.unshift(historyEntry);
           if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
           
-          backgroundSyncFirestore(setDoc(doc(db, 'paper_history', pos.id), historyEntry));
+          backgroundSyncFirestore(setDoc(doc(db, 'paper_history', historyId), historyEntry));
           
           if (pos.journalId) {
             backgroundSyncFirestore(setDoc(doc(db, 'trading_journal', pos.journalId), {
@@ -1694,8 +1687,8 @@ async function runPaperTradingEngine() {
           
           const historyId = `${pos.id}_partial_${Date.now()}`;
           const historyEntry = {
-            ...pos, size: sizeToClose, exitPrice: currentPrice, pnl: realizedPnl, reason, closedAt: new Date().toISOString(), status: 'CLOSED'
-          };
+            ...pos, id: historyId, size: sizeToClose, exitPrice: currentPrice, pnl: realizedPnl, reason, closedAt: new Date().toISOString(), status: 'CLOSED' as const
+          } as PaperHistory;
           
           cachedPaperHistory.unshift(historyEntry);
           if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
@@ -1742,8 +1735,8 @@ async function runPaperTradingEngine() {
           };
           backgroundSyncFirestore(setDoc(doc(db, 'trading_journal', journalId), journalEntry));
 
-          const newPos = {
-            id: newPosRef.id, symbol, side, entryPrice: currentPrice, size, unrealizedPnl: 0,
+          const newPos: PaperPosition = {
+            id: newPosRef.id, symbol, side: side as 'LONG' | 'SHORT', entryPrice: currentPrice, size, unrealizedPnl: 0,
             takeProfit: tpPrice,
             stopLoss: slPrice, 
             target1: signalData?.targets?.t1 || 0,
@@ -1785,67 +1778,103 @@ async function runPaperTradingEngine() {
         };
 
         // --- 0. EMERGENCY DE-RISK (MR > 25%) ---
+        type TradeDecision = 
+          | { action: 'CLOSE_POSITION'; targetPositionId: string; reason: string }
+          | { action: 'PARTIAL_CLOSE'; targetPositionId: string; size: number; reason: string }
+          | { action: 'MODIFY_POSITION'; targetPositionId: string; newSl: number; reason: string };
+        
+        const decisions: TradeDecision[] = [];
+
         if (wallet.isEmergencyDeRisking && wallet.marginRatio > 15) {
           if (longPos && shortPos) {
             // Hedged position: Unlock or Reduce the profitable leg
             if (longPos.currentPnl > 0) {
               if (longPos.size > shortPos.size) {
                 const excessSize = longPos.size - shortPos.size;
-                await partialClosePos(longPos, excessSize, 'Emergency De-Risk (Reduce Long to 1:1)');
+                decisions.push({ action: 'PARTIAL_CLOSE', targetPositionId: longPos.id, size: excessSize, reason: 'Emergency De-Risk (Reduce Long to 1:1)' });
               } else {
-                await closePos(longPos, 'Emergency De-Risk (Unlock Long)');
+                decisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Emergency De-Risk (Unlock Long)' });
                 longPos = undefined;
                 // Update shortPos SL to prevent immediate re-hedge
                 if (shortPos) {
                   const newSl = currentPrice * (1 + (setting.lockTriggerPct || 2.0) / 100);
-                  shortPos.stopLoss = newSl;
-                  backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { stopLoss: newSl }, { merge: true }));
+                  decisions.push({ action: 'MODIFY_POSITION', targetPositionId: shortPos.id, newSl, reason: 'Emergency De-Risk (Update SL)' });
                 }
               }
             } else if (shortPos.currentPnl > 0) {
               if (shortPos.size > longPos.size) {
                 const excessSize = shortPos.size - longPos.size;
-                await partialClosePos(shortPos, excessSize, 'Emergency De-Risk (Reduce Short to 1:1)');
+                decisions.push({ action: 'PARTIAL_CLOSE', targetPositionId: shortPos.id, size: excessSize, reason: 'Emergency De-Risk (Reduce Short to 1:1)' });
               } else {
-                await closePos(shortPos, 'Emergency De-Risk (Unlock Short)');
+                decisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Emergency De-Risk (Unlock Short)' });
                 shortPos = undefined;
                 // Update longPos SL to prevent immediate re-hedge
                 if (longPos) {
                   const newSl = currentPrice * (1 - (setting.lockTriggerPct || 2.0) / 100);
-                  longPos.stopLoss = newSl;
-                  backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { stopLoss: newSl }, { merge: true }));
+                  decisions.push({ action: 'MODIFY_POSITION', targetPositionId: longPos.id, newSl, reason: 'Emergency De-Risk (Update SL)' });
                 }
               }
             }
           } else if (longPos && !shortPos) {
             // Single leg: Close if profitable
             if (longPos.currentPnl > 0) {
-              await closePos(longPos, 'Emergency De-Risk (Take Profit Long)');
+              decisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Emergency De-Risk (Take Profit Long)' });
               longPos = undefined;
             }
           } else if (shortPos && !longPos) {
             // Single leg: Close if profitable
             if (shortPos.currentPnl > 0) {
-              await closePos(shortPos, 'Emergency De-Risk (Take Profit Short)');
+              decisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Emergency De-Risk (Take Profit Short)' });
               shortPos = undefined;
             }
           }
         }
 
+        // --- EXECUTION LOOP FOR 1C-1a ---
+        for (const decision of decisions) {
+          if (decision.action === 'CLOSE_POSITION') {
+            const pos = openPositions.find(p => p.id === decision.targetPositionId);
+            if (pos) await closePos(pos, decision.reason);
+          } else if (decision.action === 'PARTIAL_CLOSE') {
+            const pos = openPositions.find(p => p.id === decision.targetPositionId);
+            if (pos) await partialClosePos(pos, decision.size, decision.reason);
+          } else if (decision.action === 'MODIFY_POSITION') {
+            const pos = openPositions.find(p => p.id === decision.targetPositionId);
+            if (pos) pos.stopLoss = decision.newSl;
+            backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', decision.targetPositionId), { stopLoss: decision.newSl }, { merge: true }));
+          }
+        }
+
         // --- 1. EXIT LOGIC (Sentinel Targets) ---
+        const exitDecisions: TradeDecision[] = [];
+
         if (longPos && shortPos) {
-          const primaryPos = longPos.openedAt < shortPos.openedAt ? longPos : shortPos;
+          // TODO: Implement BEP_NET_PRICE calculation to account for fees and realized hedge profit
           
-          const realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + (shortPos.realizedHedgeProfit || 0);
-          const totalNetProfit = totalUnrealizedPnl + realizedHedgeProfit;
-          
-          // Exit hedge if total net profit is positive (BEP+)
-          if (totalNetProfit > 0) {
-            await closePos(longPos, 'Net Take Profit (Hedge Resolved)');
-            await closePos(shortPos, 'Net Take Profit (Hedge Resolved)');
-            longPos = undefined; shortPos = undefined;
-            const reclass = reclassifyState(longPos, shortPos, currentPrice);
-            console.log(`[PAPER] Post-Action Reclass (Hedge Resolved) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+          // Calculate Structural BEP_GROSS_PRICE
+          const currentStructure = classifyStructure(longPos.size, shortPos.size);
+          if (currentStructure !== 'LOCK_1TO1') {
+            const bepGross = ((longPos.size * longPos.entryPrice) - (shortPos.size * shortPos.entryPrice)) / (longPos.size - shortPos.size);
+            
+            let isAtBep = false;
+            if (longPos.size > shortPos.size) {
+              // Net LONG
+              isAtBep = currentPrice >= bepGross;
+            } else {
+              // Net SHORT
+              isAtBep = currentPrice <= bepGross;
+            }
+
+            if (isAtBep) {
+              exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Structural BEP Gross Reached (Hedge Resolved)' });
+              exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Structural BEP Gross Reached (Hedge Resolved)' });
+              longPos = undefined; shortPos = undefined;
+              const reclass = reclassifyState(longPos, shortPos, currentPrice);
+              console.log(`[PAPER] Post-Action Reclass (Hedge Resolved) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+            }
+          } else {
+            // LOCK_1TO1 (toleransi 0.95–1.05): skip BEP, tunggu perubahan struktur
+            console.log(`[PAPER] LOCK_1TO1 detected for ${symbol}, skip BEP calculation.`);
           }
         } else {
           if (longPos) {
@@ -1854,12 +1883,16 @@ async function runPaperTradingEngine() {
             const isAtSL = !setting.lock11Mode && longPos.stopLoss > 0 && currentPrice <= longPos.stopLoss;
             
             if (isAtTP) {
-              await closePos(longPos, 'Take Profit (Sentinel Target)');
-              longPos = undefined;
-              const reclass = reclassifyState(longPos, shortPos, currentPrice);
-              console.log(`[PAPER] Post-Action Reclass (TP) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+              if (longPos.currentPnl >= 0) {
+                exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Take Profit (Sentinel Target)' });
+                longPos = undefined;
+                const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                console.log(`[PAPER] Post-Action Reclass (TP) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+              } else {
+                console.log(`[PAPER] SKIP TP for ${symbol} LONG: Position is RED (currentPnl < 0). Golden Rule enforced.`);
+              }
             } else if (isAtSL) {
-              await closePos(longPos, 'Stop Loss (Sentinel Target)');
+              exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Stop Loss (Sentinel Target)' });
               longPos = undefined;
               const reclass = reclassifyState(longPos, shortPos, currentPrice);
               console.log(`[PAPER] Post-Action Reclass (SL) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
@@ -1871,12 +1904,16 @@ async function runPaperTradingEngine() {
             const isAtSL = !setting.lock11Mode && shortPos.stopLoss > 0 && currentPrice >= shortPos.stopLoss;
             
             if (isAtTP) {
-              await closePos(shortPos, 'Take Profit (Sentinel Target)');
-              shortPos = undefined;
-              const reclass = reclassifyState(longPos, shortPos, currentPrice);
-              console.log(`[PAPER] Post-Action Reclass (TP) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+              if (shortPos.currentPnl >= 0) {
+                exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Take Profit (Sentinel Target)' });
+                shortPos = undefined;
+                const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                console.log(`[PAPER] Post-Action Reclass (TP) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+              } else {
+                console.log(`[PAPER] SKIP TP for ${symbol} SHORT: Position is RED (currentPnl < 0). Golden Rule enforced.`);
+              }
             } else if (isAtSL) {
-              await closePos(shortPos, 'Stop Loss (Sentinel Target)');
+              exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Stop Loss (Sentinel Target)' });
               shortPos = undefined;
               const reclass = reclassifyState(longPos, shortPos, currentPrice);
               console.log(`[PAPER] Post-Action Reclass (SL) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
@@ -1884,256 +1921,358 @@ async function runPaperTradingEngine() {
           }
         }
 
-        // --- 2. HEDGE LOGIC (LOCK 1:1 - Based on Sentinel SL/Structure) ---
-        if (setting.lock11Mode) {
-          // Trigger hedge if price hits Stop Loss level instead of fixed %
-          if (longPos && !shortPos) {
-            const triggerHedge = longPos.stopLoss > 0 ? (currentPrice <= longPos.stopLoss) : (longPos.pnlPct <= -2.0);
-            if (triggerHedge) {
-              shortPos = await openPos('SHORT', longPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
-              const reclass = reclassifyState(longPos, shortPos, currentPrice);
-              console.log(`[PAPER] Post-Action Reclass (Hedge Trigger) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
-            }
-          } else if (shortPos && !longPos) {
-            const triggerHedge = shortPos.stopLoss > 0 ? (currentPrice >= shortPos.stopLoss) : (shortPos.pnlPct <= -2.0);
-            if (triggerHedge) {
-              longPos = await openPos('LONG', shortPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
-              const reclass = reclassifyState(longPos, shortPos, currentPrice);
-              console.log(`[PAPER] Post-Action Reclass (Hedge Trigger) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
-            }
+        // --- EXECUTION LOOP FOR HF Exit Logic ---
+        for (const decision of exitDecisions) {
+          if (decision.action === 'CLOSE_POSITION') {
+            const pos = openPositions.find(p => p.id === decision.targetPositionId);
+            if (pos) await closePos(pos, decision.reason);
+          } else if (decision.action === 'PARTIAL_CLOSE') {
+            const pos = openPositions.find(p => p.id === decision.targetPositionId);
+            if (pos) await partialClosePos(pos, decision.size, decision.reason);
+          } else if (decision.action === 'MODIFY_POSITION') {
+            const pos = openPositions.find(p => p.id === decision.targetPositionId);
+            if (pos) pos.stopLoss = decision.newSl;
+            backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', decision.targetPositionId), { stopLoss: decision.newSl }, { merge: true }));
           }
         }
 
-        // --- 3. ENTRY & ADD LOGIC (AI SIGNAL) ---
-        if (freshSignal && !wallet.isEmergencyDeRisking) {
-          const hasActed = (longPos?.signalId === freshSignal.id || shortPos?.signalId === freshSignal.id || longPos?.lastSignalId === freshSignal.id || shortPos?.lastSignalId === freshSignal.id);
-          
-          if (!hasActed) {
-            const historyExists = cachedPaperHistory.some(h => h.signalId === freshSignal.id);
-            if (!historyExists) {
-              const sideUpper = String(freshSignal.side).toUpperCase();
-              const signalSide = (sideUpper === 'BUY' || sideUpper === 'LONG') ? 'LONG' : 'SHORT';
-              
-              if (!longPos && !shortPos) {
-                // New Entry
-                if (wallet.freeMargin <= 0 || wallet.balance <= 0) {
-                  console.log(`[PAPER] Insufficient free margin to open new position for ${symbol}`);
-                } else {
-                  const entryMultiplier = setting.structure21Mode ? 2.0 : 1.0;
-                  let size = (wallet.balance / currentPrice) * entryMultiplier;
+        // --- 2. HEDGE LOGIC (LOCK 1:1 - Based on Sentinel SL/Structure) ---
+        // --- PAPER TRADING EVALUATOR SWITCH ONLY ---
+        const parityV2 = isParityV2Mode();
+
+        if (parityV2) {
+          // currentStructure, currentPrice, freshSignal, wallet, longPos, shortPos,
+          // stopHedgeHit, cachedPaperHistory, dll. diasumsikan sudah tersedia dari flow paper lama.
+          const currentStructure = classifyStructure(longPos ? longPos.size : 0, shortPos ? shortPos.size : 0);
+
+          const signalAlreadyActed = Boolean(
+            freshSignal &&
+            (
+              longPos?.signalId === freshSignal.id ||
+              shortPos?.signalId === freshSignal.id ||
+              longPos?.lastSignalId === freshSignal.id ||
+              shortPos?.lastSignalId === freshSignal.id
+            )
+          );
+
+          const historyHasSignal = Boolean(
+            freshSignal && cachedPaperHistory.some((h: any) => h.signalId === freshSignal.id)
+          );
+
+          const stopHedgeHit =
+            setting.lock11Mode
+              ? (
+                  (longPos && !shortPos
+                    ? (longPos.stopLoss > 0 ? currentPrice <= longPos.stopLoss : longPos.pnlPct <= -2.0)
+                    : false) ||
+                  (shortPos && !longPos
+                    ? (shortPos.stopLoss > 0 ? currentPrice >= shortPos.stopLoss : shortPos.pnlPct <= -2.0)
+                    : false)
+                )
+              : false;
+
+          const { inputState, parityResult } = await evaluateParityPaper({
+            symbol,
+            currentPrice,
+            freshSignal,
+            longPos,
+            shortPos,
+            wallet,
+            currentStructure,
+            stopHedgeHit,
+            historyHasSignal,
+            signalAlreadyActed,
+            mrProjected: wallet.marginRatio * 1.05,
+          });
+
+          addLog(
+            `[PARITY_V2] ${symbol} input=${JSON.stringify(inputState)} output=${JSON.stringify({
+              final_action: parityResult.final_action,
+              operational_action: parityResult.operational_action || null,
+              why_blocked: parityResult.why_blocked || null,
+              why_allowed: parityResult.why_allowed || null,
+            })}`
+          );
+
+          await executeParityPaperDecision({
+            symbol,
+            freshSignal,
+            longPos,
+            shortPos,
+            parityResult,
+            openPos: async (side, signal, sizeOverride) => {
+              const entryMultiplier = setting.structure21Mode ? 2.0 : 1.0;
+              let size = sizeOverride || ((wallet.balance / currentPrice) * entryMultiplier);
+              const maxAllowedSize = (wallet.balance * ((setting.maxMrPct || 25.0) / 100)) / currentPrice;
+              if (!sizeOverride && size > maxAllowedSize) size = maxAllowedSize;
+              if (size * currentPrice > 10) {
+                 if (side === 'LONG') longPos = await openPos('LONG', size, 'Parity OPEN_LONG', signal?.id || 'PARITY', signal);
+                 else shortPos = await openPos('SHORT', size, 'Parity OPEN_SHORT', signal?.id || 'PARITY', signal);
+              }
+            },
+            partialClosePos: async (pos, fraction, reason) => {
+              const reduceAmt = pos.size * fraction;
+              await partialClosePos(pos, reduceAmt, reason);
+            },
+            closePos: async (pos, reason) => {
+              await closePos(pos, reason);
+            },
+            addLog,
+          });
+
+          // lanjut ke symbol berikut; legacy branch tidak dipakai saat parity_v2 aktif
+          continue;
+        } else {
+          if (setting.lock11Mode) {
+            // Trigger hedge if price hits Stop Loss level instead of fixed %
+            if (longPos && !shortPos) {
+              const triggerHedge = longPos.stopLoss > 0 ? (currentPrice <= longPos.stopLoss) : (longPos.pnlPct <= -2.0);
+              if (triggerHedge) {
+                shortPos = await openPos('SHORT', longPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
+                const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                console.log(`[PAPER] Post-Action Reclass (Hedge Trigger) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+              }
+            } else if (shortPos && !longPos) {
+              const triggerHedge = shortPos.stopLoss > 0 ? (currentPrice >= shortPos.stopLoss) : (shortPos.pnlPct <= -2.0);
+              if (triggerHedge) {
+                longPos = await openPos('LONG', shortPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
+                const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                console.log(`[PAPER] Post-Action Reclass (Hedge Trigger) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+              }
+            }
+          }
+
+          // --- 3. ENTRY & ADD LOGIC (AI SIGNAL) ---
+          if (freshSignal && !wallet.isEmergencyDeRisking) {
+            const hasActed = (longPos?.signalId === freshSignal.id || shortPos?.signalId === freshSignal.id || longPos?.lastSignalId === freshSignal.id || shortPos?.lastSignalId === freshSignal.id);
+            
+            if (!hasActed) {
+              const historyExists = cachedPaperHistory.some(h => h.signalId === freshSignal.id);
+              if (!historyExists) {
+                const sideUpper = String(freshSignal.side).toUpperCase();
+                const signalSide = (sideUpper === 'BUY' || sideUpper === 'LONG') ? 'LONG' : 'SHORT';
+                
+                if (!longPos && !shortPos) {
+                  // New Entry
+                  if (wallet.freeMargin <= 0 || wallet.balance <= 0) {
+                    console.log(`[PAPER] Insufficient free margin to open new position for ${symbol}`);
+                  } else {
+                    const entryMultiplier = setting.structure21Mode ? 2.0 : 1.0;
+                    let size = (wallet.balance / currentPrice) * entryMultiplier;
+                    
+                    // Limit entry size based on maxMrPct
+                    const maxAllowedSize = (wallet.balance * ((setting.maxMrPct || 25.0) / 100)) / currentPrice;
+                    if (size > maxAllowedSize) size = maxAllowedSize;
+                    
+                    if (size * currentPrice > 10) { // Minimum trade size check
+                      if (signalSide === 'LONG') longPos = await openPos('LONG', size, 'AI Signal Entry', freshSignal.id, freshSignal);
+                      else shortPos = await openPos('SHORT', size, 'AI Signal Entry', freshSignal.id, freshSignal);
+                      const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                      console.log(`[PAPER] Post-Action Reclass (New Entry) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                      (freshSignal as any).reclass = reclass;
+                    }
+                  }
+                } else if (longPos && shortPos) {
+                  // Hedged Logic
                   
-                  // Limit entry size based on maxMrPct
-                  const maxAllowedSize = (wallet.balance * ((setting.maxMrPct || 25.0) / 100)) / currentPrice;
-                  if (size > maxAllowedSize) size = maxAllowedSize;
-                  
-                  if (size * currentPrice > 10) { // Minimum trade size check
-                    if (signalSide === 'LONG') longPos = await openPos('LONG', size, 'AI Signal Entry', freshSignal.id, freshSignal);
-                    else shortPos = await openPos('SHORT', size, 'AI Signal Entry', freshSignal.id, freshSignal);
+                  // A. Unlocking Logic (Close hedge if in profit and signal aligns)
+                  // HANYA BOLEH UNLOCK (Tutup posisi hedge) JIKA POSISI HEDGE TERSEBUT SEDANG PROFIT.
+                  if (signalSide === 'LONG' && shortPos.currentPnl > 0) {
+                    const realized = shortPos.currentPnl;
+                    await closePos(shortPos, 'Unlock (Hedge in Profit)');
+                    shortPos = undefined;
+                    if (longPos) {
+                      longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + realized;
+                      longPos.lastSignalId = freshSignal.id;
+                      backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { 
+                        realizedHedgeProfit: longPos.realizedHedgeProfit,
+                        lastSignalId: freshSignal.id
+                      }, { merge: true }));
+                    }
                     const reclass = reclassifyState(longPos, shortPos, currentPrice);
-                    console.log(`[PAPER] Post-Action Reclass (New Entry) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                    console.log(`[PAPER] Post-Action Reclass (Unlock Short) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                    (freshSignal as any).reclass = reclass;
+                  } else if (signalSide === 'SHORT' && longPos.currentPnl > 0) {
+                    const realized = longPos.currentPnl;
+                    await closePos(longPos, 'Unlock (Hedge in Profit)');
+                    longPos = undefined;
+                    if (shortPos) {
+                      shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + realized;
+                      shortPos.lastSignalId = freshSignal.id;
+                      backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { 
+                        realizedHedgeProfit: shortPos.realizedHedgeProfit,
+                        lastSignalId: freshSignal.id
+                      }, { merge: true }));
+                    }
+                    const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                    console.log(`[PAPER] Post-Action Reclass (Unlock Long) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
                     (freshSignal as any).reclass = reclass;
                   }
-                }
-              } else if (longPos && shortPos) {
-                // Hedged Logic
-                
-                // A. Unlocking Logic (Close hedge if in profit and signal aligns)
-                // HANYA BOLEH UNLOCK (Tutup posisi hedge) JIKA POSISI HEDGE TERSEBUT SEDANG PROFIT.
-                if (signalSide === 'LONG' && shortPos.currentPnl > 0) {
-                  const realized = shortPos.currentPnl;
-                  await closePos(shortPos, 'Unlock (Hedge in Profit)');
-                  shortPos = undefined;
-                  if (longPos) {
-                    longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + realized;
-                    longPos.lastSignalId = freshSignal.id;
-                    backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { 
-                      realizedHedgeProfit: longPos.realizedHedgeProfit,
-                      lastSignalId: freshSignal.id
-                    }, { merge: true }));
-                  }
-                  const reclass = reclassifyState(longPos, shortPos, currentPrice);
-                  console.log(`[PAPER] Post-Action Reclass (Unlock Short) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
-                  (freshSignal as any).reclass = reclass;
-                } else if (signalSide === 'SHORT' && longPos.currentPnl > 0) {
-                  const realized = longPos.currentPnl;
-                  await closePos(longPos, 'Unlock (Hedge in Profit)');
-                  longPos = undefined;
-                  if (shortPos) {
-                    shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + realized;
-                    shortPos.lastSignalId = freshSignal.id;
-                    backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { 
-                      realizedHedgeProfit: shortPos.realizedHedgeProfit,
-                      lastSignalId: freshSignal.id
-                    }, { merge: true }));
-                  }
-                  const reclass = reclassifyState(longPos, shortPos, currentPrice);
-                  console.log(`[PAPER] Post-Action Reclass (Unlock Long) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
-                  (freshSignal as any).reclass = reclass;
-                }
-                
-                if (longPos && shortPos) {
-                  const isLongProfit = longPos.currentPnl > 0;
-                  const isShortProfit = shortPos.currentPnl > 0;
-                  const isLongLoss = longPos.currentPnl < 0;
-                  const isShortLoss = shortPos.currentPnl < 0;
                   
-                  const baseSize = Math.min(longPos.size, shortPos.size);
-                  const additionalSize = baseSize * 0.5;
+                  if (longPos && shortPos) {
+                    const isLongProfit = longPos.currentPnl > 0;
+                    const isShortProfit = shortPos.currentPnl > 0;
+                    const isLongLoss = longPos.currentPnl < 0;
+                    const isShortLoss = shortPos.currentPnl < 0;
+                    
+                    const baseSize = Math.min(longPos.size, shortPos.size);
+                    const additionalSize = baseSize * 0.5;
 
-                  // SOP Reclassification & Guards
-                  let currentStructure = classifyStructure(longPos.size, shortPos.size);
-                  const mrNow = wallet.marginRatio;
-                  const mrProjectedUp2 = mrNow * 1.02;
-                  const mrProjectedUp5 = mrNow * 1.05;
-                  const mbrHigh = currentStructure === 'LOCK_1TO1' && mrProjectedUp5 >= 25;
-                  
-                  const adverseLong = checkSpotAdverseMove(longPos, currentPrice, paperTradingResetTime);
-                  const adverseShort = checkSpotAdverseMove(shortPos, currentPrice, paperTradingResetTime);
-                  const isAdverseMoveBlocked = adverseLong || adverseShort;
-                  
-                  const hasTrendData = freshSignal.trend && freshSignal.trend.primary4H && freshSignal.trend.status;
-                  const hasSmcData = freshSignal.smc && freshSignal.smc.validated;
-                  const isAmbiguous = !hasTrendData || !hasSmcData;
+                    // SOP Reclassification & Guards
+                    let currentStructure = classifyStructure(longPos.size, shortPos.size);
+                    const mrNow = wallet.marginRatio;
+                    const mrProjectedUp2 = mrNow * 1.02;
+                    const mrProjectedUp5 = mrNow * 1.05;
+                    const mbrHigh = currentStructure === 'LOCK_1TO1' && mrProjectedUp5 >= 25;
+                    
+                    const adverseLong = checkSpotAdverseMove(longPos, currentPrice, paperTradingResetTime);
+                    const adverseShort = checkSpotAdverseMove(shortPos, currentPrice, paperTradingResetTime);
+                    const isAdverseMoveBlocked = adverseLong || adverseShort;
+                    
+                    const hasTrendData = freshSignal.trend && freshSignal.trend.primary4H && freshSignal.trend.status;
+                    const hasSmcData = freshSignal.smc && freshSignal.smc.validated;
+                    const isAmbiguous = !hasTrendData || !hasSmcData;
 
-                  let actionTaken = false;
-                  let riskOverride = 'NONE';
+                    let actionTaken = false;
+                    let riskOverride = 'NONE';
 
-                  // B. Trend Reversal & Profit Taking (Salah Satu Leg Profit)
-                  // ATURAN MUTLAK: JANGAN PERNAH REDUCE/CUT LOSS PADA LEG MERAH. REDUCE HANYA PADA LEG HIJAU.
-                  if (signalSide === 'SHORT') { // Trend baru DOWN
-                    if (isLongProfit && isShortLoss && longPos.size > shortPos.size) {
-                      // Trend berbalik DOWN, LONG masih profit. REDUCE_LONG untuk amankan profit ke Lock 1:1.
-                      const excessSize = longPos.size - shortPos.size;
-                      const excessPnl = (currentPrice - longPos.entryPrice) * excessSize;
-                      if (excessPnl > 0) { // Pastikan bagian yang di-reduce profit
-                        await partialClosePos(longPos, excessSize, 'Reduce Long (Trend Reversed DOWN)');
-                        longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + excessPnl;
-                        longPos.lastSignalId = freshSignal.id;
-                        backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { 
-                          realizedHedgeProfit: longPos.realizedHedgeProfit,
-                          lastSignalId: freshSignal.id
-                        }, { merge: true }));
-                        longPos.size -= excessSize; // Post-action reclass
-                        actionTaken = true;
+                    // B. Trend Reversal & Profit Taking (Salah Satu Leg Profit)
+                    // ATURAN MUTLAK: JANGAN PERNAH REDUCE/CUT LOSS PADA LEG MERAH. REDUCE HANYA PADA LEG HIJAU.
+                    if (signalSide === 'SHORT') { // Trend baru DOWN
+                      if (isLongProfit && isShortLoss && longPos.size > shortPos.size) {
+                        // Trend berbalik DOWN, LONG masih profit. REDUCE_LONG untuk amankan profit ke Lock 1:1.
+                        const excessSize = longPos.size - shortPos.size;
+                        const excessPnl = (currentPrice - longPos.entryPrice) * excessSize;
+                        if (excessPnl > 0) { // Pastikan bagian yang di-reduce profit
+                          await partialClosePos(longPos, excessSize, 'Reduce Long (Trend Reversed DOWN)');
+                          longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + excessPnl;
+                          longPos.lastSignalId = freshSignal.id;
+                          backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { 
+                            realizedHedgeProfit: longPos.realizedHedgeProfit,
+                            lastSignalId: freshSignal.id
+                          }, { merge: true }));
+                          longPos.size -= excessSize; // Post-action reclass
+                          actionTaken = true;
+                        }
+                      } else if (isShortProfit && isLongLoss) {
+                        // Check for LOCK_EXIT_URGENCY (Margin-Aware Override) or structure21Mode
+                        const isTrendDown = hasTrendData && freshSignal.trend.primary4H === 'DOWN' && freshSignal.trend.status === 'CONTINUATION_CONFIRMED';
+                        const isSmcValidShort = hasSmcData && freshSignal.smc.bias === 'BEARISH' && currentPrice >= freshSignal.smc.low && currentPrice <= freshSignal.smc.high;
+                        
+                        const isLockExitUrgencyShort = currentStructure === 'LOCK_1TO1' && 
+                                                  mbrHigh && 
+                                                  (mrNow >= 23 || mrProjectedUp2 >= 25) &&
+                                                  isTrendDown && 
+                                                  isSmcValidShort &&
+                                                  !isAmbiguous;
+                        
+                        if (isAmbiguous && !isLockExitUrgencyShort) {
+                          riskOverride = 'AMBIGUITY_BLOCK';
+                          console.log(`[PAPER] Expansion blocked due to AMBIGUOUS signal metadata for ${symbol}`);
+                        } else if (isAdverseMoveBlocked) {
+                          riskOverride = 'ADVERSE_MOVE_BLOCK';
+                          console.log(`[PAPER] Expansion blocked due to adverse spot move > 4% for ${symbol}`);
+                        } else if (setting.structure21Mode || isLockExitUrgencyShort) {
+                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, shortPos.id, additionalSize, currentPrice, LEVERAGE);
+                          if (projectedMr < 25 && shortPos.size < baseSize * 2 && wallet.freeMargin > 0) {
+                            const reason = isLockExitUrgencyShort ? 'LOCK_EXIT_URGENCY (Margin-Aware Override)' : 'Add 0.5x to Short (Trend Continuation DOWN)';
+                            await addSize(shortPos, additionalSize, reason, freshSignal.id);
+                            shortPos.size += additionalSize; // Post-action reclass
+                            actionTaken = true;
+                          } else if (projectedMr >= 25) {
+                            riskOverride = 'MR_BLOCK';
+                            console.log(`[PAPER] Expansion blocked. Projected MR: ${projectedMr.toFixed(2)}% >= 25%`);
+                          }
+                        }
                       }
-                    } else if (isShortProfit && isLongLoss) {
-                      // Check for LOCK_EXIT_URGENCY (Margin-Aware Override) or structure21Mode
-                      const isTrendDown = hasTrendData && freshSignal.trend.primary4H === 'DOWN' && freshSignal.trend.status === 'CONTINUATION_CONFIRMED';
-                      const isSmcValidShort = hasSmcData && freshSignal.smc.bias === 'BEARISH' && currentPrice >= freshSignal.smc.low && currentPrice <= freshSignal.smc.high;
-                      
-                      const isLockExitUrgencyShort = currentStructure === 'LOCK_1TO1' && 
-                                                mbrHigh && 
-                                                (mrNow >= 23 || mrProjectedUp2 >= 25) &&
-                                                isTrendDown && 
-                                                isSmcValidShort &&
-                                                !isAmbiguous;
-                      
-                      if (isAmbiguous && !isLockExitUrgencyShort) {
+                    } else if (signalSide === 'LONG') { // Trend baru UP
+                      if (isShortProfit && isLongLoss && shortPos.size > longPos.size) {
+                        // Trend berbalik UP, SHORT masih profit. REDUCE_SHORT untuk amankan profit ke Lock 1:1.
+                        const excessSize = shortPos.size - longPos.size;
+                        const excessPnl = (shortPos.entryPrice - currentPrice) * excessSize;
+                        if (excessPnl > 0) { // Pastikan bagian yang di-reduce profit
+                          await partialClosePos(shortPos, excessSize, 'Reduce Short (Trend Reversed UP)');
+                          shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + excessPnl;
+                          shortPos.lastSignalId = freshSignal.id;
+                          backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { 
+                            realizedHedgeProfit: shortPos.realizedHedgeProfit,
+                            lastSignalId: freshSignal.id
+                          }, { merge: true }));
+                          shortPos.size -= excessSize; // Post-action reclass
+                          actionTaken = true;
+                        }
+                      } else if (isLongProfit && isShortLoss) {
+                        // Check for LOCK_EXIT_URGENCY (Margin-Aware Override) or structure21Mode
+                        const isTrendUp = hasTrendData && freshSignal.trend.primary4H === 'UP' && freshSignal.trend.status === 'CONTINUATION_CONFIRMED';
+                        const isSmcValidLong = hasSmcData && freshSignal.smc.bias === 'BULLISH' && currentPrice >= freshSignal.smc.low && currentPrice <= freshSignal.smc.high;
+                        
+                        const isLockExitUrgencyLong = currentStructure === 'LOCK_1TO1' && 
+                                                  mbrHigh && 
+                                                  (mrNow >= 23 || mrProjectedUp2 >= 25) &&
+                                                  isTrendUp && 
+                                                  isSmcValidLong &&
+                                                  !isAmbiguous;
+                        
+                        if (isAmbiguous && !isLockExitUrgencyLong) {
+                          riskOverride = 'AMBIGUITY_BLOCK';
+                          console.log(`[PAPER] Expansion blocked due to AMBIGUOUS signal metadata for ${symbol}`);
+                        } else if (isAdverseMoveBlocked) {
+                          riskOverride = 'ADVERSE_MOVE_BLOCK';
+                          console.log(`[PAPER] Expansion blocked due to adverse spot move > 4% for ${symbol}`);
+                        } else if (setting.structure21Mode || isLockExitUrgencyLong) {
+                          // Trend UP, LONG profit. ADD_LONG untuk struktur 2:1 (LONG 2, SHORT 1).
+                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, longPos.id, additionalSize, currentPrice, LEVERAGE);
+                          if (projectedMr < 25 && longPos.size < baseSize * 2 && wallet.freeMargin > 0) {
+                            const reason = isLockExitUrgencyLong ? 'LOCK_EXIT_URGENCY (Margin-Aware Override)' : 'Add 0.5x to Long (Trend Continuation UP)';
+                            await addSize(longPos, additionalSize, reason, freshSignal.id);
+                            longPos.size += additionalSize; // Post-action reclass
+                            actionTaken = true;
+                          } else if (projectedMr >= 25) {
+                            riskOverride = 'MR_BLOCK';
+                            console.log(`[PAPER] Expansion blocked. Projected MR: ${projectedMr.toFixed(2)}% >= 25%`);
+                          }
+                        }
+                      }
+                    }
+
+                    // C. Add 0.5 Mode (Jika kedua leg merah)
+                    if (!actionTaken && isLongLoss && isShortLoss && setting.add05Mode && wallet.freeMargin > 0) {
+                      if (isAmbiguous) {
                         riskOverride = 'AMBIGUITY_BLOCK';
-                        console.log(`[PAPER] Expansion blocked due to AMBIGUOUS signal metadata for ${symbol}`);
+                        console.log(`[PAPER] Recovery expansion blocked due to AMBIGUOUS signal metadata for ${symbol}`);
                       } else if (isAdverseMoveBlocked) {
                         riskOverride = 'ADVERSE_MOVE_BLOCK';
-                        console.log(`[PAPER] Expansion blocked due to adverse spot move > 4% for ${symbol}`);
-                      } else if (setting.structure21Mode || isLockExitUrgencyShort) {
-                        const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, shortPos.id, additionalSize, currentPrice, LEVERAGE);
-                        if (projectedMr < 25 && shortPos.size < baseSize * 2 && wallet.freeMargin > 0) {
-                          const reason = isLockExitUrgencyShort ? 'LOCK_EXIT_URGENCY (Margin-Aware Override)' : 'Add 0.5x to Short (Trend Continuation DOWN)';
-                          await addSize(shortPos, additionalSize, reason, freshSignal.id);
-                          shortPos.size += additionalSize; // Post-action reclass
-                          actionTaken = true;
-                        } else if (projectedMr >= 25) {
-                          riskOverride = 'MR_BLOCK';
-                          console.log(`[PAPER] Expansion blocked. Projected MR: ${projectedMr.toFixed(2)}% >= 25%`);
+                        console.log(`[PAPER] Recovery expansion blocked due to adverse spot move > 4% for ${symbol}`);
+                      } else {
+                        if (signalSide === 'LONG' && longPos.size < baseSize * 2) {
+                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, longPos.id, additionalSize, currentPrice, LEVERAGE);
+                          if (projectedMr < 25) {
+                            await addSize(longPos, additionalSize, `Add 0.5x to Long (Recovery Mode)`, freshSignal.id);
+                            longPos.size += additionalSize;
+                            actionTaken = true;
+                          } else {
+                            riskOverride = 'MR_BLOCK';
+                          }
+                        } else if (signalSide === 'SHORT' && shortPos.size < baseSize * 2) {
+                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, shortPos.id, additionalSize, currentPrice, LEVERAGE);
+                          if (projectedMr < 25) {
+                            await addSize(shortPos, additionalSize, `Add 0.5x to Short (Recovery Mode)`, freshSignal.id);
+                            shortPos.size += additionalSize;
+                            actionTaken = true;
+                          } else {
+                            riskOverride = 'MR_BLOCK';
+                          }
                         }
                       }
                     }
-                  } else if (signalSide === 'LONG') { // Trend baru UP
-                    if (isShortProfit && isLongLoss && shortPos.size > longPos.size) {
-                      // Trend berbalik UP, SHORT masih profit. REDUCE_SHORT untuk amankan profit ke Lock 1:1.
-                      const excessSize = shortPos.size - longPos.size;
-                      const excessPnl = (shortPos.entryPrice - currentPrice) * excessSize;
-                      if (excessPnl > 0) { // Pastikan bagian yang di-reduce profit
-                        await partialClosePos(shortPos, excessSize, 'Reduce Short (Trend Reversed UP)');
-                        shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + excessPnl;
-                        shortPos.lastSignalId = freshSignal.id;
-                        backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { 
-                          realizedHedgeProfit: shortPos.realizedHedgeProfit,
-                          lastSignalId: freshSignal.id
-                        }, { merge: true }));
-                        shortPos.size -= excessSize; // Post-action reclass
-                        actionTaken = true;
-                      }
-                    } else if (isLongProfit && isShortLoss) {
-                      // Check for LOCK_EXIT_URGENCY (Margin-Aware Override) or structure21Mode
-                      const isTrendUp = hasTrendData && freshSignal.trend.primary4H === 'UP' && freshSignal.trend.status === 'CONTINUATION_CONFIRMED';
-                      const isSmcValidLong = hasSmcData && freshSignal.smc.bias === 'BULLISH' && currentPrice >= freshSignal.smc.low && currentPrice <= freshSignal.smc.high;
-                      
-                      const isLockExitUrgencyLong = currentStructure === 'LOCK_1TO1' && 
-                                                mbrHigh && 
-                                                (mrNow >= 23 || mrProjectedUp2 >= 25) &&
-                                                isTrendUp && 
-                                                isSmcValidLong &&
-                                                !isAmbiguous;
-                      
-                      if (isAmbiguous && !isLockExitUrgencyLong) {
-                        riskOverride = 'AMBIGUITY_BLOCK';
-                        console.log(`[PAPER] Expansion blocked due to AMBIGUOUS signal metadata for ${symbol}`);
-                      } else if (isAdverseMoveBlocked) {
-                        riskOverride = 'ADVERSE_MOVE_BLOCK';
-                        console.log(`[PAPER] Expansion blocked due to adverse spot move > 4% for ${symbol}`);
-                      } else if (setting.structure21Mode || isLockExitUrgencyLong) {
-                        // Trend UP, LONG profit. ADD_LONG untuk struktur 2:1 (LONG 2, SHORT 1).
-                        const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, longPos.id, additionalSize, currentPrice, LEVERAGE);
-                        if (projectedMr < 25 && longPos.size < baseSize * 2 && wallet.freeMargin > 0) {
-                          const reason = isLockExitUrgencyLong ? 'LOCK_EXIT_URGENCY (Margin-Aware Override)' : 'Add 0.5x to Long (Trend Continuation UP)';
-                          await addSize(longPos, additionalSize, reason, freshSignal.id);
-                          longPos.size += additionalSize; // Post-action reclass
-                          actionTaken = true;
-                        } else if (projectedMr >= 25) {
-                          riskOverride = 'MR_BLOCK';
-                          console.log(`[PAPER] Expansion blocked. Projected MR: ${projectedMr.toFixed(2)}% >= 25%`);
-                        }
-                      }
+                    
+                    // Post-Action Reclassification (SOP 6.6)
+                    if (actionTaken || riskOverride !== 'NONE') {
+                      const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                      console.log(`[PAPER] Post-Action Reclass for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}, RiskOverride=${riskOverride}`);
+                      (freshSignal as any).reclass = reclass;
+                      (freshSignal as any).riskOverride = riskOverride;
                     }
-                  }
-
-                  // C. Add 0.5 Mode (Jika kedua leg merah)
-                  if (!actionTaken && isLongLoss && isShortLoss && setting.add05Mode && wallet.freeMargin > 0) {
-                    if (isAmbiguous) {
-                      riskOverride = 'AMBIGUITY_BLOCK';
-                      console.log(`[PAPER] Recovery expansion blocked due to AMBIGUOUS signal metadata for ${symbol}`);
-                    } else if (isAdverseMoveBlocked) {
-                      riskOverride = 'ADVERSE_MOVE_BLOCK';
-                      console.log(`[PAPER] Recovery expansion blocked due to adverse spot move > 4% for ${symbol}`);
-                    } else {
-                      if (signalSide === 'LONG' && longPos.size < baseSize * 2) {
-                        const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, longPos.id, additionalSize, currentPrice, LEVERAGE);
-                        if (projectedMr < 25) {
-                          await addSize(longPos, additionalSize, `Add 0.5x to Long (Recovery Mode)`, freshSignal.id);
-                          longPos.size += additionalSize;
-                          actionTaken = true;
-                        } else {
-                          riskOverride = 'MR_BLOCK';
-                        }
-                      } else if (signalSide === 'SHORT' && shortPos.size < baseSize * 2) {
-                        const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, shortPos.id, additionalSize, currentPrice, LEVERAGE);
-                        if (projectedMr < 25) {
-                          await addSize(shortPos, additionalSize, `Add 0.5x to Short (Recovery Mode)`, freshSignal.id);
-                          shortPos.size += additionalSize;
-                          actionTaken = true;
-                        } else {
-                          riskOverride = 'MR_BLOCK';
-                        }
-                      }
-                    }
-                  }
-                  
-                  // Post-Action Reclassification (SOP 6.6)
-                  if (actionTaken || riskOverride !== 'NONE') {
-                    const reclass = reclassifyState(longPos, shortPos, currentPrice);
-                    console.log(`[PAPER] Post-Action Reclass for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}, RiskOverride=${riskOverride}`);
-                    (freshSignal as any).reclass = reclass;
-                    (freshSignal as any).riskOverride = riskOverride;
                   }
                 }
               }
@@ -2710,8 +2849,8 @@ async function archivePaperTradingData() {
     const historySnap = await getDocs(collection(db, 'paper_history'));
     const journalSnap = await getDocs(collection(db, 'trading_journal'));
     
-    const history = historySnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    const journal = journalSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    const history = historySnap.docs.map(doc => ({ ...doc.data(), id: doc.id }));
+    const journal = journalSnap.docs.map(doc => ({ ...doc.data(), id: doc.id }));
     
     if (history.length === 0 && journal.length === 0) {
       addLog("ℹ️ No paper trading data found to archive.");
@@ -2807,7 +2946,24 @@ app.get('/api/debug-env', (req, res) => {
 });
 
 app.get('/api/journal', async (req, res) => {
-  res.json({ journal: cachedTradingJournal });
+  const currentJournal = await withFirestoreFailSoft(
+    async () => {
+      return cachedTradingJournal;
+    },
+    [],
+    (err) => {
+      console.error('[api/journal] Firestore fail-soft:', err?.message || err);
+    }
+  );
+
+  if (!currentJournal.length && process.env.FIRESTORE_REQUIRED !== '1') {
+    return res.status(200).json({
+      journal: [],
+      ...jsonDegraded('FIRESTORE_UNAVAILABLE', 'Journal unavailable, returning degraded empty data', [])
+    });
+  }
+
+  return res.status(200).json({ journal: currentJournal });
 });
 
 app.post('/api/journal/sync', async (req, res) => {
@@ -3012,12 +3168,48 @@ app.post('/api/bot/force-run', (req, res) => {
   res.json({ success: true, message: `Bot run started in background (force: ${force})` });
 });
 
-app.get('/api/signals', (req, res) => {
-  res.json(signals);
+app.get('/api/signals', async (_req, res) => {
+  const currentSignals = await withFirestoreFailSoft(
+    async () => {
+      return signals;
+    },
+    [],
+    (err) => {
+      console.error('[api/signals] Firestore fail-soft:', err?.message || err);
+    }
+  );
+
+  if (!currentSignals.length && process.env.FIRESTORE_REQUIRED !== '1') {
+    return res.status(200).json(
+      jsonDegraded('FIRESTORE_UNAVAILABLE', 'Signals unavailable, returning degraded empty data', [])
+    );
+  }
+
+  return res.status(200).json(currentSignals);
 });
 
-app.get('/api/chats', (req, res) => {
-  res.json(cachedChats);
+app.get('/api/debug/last-signals-raw', (req, res) => {
+  res.json({ raw: lastRawNewSignals });
+});
+
+app.get('/api/chats', async (req, res) => {
+  const currentChats = await withFirestoreFailSoft(
+    async () => {
+      return cachedChats;
+    },
+    [],
+    (err) => {
+      console.error('[api/chats] Firestore fail-soft:', err?.message || err);
+    }
+  );
+
+  if (!currentChats.length && process.env.FIRESTORE_REQUIRED !== '1') {
+    return res.status(200).json(
+      jsonDegraded('FIRESTORE_UNAVAILABLE', 'Chats unavailable, returning degraded empty data', [])
+    );
+  }
+
+  return res.status(200).json(currentChats);
 });
 
 // Helper to fetch account risk data
@@ -3560,9 +3752,9 @@ async function startServer() {
                     if (db) setDoc(doc(db, 'paper_positions', posToReduce.id), { size: posToReduce.size, unrealizedPnl: posToReduce.unrealizedPnl }, { merge: true }).catch(console.error);
                 }
                 
-                const historyEntry = {
+                const historyEntry: PaperHistory = {
                     id: `${posToReduce.id}_partial_${Date.now()}`,
-                    symbol, side: targetLeg, size: quantity, entryPrice: posToReduce.entryPrice, exitPrice: currentPrice, pnl: realizedPnl, reason: `Manual ${action}`, closedAt: new Date().toISOString(), status: 'CLOSED'
+                    symbol, side: targetLeg as 'LONG' | 'SHORT', size: quantity, entryPrice: posToReduce.entryPrice, exitPrice: currentPrice, pnl: realizedPnl, reason: `Manual ${action}`, closedAt: new Date().toISOString(), status: 'CLOSED' as const
                 };
                 cachedPaperHistory.unshift(historyEntry);
                 if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
@@ -3584,11 +3776,11 @@ async function startServer() {
             } else {
                 // Open New
                 const newPosRefId = `paper_pos_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-                const newPos = {
-                    id: newPosRefId, symbol, side: targetLeg, entryPrice: currentPrice, size: quantity, unrealizedPnl: 0, currentPnl: 0,
+                const newPos: PaperPosition = {
+                    id: newPosRefId, symbol, side: targetLeg as 'LONG' | 'SHORT', entryPrice: currentPrice, size: quantity, unrealizedPnl: 0, currentPnl: 0,
                     takeProfit: targetPrice || (targetLeg === 'LONG' ? currentPrice * 1.04 : currentPrice * 0.96), // Default 4% TP if not provided
                     stopLoss: stopHedgePrice || 0,
-                    status: 'OPEN', openedAt: new Date().toISOString(), isHedge: action.includes('LOCK') || action.includes('HEDGE')
+                    status: 'OPEN' as const, openedAt: new Date().toISOString(), isHedge: action.includes('LOCK') || action.includes('HEDGE')
                 };
                 cachedPaperPositions.push(newPos);
                 if (db) setDoc(doc(db, 'paper_positions', newPosRefId), newPos).catch(console.error);

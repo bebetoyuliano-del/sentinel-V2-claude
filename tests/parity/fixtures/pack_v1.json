@@ -1,0 +1,11 @@
+{
+  "pack_id": "scenario-fixture-pack-v1",
+  "title": "Scenario Fixture Pack v1 — SR-03, SR-07, SR-08, SR-09",
+  "phase": "PAPER-SOP-PT-1",
+  "fixtures": [
+    "SR-08.json",
+    "SR-03.json",
+    "SR-07.json",
+    "SR-09.json"
+  ]
+}

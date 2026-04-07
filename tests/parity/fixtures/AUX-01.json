@@ -1,0 +1,48 @@
+{
+  "scenario_id": "AUX-01",
+  "meta": {
+    "title": "Unlock Only If Hedge Leg Profit",
+    "priority": "P0",
+    "category": "golden_rule_block"
+  },
+  "input_state": {
+    "market": {
+      "symbol": "ETH/USDT",
+      "price": 3100,
+      "PrimaryTrend4H": "UP",
+      "TrendStatus": "CONTINUATION_CONFIRMED",
+      "Bias4H": "UP",
+      "Bias1H": "UP",
+      "spot_adverse_move_pct": 0,
+      "recovery_suspended": false,
+      "ambiguity_flags": []
+    },
+    "position": {
+      "Structure": "LOCK_1TO1",
+      "ContextMode": "LOCK_WAIT_SEE",
+      "GreenLeg": "LONG",
+      "RedLeg": "SHORT",
+      "HedgeLeg": "SHORT",
+      "HedgeLegStatus": "HEDGE_FULL",
+      "requested_action": "UNLOCK"
+    },
+    "risk": {
+      "MRNow": 10.0,
+      "MRProjected": 10.0,
+      "RiskOverride": "NONE"
+    }
+  },
+  "expected": {
+    "final_action": "HOLD",
+    "blocked_actions": [
+      "UNLOCK"
+    ],
+    "expected_post_state": {
+      "Structure": "LOCK_1TO1",
+      "ContextMode": "LOCK_WAIT_SEE",
+      "HedgeLegStatus": "HEDGE_FULL",
+      "RiskOverride": "NONE",
+      "WhyBlocked": "GOLDEN_RULE_NO_UNLOCK_RED_HEDGE"
+    }
+  }
+}
