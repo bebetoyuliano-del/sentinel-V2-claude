@@ -2280,14 +2280,47 @@ async function runPaperTradingEngine() {
           }
         }
 
-        // Update Unrealized PnL in Memory ONLY (Saves massive Firestore writes/reads)
+        // Update Unrealized PnL in Memory
         if (longPos) {
           const idx = cachedPaperPositions.findIndex(p => p.id === longPos.id);
-          if (idx >= 0) cachedPaperPositions[idx].unrealizedPnl = longPos.currentPnl;
+          if (idx >= 0) {
+            cachedPaperPositions[idx].unrealizedPnl = longPos.currentPnl;
+            cachedPaperPositions[idx].currentPrice = currentPrice;
+          }
         }
         if (shortPos) {
           const idx = cachedPaperPositions.findIndex(p => p.id === shortPos.id);
-          if (idx >= 0) cachedPaperPositions[idx].unrealizedPnl = shortPos.currentPnl;
+          if (idx >= 0) {
+            cachedPaperPositions[idx].unrealizedPnl = shortPos.currentPnl;
+            cachedPaperPositions[idx].currentPrice = currentPrice;
+          }
+        }
+
+        // Update Firestore for UI visibility (Monitoring & Positions)
+        if (db) {
+          const monitoringData = {
+            symbol,
+            currentPrice,
+            trend: freshSignal?.trend?.status || 'NEUTRAL',
+            plan: parityV2 ? (parityResult?.final_action || 'MONITORING') : 'MONITORING',
+            nextAction: parityV2 ? (parityResult?.operational_action || 'HOLD') : 'NONE',
+            updatedAt: new Date().toISOString()
+          };
+          backgroundSyncFirestore(setDoc(monitoringRef, monitoringData));
+          
+          if (longPos) {
+            backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { 
+              unrealizedPnl: longPos.currentPnl, 
+              currentPrice: currentPrice 
+            }, { merge: true }));
+          }
+          if (shortPos) {
+            backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { 
+              unrealizedPnl: shortPos.currentPnl, 
+              currentPrice: currentPrice 
+            }, { merge: true }));
+          }
+          updateWalletState();
         }
 
         // Update Monitoring Plan in Memory ONLY
