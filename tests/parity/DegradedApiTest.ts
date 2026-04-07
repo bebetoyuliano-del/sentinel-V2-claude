@@ -1,32 +1,10 @@
-import express from 'express';
 import axios from 'axios';
-import { withFirestoreFailSoft, jsonDegraded, markFirestoreUnavailable } from '../../src/paper-engine/firestore_failsoft.js';
-
-const app = express();
-
-app.get('/api/test-degraded', async (req, res) => {
-  const mockFirestoreCall = async () => {
-    throw new Error("Quota exceeded.");
-  };
-
-  const result = await withFirestoreFailSoft(
-    mockFirestoreCall,
-    [],
-    (err) => {}
-  );
-
-  if (!result.length) {
-    return res.status(200).json(
-      jsonDegraded('FIRESTORE_UNAVAILABLE', 'Data unavailable, returning degraded empty data', [])
-    );
-  }
-
-  return res.status(200).json(result);
-});
+import { app } from '../../server.js';
+import { markFirestoreUnavailable } from '../../src/paper-engine/firestore_failsoft.js';
 
 async function runTest() {
   console.log("==================================================");
-  console.log("[SMOKE B] DEGRADED API TEST");
+  console.log("[SMOKE B] DEGRADED API TEST (ACTUAL ENDPOINT)");
   console.log("==================================================");
   
   const server = app.listen(0, async () => {
@@ -37,9 +15,9 @@ async function runTest() {
     markFirestoreUnavailable(60_000); // Force degraded mode
     
     // 2. Call API
-    console.log(`2. Calling http://localhost:${port}/api/test-degraded...`);
+    console.log(`2. Calling http://localhost:${port}/api/signals...`);
     try {
-      const response = await axios.get(`http://localhost:${port}/api/test-degraded`);
+      const response = await axios.get(`http://localhost:${port}/api/signals`);
       
       console.log("   -> Status:", response.status);
       console.log("   -> Content-Type:", response.headers['content-type']);
@@ -52,8 +30,13 @@ async function runTest() {
       }
     } catch (err: any) {
       console.log("   -> Error:", err.message);
+      if (err.response) {
+        console.log("   -> Response Status:", err.response.status);
+        console.log("   -> Response Body:", err.response.data);
+      }
     } finally {
       server.close();
+      process.exit(0);
     }
   });
 }

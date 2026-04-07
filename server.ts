@@ -5212,4 +5212,12 @@ app.listen(PORT, '0.0.0.0', async () => {
   });
 }
 
-startServer();
+export { app };
+
+const isESMMain = typeof import.meta !== 'undefined' && import.meta.url === `file://${process.argv[1]}`;
+const isCJSMain = typeof require !== 'undefined' && require.main === module;
+const isProd = process.env.NODE_ENV === 'production' && process.argv[1]?.endsWith('server.cjs');
+
+if (isESMMain || isCJSMain || isProd) {
+  startServer();
+}
