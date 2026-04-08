@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc:*)",
+      "Bash(ls *.json)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(npm install:*)",
+      "Bash(npx jest:*)",
+      "Bash(PAPER_ENGINE_MODE=parity_v2 npx tsx tests/parity/RegressionBatchRunner.ts)",
+      "Bash(npx tsx:*)"
+    ]
+  }
+}

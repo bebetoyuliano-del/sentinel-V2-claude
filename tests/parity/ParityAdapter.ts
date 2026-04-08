@@ -1,3 +1,5 @@
+import { verifySignalPayload } from '../../src/paper-engine/signal_gate';
+
 export class ParityAdapter {
   static evaluate(inputState: any): any {
     const { market, position, risk } = inputState;
@@ -142,7 +144,34 @@ export class ParityAdapter {
       }
     }
 
-    // 5. Routing Logic (Only if not blocked)
+    // 5. Signal Payload Verification Gate
+    // Active only when called from parity_v2 path. Runs AFTER all Sentinel guards
+    // (Golden Rule, MR, Ambiguity, Chop) and BEFORE routing logic.
+    // FAIL / INSUFFICIENT → force HOLD safe posture, do not route.
+    // PASS / WARN         → proceed to routing as normal.
+    if (!isBlocked && process.env.PAPER_ENGINE_MODE === 'parity_v2') {
+      const rawSignalPayload = (inputState as any)._rawSignal ?? null;
+      const gateResult = verifySignalPayload(rawSignalPayload, inputState);
+
+      console.log('[SIGNAL_GATE]', JSON.stringify({
+        symbol:              inputState?.market?.symbol,
+        verificationStatus:  gateResult.verificationStatus,
+        safeToEvaluate:      gateResult.safeToEvaluateInParity,
+        issueCount:          gateResult.issues.length,
+        sentinelRulesAtRisk: gateResult.sentinelRuleAtRisk,
+        auditHints:          gateResult.auditHints,
+        timestamp:           gateResult.timestamp,
+      }));
+
+      if (!gateResult.safeToEvaluateInParity) {
+        result.blocked_actions.push(currentAction);
+        currentAction = 'HOLD';
+        whyBlocked = `SIGNAL_GATE_${gateResult.verificationStatus}`;
+        isBlocked = true;
+      }
+    }
+
+    // 6. Routing Logic (Only if not blocked)
     if (!isBlocked) {
       if (position.stop_hedge_hit === true && position.Structure === "SINGLE") {
         currentAction = "LOCK_NEUTRAL";
