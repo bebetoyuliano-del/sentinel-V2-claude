@@ -1100,9 +1100,11 @@ async function monitorMarkets(force = false) {
     // Fetch recent backtest results
     let recentBacktests: any[] = [];
     try {
-      const q = query(collection(db, 'backtests'), orderBy('timestamp', 'desc'), limit(5));
-      const backtestsSnapshot = await getDocs(q);
-      recentBacktests = backtestsSnapshot.docs.map(doc => doc.data());
+      recentBacktests = await withFirestoreFailSoft(async () => {
+        const q = query(collection(db, 'backtests'), orderBy('timestamp', 'desc'), limit(5));
+        const backtestsSnapshot = await getDocs(q);
+        return backtestsSnapshot.docs.map(doc => doc.data());
+      }, []);
     } catch (e) {
       console.error('Error fetching backtest results:', e);
     }
@@ -1324,7 +1326,7 @@ async function monitorMarkets(force = false) {
                   why_this_pair: sig.why_this_pair,
                   sentiment: sig.sentiment,
                   trend: sig.trend,
-                  smc: sig.smc
+                  smc: sig.smc || (sig as any).confluence?.smc || null
                 };
                 signals.unshift(newSignal);
 
@@ -1990,6 +1992,9 @@ async function runPaperTradingEngine() {
                 )
               : false;
 
+          console.log(`[PARITY DEBUG] Symbol: ${symbol}`);
+          console.log(`[PARITY DEBUG] freshSignal.smc:`, freshSignal ? JSON.stringify(freshSignal.smc) : 'No freshSignal');
+
           const { inputState, parityResult } = await evaluateParityPaper({
             symbol,
             currentPrice,
@@ -2067,8 +2072,6 @@ async function runPaperTradingEngine() {
             addLog,
           });
 
-          // lanjut ke symbol berikut; legacy branch tidak dipakai saat parity_v2 aktif
-          continue;
         } else {
           if (setting.lock11Mode) {
             // Trigger hedge if price hits Stop Loss level instead of fixed %
@@ -2372,22 +2375,30 @@ async function runPaperTradingEngine() {
 
         // Update Monitoring Plan in Memory ONLY
         let plan = 'Waiting for AI Signal...';
-        if (longPos && shortPos) {
-          const realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + (shortPos.realizedHedgeProfit || 0);
-          const totalNetProfit = totalUnrealizedPnl + realizedHedgeProfit;
-          plan = `Hedged (Lock 1:1). Net PnL: $${totalNetProfit.toFixed(2)}. Waiting for Net TP or Add Signal.`;
-        } else if (longPos || shortPos) {
-          const pos = longPos || shortPos;
-          const realizedHedgeProfit = pos.realizedHedgeProfit || 0;
-          const totalNetProfit = pos.currentPnl + realizedHedgeProfit;
-          const tpPrice = pos.takeProfit || 0;
-          const slPrice = pos.stopLoss || 0;
-          plan = `Monitoring ${pos.side} for Sentinel TP ($${tpPrice.toFixed(2)}). Net PnL: $${totalNetProfit.toFixed(2)}. SL: $${slPrice.toFixed(2)}.`;
+        let nextAction = 'NONE';
+        let trend = freshSignal?.trend?.status || 'NEUTRAL';
+
+        if (parityV2) {
+          plan = currentParityResult?.final_action || 'MONITORING';
+          nextAction = currentParityResult?.operational_action || 'HOLD';
+        } else {
+          if (longPos && shortPos) {
+            const realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + (shortPos.realizedHedgeProfit || 0);
+            const totalNetProfit = totalUnrealizedPnl + realizedHedgeProfit;
+            plan = `Hedged (Lock 1:1). Net PnL: $${totalNetProfit.toFixed(2)}. Waiting for Net TP or Add Signal.`;
+          } else if (longPos || shortPos) {
+            const pos = longPos || shortPos;
+            const realizedHedgeProfit = pos.realizedHedgeProfit || 0;
+            const totalNetProfit = pos.currentPnl + realizedHedgeProfit;
+            const tpPrice = pos.takeProfit || 0;
+            const slPrice = pos.stopLoss || 0;
+            plan = `Monitoring ${pos.side} for Sentinel TP ($${tpPrice.toFixed(2)}). Net PnL: $${totalNetProfit.toFixed(2)}. SL: $${slPrice.toFixed(2)}.`;
+          }
         }
         
         const monitorId = symbol.replace('/', '_');
         const existingMonitorIndex = cachedPaperMonitoring.findIndex(m => m.id === monitorId);
-        const monitorData = { id: monitorId, symbol, timeframe, currentPrice, plan, updatedAt: new Date().toISOString() };
+        const monitorData = { id: monitorId, symbol, timeframe, currentPrice, plan, nextAction, trend, updatedAt: new Date().toISOString() };
         
         if (existingMonitorIndex >= 0) {
           cachedPaperMonitoring[existingMonitorIndex] = { ...cachedPaperMonitoring[existingMonitorIndex], ...monitorData };
@@ -2411,6 +2422,40 @@ async function runPaperTradingEngine() {
 }
 
 // API Routes
+async function syncPaperPrices() {
+  if (cachedPaperPositions.length === 0) return;
+  
+  try {
+    const symbols = Array.from(new Set(cachedPaperPositions.map(p => p.symbol)));
+    const tickers = await binance.fetchTickers(symbols);
+    
+    let totalUnrealized = 0;
+    let totalMarginUsed = 0;
+    const LEVERAGE = 20;
+
+    for (const pos of cachedPaperPositions) {
+      if (pos.status === 'OPEN' && tickers[pos.symbol]) {
+        const currentPrice = tickers[pos.symbol].last;
+        if (currentPrice) {
+          pos.currentPrice = currentPrice;
+          const priceDiff = pos.side === 'LONG' ? currentPrice - pos.entryPrice : pos.entryPrice - currentPrice;
+          pos.unrealizedPnl = priceDiff * pos.size;
+        }
+        totalUnrealized += (pos.unrealizedPnl || 0);
+        totalMarginUsed += calculateMarginUsed(pos, LEVERAGE);
+      }
+    }
+
+    cachedPaperWallet.equity = cachedPaperWallet.balance + totalUnrealized;
+    cachedPaperWallet.freeMargin = cachedPaperWallet.equity - totalMarginUsed;
+    cachedPaperWallet.marginRatio = cachedPaperWallet.equity > 0 ? (totalMarginUsed / cachedPaperWallet.equity) * 100 : 0;
+    cachedPaperWallet.updatedAt = new Date().toISOString();
+
+  } catch (err) {
+    console.error('[PAPER] Error syncing prices:', err);
+  }
+}
+
 // Backtesting Engine Logic
 async function runBacktest(
   symbol: string, 
@@ -3186,6 +3231,7 @@ app.get('/api/paper/status', (req, res) => {
 app.get('/api/paper/wallet', async (req, res) => {
   try {
     await ensureAuth();
+    await syncPaperPrices();
     res.json(cachedPaperWallet);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -3195,6 +3241,7 @@ app.get('/api/paper/wallet', async (req, res) => {
 app.get('/api/paper/positions', async (req, res) => {
   try {
     await ensureAuth();
+    await syncPaperPrices();
     res.json(cachedPaperPositions);
   } catch (error: any) {
     res.status(500).json({ error: error.message });

@@ -202,10 +202,11 @@ export default function App() {
             });
           }
         } catch (err: any) {
-          console.error("Error fetching user doc:", err);
           if (err.message && err.message.includes('Quota limit exceeded')) {
             console.warn("Firebase Quota Exceeded. Running in offline mode.");
             setIsOfflineMode(true);
+          } else {
+            console.error("Error fetching user doc:", err);
           }
         }
       }

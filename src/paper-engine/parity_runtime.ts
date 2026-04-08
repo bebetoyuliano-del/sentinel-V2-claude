@@ -282,8 +282,10 @@ export function buildParityInputState(args: BuildParityInputArgs) {
     ambiguity_flags.push('MISSING_TREND_METADATA');
   }
 
-  if (!freshSignal?.smc?.validated) {
+  if (!freshSignal?.smc) {
     ambiguity_flags.push('MISSING_SMC_METADATA');
+  } else if (freshSignal.smc.validated === false) {
+    ambiguity_flags.push('SMC_NOT_VALIDATED');
   }
 
   const { GreenLeg, RedLeg } = deriveLegState(longPos, shortPos);
