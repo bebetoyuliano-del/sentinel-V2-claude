@@ -2434,8 +2434,9 @@ async function syncPaperPrices() {
     const LEVERAGE = 20;
 
     for (const pos of cachedPaperPositions) {
-      if (pos.status === 'OPEN' && tickers[pos.symbol]) {
-        const currentPrice = tickers[pos.symbol].last;
+      const ticker = tickers[pos.symbol] || tickers[`${pos.symbol}:USDT`];
+      if (pos.status === 'OPEN' && ticker) {
+        const currentPrice = ticker.last;
         if (currentPrice) {
           pos.currentPrice = currentPrice;
           const priceDiff = pos.side === 'LONG' ? currentPrice - pos.entryPrice : pos.entryPrice - currentPrice;
