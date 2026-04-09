@@ -1251,11 +1251,29 @@ async function monitorMarkets(force = false) {
 
       console.log(`[DC-TRACE] ${symbol} | gemini=${geminiAction} | parity=${parityAction} | status=${traceStatus}`);
 
-      // DC-2: Soft Override (DEFER sampai DC-1 validated)
-      // if (parityDecision && parityAction) {
-      //   card.action_now.action = parityAction;
-      //   // ... override fields lain
-      // }
+      // DC-2: Soft Override
+      if (parityDecision && parityAction) {
+        // Override action
+        if (card.action_now) {
+          card.action_now.action = parityAction;
+
+          // Derive percentage from action
+          const percentage = parityAction.includes('0.5') ? 0.5 : 1.0;
+          card.action_now.percentage = percentage;
+
+          console.log(`[DC-2-OVERRIDE] ${symbol} | action: ${geminiAction} → ${parityAction}`);
+        }
+
+        // Override buttons (if structure exists)
+        if (card.buttons) {
+          // Sync blocked from whyBlocked
+          if (parityDecision.whyBlocked) {
+            card.buttons.block = parityDecision.whyBlocked;
+          }
+        }
+      } else {
+        console.log(`[DC-2-FALLBACK] ${symbol} | Using Gemini (parity unavailable)`);
+      }
     }
 
     // Baris 1234 — composeExcelRows tetap jalan dengan cards yang sudah di-trace/override
