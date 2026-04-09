@@ -1410,9 +1410,9 @@ function handlePaperDecisionOutput(
     };
     const { decision, warnings } = normalizeDecision(rawDecision);
     lastDecisionOutputs.set(symbol, decision);
-    sendTelegramMessage(formatDecisionCard(decision)).catch(err =>
-      console.error(`[DecisionCard] Telegram send failed for ${symbol}:`, err)
-    );
+    // sendTelegramMessage(formatDecisionCard(decision)).catch(err =>
+    //   console.error(`[DecisionCard] Telegram send failed for ${symbol}:`, err)
+    // );
     if (warnings.length > 0) {
       console.log(`[DecisionCard] ${symbol} warnings:`, JSON.stringify(warnings));
     }
