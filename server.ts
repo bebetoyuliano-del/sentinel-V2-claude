@@ -1225,6 +1225,34 @@ async function monitorMarkets(force = false) {
     }
     cards = uniqueCards;
     latestDecisionCards = cards;
+
+    // Baris 1228 — setelah latestDecisionCards = cards
+    // INJECT DC-TRACE + OVERRIDE LOGIC HERE
+
+    for (const card of cards) {
+      const symbol = card.symbol;
+      if (!symbol) continue; // safety check
+
+      // DC-1: Observability (read-only)
+      const geminiAction = card.action_now?.action;
+      const parityDecision = lastDecisionOutputs.get(symbol);
+      const parityAction = parityDecision?.recommendedAction ?? null;
+
+      const traceStatus = !parityAction ? 'AI_ONLY_FALLBACK'
+        : geminiAction === parityAction ? 'MATCH'
+        : 'MISMATCH';
+
+      console.log(`[DC-TRACE] ${symbol} | gemini=${geminiAction} | parity=${parityAction} | status=${traceStatus}`);
+
+      // DC-2: Soft Override (DEFER sampai DC-1 validated)
+      // if (parityDecision && parityAction) {
+      //   card.action_now.action = parityAction;
+      //   // ... override fields lain
+      // }
+    }
+
+    // Baris 1234 — composeExcelRows tetap jalan dengan cards yang sudah di-trace/override
+
     const se = analysisData.server_enforce || { overrides:[], mr_projection:[], alerts:[] };
     const gg = analysisData.global_guard || { mode:"NORMAL" };
     const new_signals = analysisData.new_signals || null;
