@@ -1173,7 +1173,8 @@ async function monitorMarkets(force = false) {
 
     // Switched to gemini-3-flash-preview for better stability, with Search enabled
     const analysisJson = await generateWithRetry(finalPrompt, 'gemini-3-flash-preview', 3, true, chartBase64, true);
-    
+    console.log(`[DC-DEBUG] Gemini response received, length=${analysisJson?.length || 0}`);
+
     if (!analysisJson) {
       throw new Error('Failed to generate analysis');
     }
@@ -1188,6 +1189,7 @@ async function monitorMarkets(force = false) {
             const cleanJson = analysisJson.substring(firstBrace, lastBrace + 1);
             try {
                 analysisData = JSON.parse(cleanJson);
+                console.log(`[DC-DEBUG] JSON parsed successfully, decision_cards length=${analysisData.decision_cards?.length || 0}`);
             } catch (parseErr: any) {
                 // If it fails with "Unexpected non-whitespace character after JSON at position X"
                 const match = parseErr.message.match(/at position (\d+)/);
@@ -1204,6 +1206,7 @@ async function monitorMarkets(force = false) {
     } catch (e) {
         console.error("Failed to parse JSON from Gemini:", e);
         console.log("Raw response:", analysisJson);
+        console.log(`[DC-DEBUG] Parse ERROR - falling back to empty cards`);
         analysisData = {
             market_summary: "Error parsing analysis. Please check server logs.",
             decision_cards: []
@@ -1211,6 +1214,10 @@ async function monitorMarkets(force = false) {
     }
     
     let cards = analysisData.decision_cards || [];
+    console.log(`[DC-DEBUG] Cards extracted: length=${cards.length}`);
+    if (cards.length === 0) {
+        console.log(`[DC-DEBUG] WARNING: cards array is EMPTY - DC-TRACE will not execute`);
+    }
     lastRawNewSignals = analysisData.new_signals || null;
     lastRawNewSignalsTimestamp = new Date().toISOString();
 
