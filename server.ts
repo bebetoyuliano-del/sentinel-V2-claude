@@ -6,6 +6,9 @@ import { calculateMarginUsed, computeMRProjectedAfterAdd } from './src/paper-eng
 import { isParityV2Mode, evaluateParityPaper } from './src/paper-engine/parity_runtime';
 import { executeParityPaperDecision } from './src/paper-engine/parity_execute';
 import { withFirestoreFailSoft, jsonDegraded, markFirestoreUnavailable, getFirestoreFailsoftStatus } from './src/paper-engine/firestore_failsoft';
+import { normalizeDecision, RawPaperDecision } from './src/paper-engine/decisionNormalizer';
+import { formatDecisionCard } from './src/telegram/decisionCardFormatter';
+import { DecisionOutput } from './src/paper-engine/types';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import axios from 'axios';
 import ccxt from 'ccxt';
@@ -624,6 +627,7 @@ let monitorInterval: NodeJS.Timeout | null = null;
 let isPaperTradingRunning = false;
 let paperTradingInterval: NodeJS.Timeout | null = null;
 let latestDecisionCards: any[] = [];
+const lastDecisionOutputs: Map<string, DecisionOutput> = new Map();
 let paperTradingResetTime = 0;
 
 // Paper Trading Session Metadata
@@ -1373,6 +1377,48 @@ function backgroundSyncFirestore(promise: Promise<any>) {
 // Helper to calculate margin used based on current notional value (Binance Hedge Mode logic)
 // Moved to src/paper-engine/valuation.ts
 
+// Decision Card Output handler — normalizes parityResult → DecisionOutput
+function handlePaperDecisionOutput(
+  symbol: string,
+  rawResult: Record<string, unknown>,
+  mrNow: number,
+): void {
+  if (process.env.PAPER_ENGINE_MODE !== 'parity_v2') return;
+  try {
+    const rawDecision: RawPaperDecision = {
+      symbol,
+      mrNow,
+      structure: rawResult.structure as string | undefined,
+      structureOrigin: rawResult.structureOrigin as string | undefined,
+      primaryTrend4H: rawResult.primaryTrend4H as string | undefined,
+      trendStatus: rawResult.trendStatus as string | undefined,
+      greenLeg: rawResult.greenLeg as string | undefined,
+      redLeg: rawResult.redLeg as string | undefined,
+      hedgeLegStatus: rawResult.hedgeLegStatus as string | undefined,
+      mrProjected: rawResult.mrProjected as number | null | undefined,
+      riskOverride: rawResult.riskOverride as string | undefined,
+      contextMode: rawResult.contextMode as string | undefined,
+      recommendedAction: rawResult.recommendedAction as string | undefined,
+      reasoning: rawResult.reasoning as string | undefined,
+      whyAllowed: rawResult.whyAllowed as string | null | undefined,
+      whyBlocked: rawResult.whyBlocked as string | null | undefined,
+      bepGrossPrice: rawResult.bepGrossPrice as number | null | undefined,
+      bepType: rawResult.bepType as string | undefined,
+      confidence: rawResult.confidence as string | undefined,
+    };
+    const { decision, warnings } = normalizeDecision(rawDecision);
+    lastDecisionOutputs.set(symbol, decision);
+    sendTelegramMessage(formatDecisionCard(decision)).catch(err =>
+      console.error(`[DecisionCard] Telegram send failed for ${symbol}:`, err)
+    );
+    if (warnings.length > 0) {
+      console.log(`[DecisionCard] ${symbol} warnings:`, JSON.stringify(warnings));
+    }
+  } catch (err) {
+    console.error(`[DecisionCard] Normalization failed for ${symbol}:`, err);
+  }
+}
+
 // SOP Helper: Classify Structure with tolerance (SOP 2AB)
 function classifyStructure(longSize: number, shortSize: number): string {
   if (longSize === 0 && shortSize === 0) return 'NONE';
@@ -2009,6 +2055,7 @@ async function runPaperTradingEngine() {
             mrProjected: wallet.marginRatio * 1.05,
           });
           currentParityResult = parityResult;
+          handlePaperDecisionOutput(symbol, parityResult as unknown as Record<string, unknown>, wallet.marginRatio ?? 0);
 
           addLog(
             `[PARITY_V2] ${symbol} input=${JSON.stringify(inputState)} output=${JSON.stringify({
