@@ -1,7 +1,7 @@
 # CLAUDE.md — SENTINEL V2 Project Intelligence
 
 > File ini dibaca otomatis oleh Claude Code setiap session.
-> Terakhir diperbarui: 8 April 2026.
+> Terakhir diperbarui: 9 April 2026.
 
 ---
 
@@ -165,6 +165,110 @@ CHECKLIST:
 
 ---
 
+## 4A. CURRENT ACTIVE PRIORITY — TELEGRAM DECISION CARD PARITY
+
+> **Status:** Active | **Phase:** Paper Consistency → Decision Card Parity → Backtesting
+> **Source:** CURRENT_PRIORITY.md + MODULE_MAP.md
+
+### Objective
+
+Telegram Decision Card HARUS menggunakan core logic yang sama dengan Paper Trading Engine. **Reuse, bukan duplikasi.**
+
+### Architecture Flow
+
+```
+Paper Trading Engine (Authority)
+├─ Main SOP
+├─ Hedging-Recovery Logic
+└─ Decision Output
+    ├─→ Paper Execution
+    └─→ Telegram Decision Card (presenter only — NO logic)
+```
+
+### Module Responsibilities
+
+| Module | Role | Status |
+|--------|------|--------|
+| Paper Trading Core | Authority — decision truth source | ✅ Active & stable |
+| Decision Output Layer | Normalize raw → structured decisions | 🔄 Validation needed |
+| Telegram Decision Card | Format only — presenter, NEVER logic | 🔴 TBD — Parity target |
+| Orchestration Layer | Signal ingest & route | ✅ Active (signal_gate live) |
+| Backtesting Layer | Replay decisions (Phase 2) | ⏳ After parity stable |
+
+### Hard Rules — Decision Card Parity
+
+- ❌ **No 2nd trading logic** untuk Telegram — reuse Paper Core jika memungkinkan
+- ❌ **Jangan break** paper trading behavior yang sudah stable
+- ✅ **Hedging-recovery logic** tetap canonical
+- ✅ Formatting boleh berbeda, **semantics harus align**
+- ⏳ Backtesting **menunggu** parity stable
+
+### P0 Tasks (Decision Card Parity)
+
+1. Validate paper trading consistency vs SOP
+2. Identify true decision core in paper engine
+3. Connect Decision Card to that core (via Decision Output Layer)
+4. Verify semantic parity
+5. Stabilize confidence
+
+### Decision Flow (Canonical)
+
+```
+Market Signals
+    ↓
+Orchestration Layer (signal_gate + route)
+    ↓
+Paper Trading Core (execute + decide)
+    ↓
+Decision Output Layer (normalize)
+    ├─→ Execution
+    ├─→ Monitoring
+    └─→ Telegram Card Layer (format only)
+         ↓
+      User Card (Telegram)
+```
+
+### Parity Rules
+
+| Rule | Notes |
+|------|-------|
+| Telegram consumes from Output Layer only | Never bypass Paper Core |
+| No independent Telegram decision logic | Reuse from Paper Core |
+| Hedging-recovery unchanged | Canonical behavior |
+| Semantic alignment verified | Parity tests required |
+
+### Per-Session Questions (Wajib)
+
+Setiap session yang menyangkut Decision Card, tanyakan:
+1. Reuse logic atau duplicate? → **Harus reuse**
+2. Preserves hedging-recovery? → **Harus ya**
+3. Drift ↑ atau ↓? → **Track**
+4. Needed now atau defer? → **Evaluasi**
+5. Helps backtesting prep? → **Bonus**
+
+### Working Rule
+
+> Jika aman untuk connect Decision Card ke existing engine → **connect, jangan rewrite.**
+
+### Key File Locations
+
+| Concern | Location |
+|---------|----------|
+| Decision logic | Paper Trading Core (`server.ts` + `src/paper-engine/`) |
+| Output schema | Decision Output Layer (`src/core/policy/`) |
+| Telegram integration | TBD — must connect to Output Layer |
+| Signal validation | `signal_gate.ts` |
+
+### Done Criteria (Decision Card Parity)
+
+- [ ] Paper consistency validated
+- [ ] Decision Card from real logic (not parallel)
+- [ ] Parity checks pass
+- [ ] No drift engine ↔ Telegram
+- [ ] Ready for backtesting phase
+
+---
+
 ## 5. SOP TRADING — REFERENSI CEPAT
 
 > Bagian ini untuk konteks jika Claude Code diminta mengedit logic trading.
@@ -279,6 +383,17 @@ Jalankan checklist ini **sebelum setiap commit**.
 [ ] Legacy paper engine deprecated setelah parity_v2 stable
 ```
 
+### E. Decision Card Parity
+
+```
+[ ] Telegram Decision Card menggunakan logic dari Paper Core (bukan parallel)
+[ ] Semantic parity w/ paper trading output
+[ ] Hedging-recovery logic unchanged
+[ ] Minimum duplication — reuse over rewrite
+[ ] No new decision branches in Telegram layer
+[ ] Parity test included sebelum deploy
+```
+
 ---
 
 ## 7. CONVENTIONS & PATTERNS
@@ -327,10 +442,11 @@ Ketika user memberikan task:
 
 1. **Baca section 2 (Golden Rules)** — pastikan task tidak melanggar guardrail.
 2. **Identifikasi file** — navigasi ke file yang relevan, baca konteks sekitar.
-3. **Edit minimal** — jangan refactor hal yang tidak diminta.
-4. **Type-check** — jalankan `npx tsc --noEmit` setelah edit.
-5. **Regression** — jalankan regression pack jika tersedia.
-6. **Report** — jelaskan apa yang diubah dan file mana yang tersentuh.
+3. **Cek section 4A (Decision Card Parity)** — jika task menyangkut Telegram/Decision Card, pastikan reuse logic, bukan duplikasi.
+4. **Edit minimal** — jangan refactor hal yang tidak diminta.
+5. **Type-check** — jalankan `npx tsc --noEmit` setelah edit.
+6. **Regression** — jalankan regression pack jika tersedia.
+7. **Report** — jelaskan apa yang diubah dan file mana yang tersentuh.
 
 Jika task ambigu atau berpotensi menyentuh live execution path → **TANYA USER DULU**, jangan asumsi.
 
@@ -340,6 +456,8 @@ Jika task ambigu atau berpotensi menyentuh live execution path → **TANYA USER 
 
 | Tanggal | Keputusan | Alasan |
 |---------|-----------|--------|
+| 2026-04-09 | Tambah Section 4A: Decision Card Parity ke CLAUDE.md | Priority aktif dari CURRENT_PRIORITY.md + MODULE_MAP.md harus tercermin di project intelligence |
+| 2026-04-09 | Tambah Regression Checklist E: Decision Card Parity | Setiap commit yang menyangkut Telegram harus dicek parity-nya |
 | 2026-04-08 | Adopt Gemini audit findings ke roadmap | External review valid |
 | 2026-04-08 | clientOrderId jadi P0 | Double order = financial loss |
 | 2026-04-08 | Kill-Switch jadi P0 Phase 2 | Tidak ada emergency brake |
