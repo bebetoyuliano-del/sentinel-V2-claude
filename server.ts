@@ -622,6 +622,7 @@ function getAI() {
 // In-memory storage for signals
 let signals: any[] = [];
 let lastRawNewSignals: any = null;
+let lastRawNewSignalsTimestamp: string | null = null;
 let isBotRunning = false;
 let monitorInterval: NodeJS.Timeout | null = null;
 let isPaperTradingRunning = false;
@@ -1211,7 +1212,8 @@ async function monitorMarkets(force = false) {
     
     let cards = analysisData.decision_cards || [];
     lastRawNewSignals = analysisData.new_signals || null;
-    
+    lastRawNewSignalsTimestamp = new Date().toISOString();
+
     // Deduplicate cards by symbol to prevent spam
     const uniqueCards = [];
     const seenSymbols = new Set();
@@ -3457,8 +3459,13 @@ app.get('/api/signals', async (_req, res) => {
   return res.status(200).json(currentSignals);
 });
 
-app.get('/api/debug/last-signals-raw', (req, res) => {
-  res.json({ raw: lastRawNewSignals });
+app.get('/api/debug/last-signals-raw', (_req, res) => {
+  res.json({
+    signals: lastRawNewSignals,
+    count: Array.isArray(lastRawNewSignals) ? lastRawNewSignals.length : (lastRawNewSignals ? 1 : 0),
+    capturedAt: lastRawNewSignalsTimestamp,
+    note: 'Captured BEFORE guardrail filter. For PRE-HF-3E payload verification only.',
+  });
 });
 
 app.get('/api/chats', async (req, res) => {
