@@ -3531,6 +3531,19 @@ app.get('/api/debug/last-signals-raw', (_req, res) => {
   });
 });
 
+app.get('/api/debug/last-decision-outputs', (_req, res) => {
+  const entries: Record<string, unknown> = {};
+  for (const [symbol, decision] of lastDecisionOutputs.entries()) {
+    entries[symbol] = decision;
+  }
+  res.json({
+    count: lastDecisionOutputs.size,
+    symbols: Array.from(lastDecisionOutputs.keys()),
+    decisions: entries,
+    note: 'lastDecisionOutputs Map — populated by handlePaperDecisionOutput after evaluateParityPaper. For DC-1/DC-2 parity verification.',
+  });
+});
+
 app.get('/api/chats', async (req, res) => {
   const currentChats = await withFirestoreFailSoft(
     async () => {
