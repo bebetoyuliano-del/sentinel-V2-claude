@@ -1,7 +1,7 @@
 # CLAUDE.md — SENTINEL V2 Project Intelligence
 
 > File ini dibaca otomatis oleh Claude Code setiap session.
-> Terakhir diperbarui: 9 April 2026.
+> Terakhir diperbarui: 10 April 2026.
 
 ---
 
@@ -29,10 +29,13 @@
 | File/Folder | Fungsi |
 |-------------|--------|
 | `server.ts` | Monolith utama — live execution, paper engine, API endpoints |
-| `src/paper-engine/types.ts` | Type definitions (sudah refactor Phase 4B Step 1A) |
+| `src/paper-engine/types.ts` | Type definitions + DecisionOutput contract (Phase 4B Step 1A + DC-Parity) |
 | `src/paper-engine/valuation.ts` | Kalkulasi valuasi (sudah refactor Phase 4B Step 1B) |
+| `src/paper-engine/decisionNormalizer.ts` | Normalize raw parityResult → DecisionOutput (Decision Card Parity) |
+| `src/telegram/decisionCardFormatter.ts` | Format DecisionOutput → Telegram HTML card (presenter only, NO logic) |
 | `src/prompts/buildMonitoringPrompt.ts` | Prompt assembly untuk Gemini |
 | `src/core/policy/` | Policy runtime — bootstrap, registry, selectors, validator |
+| `src/services/TelegramService.ts` | sendTelegramMessage wrapper — HTML mode, auto-split, fire-and-forget pattern |
 
 ---
 
@@ -69,7 +72,7 @@ CHECKLIST:
 
 ---
 
-## 3. ARCHITECTURE STATUS (Per 8 April 2026)
+## 3. ARCHITECTURE STATUS (Per 10 April 2026)
 
 ### Phase Arsitektur: 2.5 Hybrid Rollback Baseline
 
@@ -91,7 +94,7 @@ CHECKLIST:
 | PRE-HF-3C | ✅ | Field trend+smc di buildMonitoringPrompt signal contract |
 | PRE-HF-3D | ✅ | Pass trend+smc dari monitorMarkets ke newSignal |
 | PRE-HF-3E | ⚠️ INCONCLUSIVE | Payload compliance — tidak bisa verifikasi live (BLOCK_SIGNALS) |
-| PRE-HF-3E-OBS | 📋 PLANNED | Debug endpoint /api/debug/last-signals-raw |
+| PRE-HF-3E-OBS | ✅ DONE | Debug endpoint /api/debug/last-signals-raw — live, capture BEFORE guardrail |
 | HF-3 | ⏸️ BLOCKED | Menunggu PRE-HF-3E final |
 
 ### Known Root Causes
@@ -123,10 +126,10 @@ CHECKLIST:
 
 | # | Task | Priority |
 |---|------|----------|
-| 1.1 | PRE-HF-3E-OBS: debug endpoint /api/debug/last-signals-raw | P0 |
+| 1.1 | ~~PRE-HF-3E-OBS: debug endpoint /api/debug/last-signals-raw~~ ✅ DONE | P0 |
 | 1.2 | Patch RC-4: backgroundSyncFirestore guard if(pos) di MODIFY_POSITION | P0 |
 | 1.3 | Tambah clientOrderId (UUID v4) pada setiap createOrder | P0 |
-| 1.4 | Final approve PRE-HF-3E (blocked by 1.1) | P0 |
+| 1.4 | Final approve PRE-HF-3E (blocked by 1.1 → unblocked, tunggu live run) | P0 |
 
 ### Phase 2 — Stabilisasi (30 Hari)
 
@@ -190,9 +193,10 @@ Paper Trading Engine (Authority)
 | Module | Role | Status |
 |--------|------|--------|
 | Paper Trading Core | Authority — decision truth source | ✅ Active & stable |
-| Decision Output Layer | Normalize raw → structured decisions | 🔄 Validation needed |
-| Telegram Decision Card | Format only — presenter, NEVER logic | 🔴 TBD — Parity target |
+| Decision Output Layer | Normalize raw → structured decisions | ✅ Built (`decisionNormalizer.ts`) — DC-1 trace active |
+| Telegram Decision Card | Format only — presenter, NEVER logic | ✅ Built (`src/telegram/decisionCardFormatter.ts`) — send path deferred |
 | Orchestration Layer | Signal ingest & route | ✅ Active (signal_gate live) |
+| DC-TRACE (DC-1) | Observability — MATCH/MISMATCH log per symbol | ✅ Active — post-parse seam, server.ts ~1232 |
 | Backtesting Layer | Replay decisions (Phase 2) | ⏳ After parity stable |
 
 ### Hard Rules — Decision Card Parity
@@ -255,17 +259,36 @@ Setiap session yang menyangkut Decision Card, tanyakan:
 | Concern | Location |
 |---------|----------|
 | Decision logic | Paper Trading Core (`server.ts` + `src/paper-engine/`) |
-| Output schema | Decision Output Layer (`src/core/policy/`) |
-| Telegram integration | TBD — must connect to Output Layer |
+| Output schema / types | `src/paper-engine/types.ts` — `DecisionOutput` + semua canonical types |
+| Normalizer | `src/paper-engine/decisionNormalizer.ts` — `normalizeDecision()` + `RawPaperDecision` |
+| Telegram formatter | `src/telegram/decisionCardFormatter.ts` — `formatDecisionCard()` presenter only |
+| In-memory store | `lastDecisionOutputs: Map<string, DecisionOutput>` di `server.ts` ~630 |
+| DC-TRACE seam | `server.ts` ~1232 — loop post-parse, pre-TelegramRenderer |
+| Debug endpoint | `GET /api/debug/last-signals-raw` — `server.ts` ~3460 |
+| Telegram send | `src/services/TelegramService.ts` — `sendTelegramMessage()` |
 | Signal validation | `signal_gate.ts` |
 
 ### Done Criteria (Decision Card Parity)
 
 - [ ] Paper consistency validated
+- [x] DecisionOutput contract defined (`types.ts`) ✅
+- [x] Normalizer built (`decisionNormalizer.ts`) ✅
+- [x] Formatter built (`src/telegram/decisionCardFormatter.ts`) ✅
+- [x] `handlePaperDecisionOutput` wired after `evaluateParityPaper` ✅
+- [x] DC-TRACE (DC-1) active — MATCH/MISMATCH observable per symbol ✅
+- [ ] DC-1 validated on live run — confirm MATCH rate acceptable
+- [ ] DC-2 Soft Override enabled (deferred sampai DC-1 validated)
 - [ ] Decision Card from real logic (not parallel)
 - [ ] Parity checks pass
 - [ ] No drift engine ↔ Telegram
 - [ ] Ready for backtesting phase
+
+### DC-1 → DC-2 Gate
+
+**DC-1 (Observability):** ACTIVE — log `[DC-TRACE]` per symbol, zero behavioral change.
+**DC-2 (Soft Override):** DEFERRED — commented out di seam, aktifkan setelah DC-1 validated.
+
+DC-2 code location: `server.ts` ~1247 (commented block dalam DC-TRACE loop).
 
 ---
 
@@ -456,6 +479,11 @@ Jika task ambigu atau berpotensi menyentuh live execution path → **TANYA USER 
 
 | Tanggal | Keputusan | Alasan |
 |---------|-----------|--------|
+| 2026-04-10 | DC-TRACE (DC-1) active, DC-2 override deferred | DC-1 harus validated live sebelum card mutation diaktifkan |
+| 2026-04-10 | handlePaperDecisionOutput TIDAK send Telegram langsung | Telegram untuk live card sudah dihandle TelegramRenderer path terpisah — double-send risk |
+| 2026-04-10 | decisionCardFormatter dipindah ke src/telegram/ | Presenter Telegram tidak boleh tinggal di src/paper-engine/ — separation of concerns |
+| 2026-04-10 | DecisionOutput types ditambah ke types.ts | Shared contract antara paper engine + Telegram — reuse over duplication (Section 4A) |
+| 2026-04-10 | PRE-HF-3E-OBS endpoint selesai | /api/debug/last-signals-raw capture BEFORE guardrail, unblock 1.4 setelah live run |
 | 2026-04-09 | Tambah Section 4A: Decision Card Parity ke CLAUDE.md | Priority aktif dari CURRENT_PRIORITY.md + MODULE_MAP.md harus tercermin di project intelligence |
 | 2026-04-09 | Tambah Regression Checklist E: Decision Card Parity | Setiap commit yang menyangkut Telegram harus dicek parity-nya |
 | 2026-04-08 | Adopt Gemini audit findings ke roadmap | External review valid |
