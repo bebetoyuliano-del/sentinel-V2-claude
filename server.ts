@@ -1215,6 +1215,7 @@ async function monitorMarkets(force = false) {
     
     let cards = analysisData.decision_cards || [];
     console.log(`[DC-DEBUG] Cards extracted: length=${cards.length}`);
+    console.log(`[DC-DEBUG] lastDecisionOutputs.size=${lastDecisionOutputs.size}, keys=[${Array.from(lastDecisionOutputs.keys()).join(", ")}]`);
     if (cards.length === 0) {
         console.log(`[DC-DEBUG] WARNING: cards array is EMPTY - DC-TRACE will not execute`);
     }
@@ -1268,7 +1269,7 @@ async function monitorMarkets(force = false) {
         if (card.buttons) {
           // Sync blocked from whyBlocked
           if (parityDecision.whyBlocked) {
-            card.buttons.block = parityDecision.whyBlocked;
+            card.buttons.block = parityDecision.whyBlocked ? [parityDecision.whyBlocked] : [];
           }
         }
       } else {
@@ -2107,7 +2108,19 @@ async function runPaperTradingEngine() {
             mrProjected: wallet.marginRatio * 1.05,
           });
           currentParityResult = parityResult;
-          handlePaperDecisionOutput(symbol, parityResult as unknown as Record<string, unknown>, wallet.marginRatio ?? 0);
+          handlePaperDecisionOutput(symbol, {
+            recommendedAction: parityResult.final_action,
+            whyBlocked:        parityResult.why_blocked ?? null,
+            whyAllowed:        parityResult.why_allowed ?? null,
+            structure:         inputState.position.Structure,
+            primaryTrend4H:    inputState.market.PrimaryTrend4H,
+            trendStatus:       inputState.market.TrendStatus,
+            contextMode:       inputState.position.ContextMode,
+            greenLeg:          inputState.position.GreenLeg,
+            redLeg:            inputState.position.RedLeg,
+            hedgeLegStatus:    inputState.position.HedgeLegStatus,
+            mrProjected:       inputState.risk?.MRProjected ?? null,
+          } as Record<string, unknown>, wallet.marginRatio ?? 0);
 
           addLog(
             `[PARITY_V2] ${symbol} input=${JSON.stringify(inputState)} output=${JSON.stringify({
