@@ -6,7 +6,8 @@ import { calculateMarginUsed, computeMRProjectedAfterAdd } from './src/paper-eng
 import { isParityV2Mode, evaluateParityPaper } from './src/paper-engine/parity_runtime';
 import { executeParityPaperDecision } from './src/paper-engine/parity_execute';
 import { withFirestoreFailSoft, jsonDegraded, markFirestoreUnavailable, getFirestoreFailsoftStatus } from './src/paper-engine/firestore_failsoft';
-import { loadAllFromDisk, syncWalletToDisk, syncPositionsToDisk, syncHistoryToDisk, syncJournalToDisk, upsertJournalEntry, resetDisk, newPosId, loadAiRunHistory, syncAiRunHistoryToDisk, loadLeverageConfig, syncLeverageConfigToDisk, LeverageConfig } from './src/paper-engine/localStore';
+import { loadAllFromDisk, syncWalletToDisk, syncPositionsToDisk, syncHistoryToDisk, syncJournalToDisk, upsertJournalEntry, resetDisk, newPosId, loadAiRunHistory, syncAiRunHistoryToDisk, loadLeverageConfig, syncLeverageConfigToDisk, LeverageConfig, loadPendingOrders, syncPendingOrdersToDisk, PendingOrder } from './src/paper-engine/localStore';
+import { randomUUID } from 'crypto';
 import { normalizeDecision, RawPaperDecision } from './src/paper-engine/decisionNormalizer';
 import { fetchPaperTrendBatch, getTrendCacheSnapshot } from './src/paper-engine/paperTrendFetcher';
 import { evaluateLockExitUrgency } from './src/paper-engine/lockExitUrgency';
@@ -126,6 +127,13 @@ async function loadPaperTradingData() {
   cachedTradingJournal = stored.journal;
   console.log('[PAPER] Loaded initial paper trading data from local JSON store.');
   auditPaperPositions(cachedPaperPositions); // BFX-2C: detect anomali saat startup
+
+  // [BUG-GHOST] Restore pending orders dari disk (survive server restart)
+  const storedPending = loadPendingOrders();
+  storedPending.forEach(o => pendingOrders.set(o.clientOrderId, o));
+  if (storedPending.length > 0) {
+    console.log(`[BUG-GHOST] Restored ${storedPending.length} pending order(s) from disk.`);
+  }
 }
 
 function setupRealtimeListeners() {
@@ -637,6 +645,7 @@ let isPaperTradingRunning = false;
 let paperTradingInterval: NodeJS.Timeout | null = null;
 let latestDecisionCards: any[] = [];
 const lastDecisionOutputs: Map<string, DecisionOutput> = new Map();
+const pendingOrders: Map<string, PendingOrder> = new Map(); // [BUG-GHOST] keyed by clientOrderId
 let paperTradingResetTime = 0;
 
 // Paper Trading Session Metadata
@@ -5344,9 +5353,10 @@ async function startServer() {
         return orderType;
       };
 
-      const placeOrderWithClient = async (useHedgeMode: boolean) => {
+      const placeOrderWithClient = async (useHedgeMode: boolean, clientOrderId?: string) => {
         const orderType = determineOrderType();
         const params = buildParams(useHedgeMode, orderType);
+        if (clientOrderId) params.clientOrderId = clientOrderId;
         
         addLog(
           `[EXEC_TRY] [${VALIDATION_MODE}] ${fullSymbol} action=${action} ${side} qty=${qty} ` +
@@ -5428,9 +5438,12 @@ async function startServer() {
         }
       }
 
+      // [BUG-GHOST] Generate clientOrderId once — reused on retry (fixes BUG-IDEM)
+      const liveClientOrderId = randomUUID();
+
       try {
         let order: any;
-        
+
         if (VALIDATION_MODE === "DEMO_TRADING") {
             if (!BINANCE_DEMO_API_KEY || !BINANCE_DEMO_API_SECRET) {
                 return `❌ <b>DEMO TRADING CONFIG ERROR</b>\n\nReason: BINANCE_DEMO_API_KEY/SECRET is missing in environment variables.`;
@@ -5438,8 +5451,25 @@ async function startServer() {
             console.log(`[DEMO_TRADING EXEC] Using Binance Demo Trading Client`);
         }
 
+        // [BUG-GHOST] Save to pending BEFORE order — survive NetworkError (non-blocking)
         try {
-          order = await placeOrderWithClient(hasHedgeMode);
+          const pending: PendingOrder = {
+            clientOrderId: liveClientOrderId,
+            symbol: fullSymbol,
+            side: side as 'buy' | 'sell',
+            qty,
+            price: targetPrice ?? null,
+            action,
+            createdAt: Date.now(),
+          };
+          pendingOrders.set(liveClientOrderId, pending);
+          syncPendingOrdersToDisk([...pendingOrders.values()]);
+        } catch (persistErr: any) {
+          console.warn('[BUG-GHOST] pre-order persist failed (non-blocking):', persistErr?.message);
+        }
+
+        try {
+          order = await placeOrderWithClient(hasHedgeMode, liveClientOrderId);
         } catch (err: any) {
           const msg = String(err?.message || err?.msg || "");
           addLog(`[EXEC_ERR] 1st try failed: ${msg}`);
@@ -5447,11 +5477,18 @@ async function startServer() {
             const modeResp2 = await activeClient.fapiPrivateGetPositionSideDual();
             const actualHedgeMode = modeResp2?.dualSidePosition === true || modeResp2?.dualSidePosition === "true";
             addLog(`[EXEC_RETRY] actualHedgeMode=${actualHedgeMode}`);
-            order = await placeOrderWithClient(actualHedgeMode);
+            order = await placeOrderWithClient(actualHedgeMode, liveClientOrderId); // reuse same ID
           } else {
+            // Non-network error (e.g. notional, validation) — order rejected by Binance
+            pendingOrders.delete(liveClientOrderId);
+            syncPendingOrdersToDisk([...pendingOrders.values()]);
             throw err;
           }
         }
+
+        // [BUG-GHOST] Order confirmed — remove from pending
+        pendingOrders.delete(liveClientOrderId);
+        syncPendingOrdersToDisk([...pendingOrders.values()]);
   
         const successLabel = VALIDATION_MODE === "DEMO_TRADING" ? "DEMO TRADING ORDER VALIDATED" : "ORDER SUCCESS!";
         const finalOrderType = determineOrderType();
@@ -6134,13 +6171,49 @@ async function generateAutoJournal() {
 }
 
 // Schedule Auto-Journaling at 07:30 and 19:30 WIB (Asia/Jakarta)
+// [BUG-GHOST] Read-only reconciliation — alert only, no auto-create/cancel
+const GHOST_TIMEOUT_MS = 5 * 60 * 1000; // 5 menit tanpa konfirmasi = suspected ghost
+
+async function reconcilePendingOrders() {
+  if (pendingOrders.size === 0) return;
+  const activeClient = VALIDATION_MODE === 'DEMO_TRADING' ? binanceDemo : binance;
+  for (const [clientOrderId, order] of pendingOrders) {
+    try {
+      const exchangeOrder = await activeClient.fetchOrder(clientOrderId, order.symbol);
+      if (exchangeOrder.status === 'closed' || exchangeOrder.status === 'filled') {
+        console.log(`[BUG-GHOST] Order confirmed on exchange: ${clientOrderId} ${order.symbol}`);
+        pendingOrders.delete(clientOrderId);
+        syncPendingOrdersToDisk([...pendingOrders.values()]);
+      } else if (Date.now() - order.createdAt > GHOST_TIMEOUT_MS) {
+        console.warn(`[BUG-GHOST] SUSPECTED GHOST: ${order.symbol} ${order.side} cid=${clientOrderId}`);
+        sendTelegramMessage(
+          `⚠️ <b>[BUG-GHOST] Suspected ghost position</b>\n` +
+          `Symbol: ${order.symbol} ${order.side.toUpperCase()}\n` +
+          `Action: ${order.action}\n` +
+          `ClientOrderId: <code>${clientOrderId}</code>\n` +
+          `Created: ${new Date(order.createdAt).toISOString()}\n` +
+          `Investigate manually on Binance.`
+        ).catch(err => console.error('[BUG-GHOST] Telegram alert failed:', err));
+        pendingOrders.delete(clientOrderId);
+        syncPendingOrdersToDisk([...pendingOrders.values()]);
+      }
+    } catch (err: any) {
+      console.warn(`[BUG-GHOST] reconcile fetchOrder failed for ${clientOrderId}:`, err?.message || err);
+    }
+  }
+}
+
 function scheduleCronJobs() {
   // [MANUAL-ONLY MODE] Semua cron AI dinonaktifkan.
   // AI hanya berjalan saat user klik Force Run.
   // Aktifkan kembali dengan uncomment baris di bawah jika diperlukan:
   // cron.schedule('30 7,19 * * *', generateAutoJournal, { timezone: "Asia/Jakarta" });
   // cron.schedule('*/10 * * * *', checkRiskAndNotify);
-  console.log("✅ Cron jobs scheduled (MANUAL-ONLY MODE — AI crons disabled)");
+
+  // [BUG-GHOST] Reconciliation loop — tiap 30 detik, read-only, alert-only
+  setInterval(() => { reconcilePendingOrders().catch(e => console.warn('[BUG-GHOST] recon error:', e)); }, 30_000);
+
+  console.log("✅ Cron jobs scheduled (MANUAL-ONLY MODE — AI crons disabled, BUG-GHOST recon active)");
 }
 
 // --- PROACTIVE RISK MANAGER ---

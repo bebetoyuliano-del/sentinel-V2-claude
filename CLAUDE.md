@@ -50,7 +50,8 @@
 | `src/prompts/buildMonitoringPrompt.ts` | Prompt assembly untuk AI |
 | `src/core/policy/` | Policy runtime — bootstrap, registry, selectors, validator |
 | `src/services/TelegramService.ts` | sendTelegramMessage wrapper — HTML mode, auto-split, fire-and-forget pattern |
-| `data/paper_wallet.json` | **[BARU]** State wallet paper trading (balance, equity, dll) |
+| `data/paper_wallet.json` | **[BARU]** State wallet paper trading (balance, equity, peakEquity, dll) |
+| `data/pending_orders.json` | **[BARU]** Pending orders untuk BUG-GHOST reconciliation — survive server restart |
 | `data/paper_positions.json` | **[BARU]** Posisi terbuka paper trading |
 | `data/paper_history.json` | **[BARU]** History closed trades paper trading (max 200) |
 | `data/trading_journal.json` | **[BARU]** Jurnal per posisi paper trading |
@@ -164,11 +165,11 @@ CHECKLIST:
 |----|----------|-----------|--------|
 | BUG-LEVERAGE | S1 | `const LEVERAGE = 20` hardcoded di syncPaperPrices | ✅ FIXED — `leverage_config.json` per symbol; auto-update saat Import Live; `getLeverageForSymbol()` dipakai di openPos + computeHedgeMarginUsed; API GET/PUT `/api/paper/leverage-config` |
 | BUG-PROMISE | S1 | Promise.all di fetchMarketDataWithIndicators (fail-fast) | ✅ FIXED — `fetchInChunks` helper + `Promise.allSettled` + 200ms delay antar chunk; inner 4-TF fetch juga allSettled |
-| BUG-GHOST | S0 | Ghost Position jika NetworkError saat createOrder | 🔴 OPEN |
+| BUG-GHOST | S0 | Ghost Position jika NetworkError saat createOrder | ✅ FIXED — `pendingOrders` Map + `reconcilePendingOrders()` 30s loop (alert-only); `clientOrderId` via `randomUUID()` sebelum order (sekaligus fix BUG-IDEM partial); non-blocking pre-order persist |
 | BUG-RACE | S1 | Race condition backgroundSyncFirestore — paper trading resolved via local JSON; live path masih open | ⚠️ PARTIAL |
 | BUG-FLOAT | S1 | IEEE 754 floating point untuk kalkulasi finansial | 🔴 OPEN |
 | BUG-SYMBOL | S2 | CCXT symbol BTC/USDT vs BTC/USDT:USDT inconsistency | ⚠️ PARTIAL PATCH |
-| BUG-IDEM | S1 | Tidak ada clientOrderId pada createOrder | 🔴 OPEN |
+| BUG-IDEM | S1 | Tidak ada clientOrderId pada createOrder | ✅ FIXED (partial, via BUG-GHOST) — `randomUUID()` di-generate sebelum try block, di-inject ke `placeOrderWithClient`, direuse di retry path |
 
 ---
 
@@ -180,7 +181,7 @@ CHECKLIST:
 |---|------|----------|--------|
 | 1.1 | PRE-HF-3E-OBS: debug endpoint /api/debug/last-signals-raw | P0 | ✅ DONE |
 | 1.2 | Paper trading storage → Local JSON (Firestore diganti) | P0 | ✅ DONE |
-| 1.3 | Tambah clientOrderId (UUID v4) pada setiap createOrder | P0 | 🔴 OPEN |
+| 1.3 | Tambah clientOrderId (UUID v4) pada setiap createOrder | P0 | ✅ DONE (via BUG-GHOST Item 2) |
 | 1.4 | Final approve PRE-HF-3E (tunggu live Force Run) | P0 | ⏳ PENDING |
 
 ### Phase 2 — Stabilisasi (30 Hari)
@@ -233,7 +234,7 @@ CHECKLIST:
 | # | Item | Bug/Task | Status |
 |---|------|----------|--------|
 | 1 | Chunked fetchInChunks | BUG-PROMISE | ✅ DONE (2026-04-26) |
-| 2 | Order reconciliation loop | BUG-GHOST | 🔴 OPEN — next (butuh approval live path) |
+| 2 | Order reconciliation loop | BUG-GHOST | ✅ DONE (2026-04-26) |
 | 3 | Leverage dari config | BUG-LEVERAGE | ✅ DONE (2026-04-26) |
 | 4 | Max drawdown guard | Phase 2.4 | ✅ DONE (2026-04-26) |
 
@@ -301,7 +302,7 @@ const validResults = results.filter((r): r is NonNullable<typeof r> => r !== nul
 ---
 
 ### ITEM 2 — BUG-GHOST: Order Reconciliation Loop
-**Status:** 🔴 OPEN | **Priority:** P0 | **Estimasi:** ~80 baris TypeScript
+**Status:** ✅ DONE (2026-04-26) | **Priority:** P0
 
 **Root cause:**
 Jika `createOrder()` success di Binance tapi response tidak diterima (NetworkError), posisi terbuka di exchange tapi tidak tercatat di paper engine → ghost position.
@@ -816,6 +817,7 @@ Jika task ambigu atau berpotensi menyentuh live execution path → **TANYA USER 
 
 | Tanggal | Keputusan | Alasan |
 |---------|-----------|--------|
+| 2026-04-26 | BUG-GHOST FIXED + BUG-IDEM partial: Order reconciliation loop | Part A: `PendingOrder` struct + `loadPendingOrders/syncPendingOrdersToDisk` di localStore.ts + `data/pending_orders.json`. Part B: `pendingOrders` Map, `reconcilePendingOrders()` (30s, read-only+alert-only), startup restore, wired ke scheduleCronJobs. Part C: `randomUUID()` sebelum try block, non-blocking pre-order persist, delete on success, delete on non-network error, keep on NetworkError, clientOrderId dipass ke `placeOrderWithClient` + direuse di retry. TSC clean, pack_v2 8/8 hijau. |
 | 2026-04-26 | BUG-PROMISE FIXED: fetchInChunks + Promise.allSettled + 200ms delay | Outer chunk loop fail-fast + zero delay antar chunk → Binance 429/IP ban. Fix: tambah fetchInChunks<T> helper sebelum fetchMarketDataWithIndicators; outer Promise.all → allSettled; inner 4-TF fetch juga allSettled; 200ms delay antar chunk. ~1.2s overhead per 31-pair run (acceptable). TSC clean, pack_v2 8/8 hijau. |
 | 2026-04-26 | Phase 2.4 Max Drawdown Guard DONE | checkMaxDrawdown() tracks peakEquity (persisted ke wallet JSON); stop engine + Telegram alert jika drawdown ≥ MAX_DRAWDOWN_PCT (default 20%, configurable via env); POST /api/paper/reset-drawdown-peak untuk reset manual; peakEquity + maxDrawdownPct ditambah ke PaperWallet type. |
 | 2026-04-26 | GET /api/debug/last-decision-outputs endpoint ditambahkan | Expose lastDecisionOutputs Map untuk verifikasi DC-1/DC-2 parity dari luar server. Live test di GCP VM 34.158.55.103: 9 symbols terisi, field remap dari commit f14b081 confirmed bekerja. |

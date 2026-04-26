@@ -13,8 +13,9 @@ const WALLET_FILE         = path.join(DATA_DIR, 'paper_wallet.json');
 const POSITIONS_FILE      = path.join(DATA_DIR, 'paper_positions.json');
 const HISTORY_FILE        = path.join(DATA_DIR, 'paper_history.json');
 const JOURNAL_FILE        = path.join(DATA_DIR, 'trading_journal.json');
-const AI_HISTORY_FILE     = path.join(DATA_DIR, 'ai_run_history.json');
-const LEVERAGE_CONFIG_FILE = path.join(DATA_DIR, 'leverage_config.json');
+const AI_HISTORY_FILE      = path.join(DATA_DIR, 'ai_run_history.json');
+const LEVERAGE_CONFIG_FILE  = path.join(DATA_DIR, 'leverage_config.json');
+const PENDING_ORDERS_FILE   = path.join(DATA_DIR, 'pending_orders.json');
 
 // Ensure data dir exists on module load
 if (!fs.existsSync(DATA_DIR)) {
@@ -122,6 +123,26 @@ export function loadLeverageConfig(): LeverageConfig {
 export function syncLeverageConfigToDisk(config: LeverageConfig): void {
   try { atomicWrite(LEVERAGE_CONFIG_FILE, config); }
   catch (e: any) { console.error('[LOCAL-STORE] leverage_config write error:', e.message); }
+}
+
+// ─── Pending Orders persistence (BUG-GHOST reconciliation) ──────────────────
+export interface PendingOrder {
+  clientOrderId: string;
+  symbol: string;
+  side: 'buy' | 'sell';
+  qty: number;
+  price: number | null;  // null for market orders
+  action: string;
+  createdAt: number;     // unix ms
+}
+
+export function loadPendingOrders(): PendingOrder[] {
+  return readJson<PendingOrder[]>(PENDING_ORDERS_FILE, []);
+}
+
+export function syncPendingOrdersToDisk(orders: PendingOrder[]): void {
+  try { atomicWrite(PENDING_ORDERS_FILE, orders); }
+  catch (e: any) { console.error('[LOCAL-STORE] pending_orders write error:', e.message); }
 }
 
 // ─── AI Run History persistence ───────────────────────────────────────────────
