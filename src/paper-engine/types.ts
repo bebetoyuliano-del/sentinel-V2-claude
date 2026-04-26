@@ -1,6 +1,24 @@
 export type TradeSide = 'LONG' | 'SHORT';
 export type PositionStatus = 'OPEN' | 'CLOSED';
 
+// === Import Annotation: Supervisor Override ===
+/**
+ * Supervisor annotation disertakan saat POST /api/paper/import-live.
+ * Berlaku satu session saja — tidak persist setelah Reset Account.
+ * Tidak mengubah SOP, Golden Rule, atau MR guard.
+ */
+export interface SupervisorAnnotation {
+  symbol: string;
+  /**
+   * True jika hedge sengaja ditutup oleh supervisor (strategic unlock).
+   * Efek: engine skip HEDGE_TRIGGER_HIT untuk symbol ini.
+   */
+  hedgeIntentionallyClosed: boolean;
+  reason?: string;
+  annotatedAt?: string;
+}
+// === END Import Annotation types ===
+
 export interface PaperPosition {
   id: string;
   symbol: string;
@@ -16,6 +34,10 @@ export interface PaperPosition {
   openedAt: string;
   isHedge?: boolean;
   journalId?: string;
+  leverage?: number;                   // leverage per posisi — dari config atau Import Live
+  lastEmergencyDeRiskAt?: number;     // unix ms — BFX-1 cooldown tracker
+  emergencyDeRiskCooldownMs?: number; // override default 300_000ms — BFX-1
+  supervisorAnnotation?: SupervisorAnnotation; // Import Annotation — hedge intentionally closed override
   [key: string]: any; // Fallback aman untuk properti dinamis legacy
 }
 
@@ -26,6 +48,10 @@ export interface PaperWallet {
   marginRatio?: number;
   updatedAt: string;
   isEmergencyDeRisking?: boolean;
+  effectiveLeverage?: number; // calibrated from Binance at import — used for freeMargin computation
+  effectiveMmr?: number;      // calibrated from Binance at import — used for MR computation
+  peakEquity?: number;        // tracks all-time high equity for max drawdown guard
+  maxDrawdownPct?: number;    // override threshold (default: MAX_DRAWDOWN_PCT env)
 }
 
 export interface PaperHistory {
