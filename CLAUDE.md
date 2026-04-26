@@ -1,7 +1,7 @@
 # CLAUDE.md — SENTINEL V2 Project Intelligence
 
 > File ini dibaca otomatis oleh Claude Code setiap session.
-> Terakhir diperbarui: 23 April 2026 (Session 5).
+> Terakhir diperbarui: 26 April 2026 (Session 6).
 
 ---
 
@@ -24,24 +24,28 @@
 | Database | **Local JSON** (`data/`) untuk paper trading; Firebase Firestore untuk policies & auth |
 | Hosting | **Local Server Windows** (sementara, GCP/Cloud Run di-suspend) |
 
-### Deployment Info (Per 13 April 2026)
+### Deployment Info (Per 26 April 2026)
 
-- Server berjalan via `npm run dev` (`tsx server.ts`) di port 3000
+- **Local**: Server berjalan via `npm run dev` (`tsx server.ts`) di port 3000
+- **GCP VM**: `sentinel-v2-claude` di `34.158.55.103:3000` — PM2 process, folder `/home/bebetoyuliano/sentinel-V2-claude/`
 - Frontend + Backend satu port — Vite middleware mode (`middlewareMode: true`) embedded di Express
 - Firebase hanya dipakai untuk `approved_settings` (policy) dan auth — **BUKAN** untuk paper trading
 - Firestore quota exceeded → paper trading sudah dimigrasikan ke local JSON
 - npm cache di `D:\npm-cache` (bukan default C:\) — C: drive hampir penuh
-- **Binance IP**: Menggunakan mobile hotspot (POCO F4 GT) — dynamic IP via Cloudflare (104.28.x.x range). IP ban teratasi dengan airplane mode → IP baru. BUG-PROMISE (concurrent requests) diduga penyebab utama.
+- **Binance IP**: Menggunakan mobile hotspot (POCO F4 GT) — dynamic IP via Cloudflare (104.28.x.x range). IP ban teratasi dengan airplane mode → IP baru. BUG-PROMISE ✅ FIXED (fetchInChunks + allSettled + 200ms delay).
 
 ### File Penting
 
 | File/Folder | Fungsi |
 |-------------|--------|
 | `server.ts` | Monolith utama — live execution, paper engine, API endpoints |
-| `src/paper-engine/types.ts` | Type definitions + DecisionOutput contract; `PaperWallet` punya `effectiveLeverage?` + `effectiveMmr?` |
+| `src/paper-engine/types.ts` | Type definitions + DecisionOutput contract; `PaperWallet` punya `effectiveLeverage?` + `effectiveMmr?` + `peakEquity?` + `maxDrawdownPct?` |
 | `src/paper-engine/valuation.ts` | Kalkulasi valuasi (sudah refactor Phase 4B Step 1B) |
 | `src/paper-engine/localStore.ts` | **[BARU]** Local JSON persistence — ganti Firestore untuk paper trading |
 | `src/paper-engine/decisionNormalizer.ts` | Normalize raw parityResult → DecisionOutput (Decision Card Parity) |
+| `src/paper-engine/exitEvaluator.ts` | **[BARU]** TP Sentinel + BEP Full Cycle exit logic (Step 1C-1b) |
+| `src/paper-engine/lockExitUrgency.ts` | **[BARU]** Standalone LOCK_EXIT_URGENCY evaluator (HF-3) |
+| `src/paper-engine/paperTrendFetcher.ts` | **[BARU]** OHLCV 4H trend fetch + ATR Range Filter (RC-1 fix) |
 | `src/telegram/decisionCardFormatter.ts` | Format DecisionOutput → Telegram HTML card (presenter only, NO logic) |
 | `src/prompts/buildMonitoringPrompt.ts` | Prompt assembly untuk AI |
 | `src/core/policy/` | Policy runtime — bootstrap, registry, selectors, validator |
@@ -69,7 +73,7 @@ Ini adalah aturan **WAJIB** saat mengedit kode SENTINEL:
 
 1. **Sentuhan `server.ts` HANYA pada paper evaluator seam** — jangan ubah live execution path.
 2. **JANGAN** perbaiki legacy evaluator secara umum.
-3. **JANGAN** ubah `fetchMarketDataWithIndicators` kecuali eksplisit di-approve untuk task tertentu.
+3. **JANGAN** ubah `fetchMarketDataWithIndicators` kecuali eksplisit di-approve untuk task tertentu. *(BUG-PROMISE sudah di-fix — sekarang pakai fetchInChunks + allSettled + 200ms delay)*
 4. **JANGAN** ganti canonical enum parity dengan label lain.
 5. **Regression pack_v2 + pack_aux HARUS tetap HIJAU** setelah setiap perubahan.
 6. **HF-3 AKTIF (semi-auto)** — hanya monitoring feed, tidak auto-execute.
@@ -90,7 +94,7 @@ CHECKLIST:
 
 ---
 
-## 3. ARCHITECTURE STATUS (Per 13 April 2026)
+## 3. ARCHITECTURE STATUS (Per 26 April 2026)
 
 ### Phase Arsitektur: 2.5 Hybrid Rollback Baseline
 
@@ -159,7 +163,7 @@ CHECKLIST:
 | ID | Severity | Deskripsi | Status |
 |----|----------|-----------|--------|
 | BUG-LEVERAGE | S1 | `const LEVERAGE = 20` hardcoded di syncPaperPrices | ✅ FIXED — `leverage_config.json` per symbol; auto-update saat Import Live; `getLeverageForSymbol()` dipakai di openPos + computeHedgeMarginUsed; API GET/PUT `/api/paper/leverage-config` |
-| BUG-PROMISE | S1 | Promise.all di fetchMarketDataWithIndicators (fail-fast) | 🔴 OPEN — **diduga penyebab IP ban Binance** (terlalu banyak concurrent request) |
+| BUG-PROMISE | S1 | Promise.all di fetchMarketDataWithIndicators (fail-fast) | ✅ FIXED — `fetchInChunks` helper + `Promise.allSettled` + 200ms delay antar chunk; inner 4-TF fetch juga allSettled |
 | BUG-GHOST | S0 | Ghost Position jika NetworkError saat createOrder | 🔴 OPEN |
 | BUG-RACE | S1 | Race condition backgroundSyncFirestore — paper trading resolved via local JSON; live path masih open | ⚠️ PARTIAL |
 | BUG-FLOAT | S1 | IEEE 754 floating point untuk kalkulasi finansial | 🔴 OPEN |
@@ -184,9 +188,9 @@ CHECKLIST:
 | # | Task | Priority |
 |---|------|----------|
 | 2.1 | Global Kill-Switch (sekarang bisa di local file, tidak perlu Firestore) | P0 |
-| 2.2 | Promise.allSettled di fetchMarketDataWithIndicators | **P0** — BUG-PROMISE diduga penyebab IP ban Binance (429 concurrent requests) |
+| 2.2 | Promise.allSettled di fetchMarketDataWithIndicators | **P0** | ✅ DONE — fetchInChunks + allSettled + 200ms delay |
 | 2.3 | Fix hardcoded LEVERAGE = 20 → config user per symbol | P1 | ✅ DONE |
-| 2.4 | Max Drawdown Guard | P1 |
+| 2.4 | Max Drawdown Guard | P1 | ✅ DONE — checkMaxDrawdown() + wire + POST /api/paper/reset-drawdown-peak |
 | 2.5 | LLM Circuit Breaker (Claude + Gemini fallback sudah ada, perlu timeout guard) | P1 |
 | 2.6 | Exposure Limit per koin + total portfolio | P2 |
 | 2.7 | Unpause Step 1C-1b (setelah 1.4) | P1 |
@@ -228,15 +232,15 @@ CHECKLIST:
 
 | # | Item | Bug/Task | Status |
 |---|------|----------|--------|
-| 1 | Chunked fetchInChunks | BUG-PROMISE | 🔴 OPEN — next |
-| 2 | Order reconciliation loop | BUG-GHOST | 🔴 OPEN |
+| 1 | Chunked fetchInChunks | BUG-PROMISE | ✅ DONE (2026-04-26) |
+| 2 | Order reconciliation loop | BUG-GHOST | 🔴 OPEN — next (butuh approval live path) |
 | 3 | Leverage dari config | BUG-LEVERAGE | ✅ DONE (2026-04-26) |
-| 4 | Max drawdown guard | Phase 2.4 | 🔴 OPEN |
+| 4 | Max drawdown guard | Phase 2.4 | ✅ DONE (2026-04-26) |
 
 ---
 
 ### ITEM 1 — BUG-PROMISE: Chunked fetchInChunks
-**Status:** 🔴 OPEN | **Priority:** P0 | **Estimasi:** ~50 baris TypeScript
+**Status:** ✅ DONE (2026-04-26) | **Priority:** P0
 
 **Root cause:**
 `fetchMarketDataWithIndicators` di `server.ts` memanggil `Promise.all([...31 pair...])` — fail-fast + semua request concurrent → Binance 429 / IP ban.
@@ -377,7 +381,7 @@ try {
 ---
 
 ### ITEM 4 — Max Drawdown Guard (Phase 2.4)
-**Status:** 🔴 OPEN | **Priority:** P1 | **Estimasi:** ~30 baris TypeScript
+**Status:** ✅ DONE (2026-04-26) | **Priority:** P1
 
 **Tujuan:**
 Stop semua operasi paper engine jika equity turun X% dari peak. Terinspirasi dari Freqtrade `max_drawdown` config + `check_max_drawdown()`.
@@ -484,7 +488,8 @@ Telegram Decision Card HARUS menggunakan core logic yang sama dengan Paper Tradi
 | DC-PARITY seam | `server.ts` ~1199 — pre-populate sebelum DC-TRACE loop |
 | DC-TRACE seam | `server.ts` ~1308 — log MATCH/MISMATCH/AI_ONLY_FALLBACK |
 | DC-2 Override seam | `server.ts` ~1310 — override `card.action_now` |
-| Debug endpoint | `GET /api/debug/last-signals-raw` |
+| Debug endpoint (signals) | `GET /api/debug/last-signals-raw` — capture BEFORE guardrail |
+| Debug endpoint (decisions) | `GET /api/debug/last-decision-outputs` — isi `lastDecisionOutputs` Map |
 | AI Usage endpoint | `GET /api/ai-usage` |
 
 ### Done Criteria (Decision Card Parity)
@@ -686,7 +691,7 @@ Jalankan checklist ini **sebelum setiap commit**.
 
 ```
 [ ] clientOrderId ada pada setiap createOrder
-[ ] Max Drawdown guard aktif (setelah Phase 2.4)
+[x] Max Drawdown guard aktif ✅ DONE — checkMaxDrawdown() wired di runPaperTradingEngine
 [ ] LLM Circuit Breaker aktif (setelah Phase 2.5)
 [ ] Reconciliation setelah NetworkError (setelah Phase 3.2)
 ```
@@ -698,7 +703,7 @@ Jalankan checklist ini **sebelum setiap commit**.
 [ ] data/ folder ada dan writable
 [ ] Atomic write berfungsi (.tmp → rename)
 [ ] Leverage diambil dari config user, bukan hardcoded
-[ ] fetchMarketDataWithIndicators pakai Promise.allSettled (Phase 2.2)
+[x] fetchMarketDataWithIndicators pakai Promise.allSettled ✅ DONE — fetchInChunks + 200ms delay
 [ ] Kalkulasi finansial pakai Decimal.js (setelah Phase 3.1)
 [ ] Symbol normalization konsisten (setelah Phase 3.5)
 ```
@@ -811,6 +816,10 @@ Jika task ambigu atau berpotensi menyentuh live execution path → **TANYA USER 
 
 | Tanggal | Keputusan | Alasan |
 |---------|-----------|--------|
+| 2026-04-26 | BUG-PROMISE FIXED: fetchInChunks + Promise.allSettled + 200ms delay | Outer chunk loop fail-fast + zero delay antar chunk → Binance 429/IP ban. Fix: tambah fetchInChunks<T> helper sebelum fetchMarketDataWithIndicators; outer Promise.all → allSettled; inner 4-TF fetch juga allSettled; 200ms delay antar chunk. ~1.2s overhead per 31-pair run (acceptable). TSC clean, pack_v2 8/8 hijau. |
+| 2026-04-26 | Phase 2.4 Max Drawdown Guard DONE | checkMaxDrawdown() tracks peakEquity (persisted ke wallet JSON); stop engine + Telegram alert jika drawdown ≥ MAX_DRAWDOWN_PCT (default 20%, configurable via env); POST /api/paper/reset-drawdown-peak untuk reset manual; peakEquity + maxDrawdownPct ditambah ke PaperWallet type. |
+| 2026-04-26 | GET /api/debug/last-decision-outputs endpoint ditambahkan | Expose lastDecisionOutputs Map untuk verifikasi DC-1/DC-2 parity dari luar server. Live test di GCP VM 34.158.55.103: 9 symbols terisi, field remap dari commit f14b081 confirmed bekerja. |
+| 2026-04-26 | GCP VM deployment aktif: sentinel-v2-claude di 34.158.55.103:3000 | PM2 process di /home/bebetoyuliano/sentinel-V2-claude/ — branch feat/telegram-decision-parity. Port 3000 belum dibuka firewall (akses via curl localhost dari dalam VM). |
 | 2026-04-26 | BUG-LEVERAGE FIXED: leverage_config.json per symbol | CCXT return leverage=0 tanpa filter symbol → hardcoded fallback || 20. Fix: `LeverageConfig` di localStore.ts, `getLeverageForSymbol()` di server.ts, wire ke `openPos()` (2 titik) + `computeHedgeMarginUsed()`. Import Live auto-update config dari Binance actual. API GET/PUT `/api/paper/leverage-config`. tsc clean. |
 | 2026-04-26 | Freqtrade dieksplorasi → 4 improvement items disimpan ke CLAUDE.md section 4B | BUG-PROMISE (chunked fetchInChunks), BUG-GHOST (reconciliation loop), BUG-LEVERAGE (done), Phase 2.4 (max drawdown). Detail implementasi + pseudocode tersimpan untuk sesi berikutnya. |
 | 2026-04-23 | Step 1C-1b DONE: exitEvaluator.ts wired ke server.ts | Phase 4B refactor — TP Sentinel + BEP Full Cycle diekstrak ke isolated evaluator; collect→execute pattern; inline lama di-deprecated (retained untuk validasi) |
