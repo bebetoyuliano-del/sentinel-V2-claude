@@ -117,6 +117,7 @@ export default function App() {
   const [isArchiving, setIsArchiving] = useState(false);
   const [archiveMessage, setArchiveMessage] = useState<{ text: string, type: 'success' | 'error' } | null>(null);
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [aiUsage, setAiUsage] = useState<any | null>(null);
 
   const handleLogin = async () => {
     setLoginError(null);
@@ -301,13 +302,19 @@ export default function App() {
         return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(id));
       };
 
-      const [statusRes, marketRes, positionsRes, ordersRes, accountRes] = await Promise.all([
+      const [statusRes, marketRes, positionsRes, ordersRes, accountRes, aiUsageRes] = await Promise.all([
         fetchWithTimeout('/api/status').catch(() => ({ ok: false, json: async () => ({}) })),
         fetchWithTimeout('/api/market').catch(() => ({ ok: false, json: async () => ({}) })),
         fetchWithTimeout('/api/positions').catch(() => ({ ok: false, json: async () => ([]) })),
         fetchWithTimeout('/api/orders').catch(() => ({ ok: false, json: async () => ([]) })),
-        fetchWithTimeout('/api/account').catch(() => ({ ok: false, json: async () => null }))
+        fetchWithTimeout('/api/account').catch(() => ({ ok: false, json: async () => null })),
+        fetchWithTimeout('/api/ai-usage').catch(() => ({ ok: false, json: async () => null })),
       ]);
+
+      if (aiUsageRes.ok) {
+        const data = await aiUsageRes.json().catch(() => null);
+        if (data) setAiUsage(data);
+      }
 
       if (statusRes.ok) {
         const data = await statusRes.json().catch(() => null);
@@ -605,6 +612,58 @@ export default function App() {
                 ${account.dailyRealizedPnl.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </div>
             </div>
+          </div>
+        )}
+
+        {/* AI Usage Widget */}
+        {aiUsage && (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-medium text-zinc-400 uppercase tracking-wider flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-violet-400 inline-block"></span>
+                AI Engine — {aiUsage.model} · {aiUsage.mode}
+              </h3>
+              <span className="text-xs text-zinc-600">Session since {new Date(aiUsage.sessionStart).toLocaleTimeString()}</span>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
+              <div className="bg-zinc-800/60 rounded-lg p-3">
+                <div className="text-xs text-zinc-500 mb-1">Force Runs</div>
+                <div className="text-lg font-mono font-medium text-violet-300">{aiUsage.totalRuns}</div>
+              </div>
+              <div className="bg-zinc-800/60 rounded-lg p-3">
+                <div className="text-xs text-zinc-500 mb-1">Success</div>
+                <div className="text-lg font-mono font-medium text-emerald-400">{aiUsage.successRuns}</div>
+                <div className="text-xs text-zinc-600">{aiUsage.claudeRuns}× Claude · {aiUsage.geminiRuns}× Gemini</div>
+              </div>
+              <div className="bg-zinc-800/60 rounded-lg p-3">
+                <div className="text-xs text-zinc-500 mb-1">Est. Cost</div>
+                <div className="text-lg font-mono font-medium text-amber-400">${aiUsage.estimatedCostUsd.toFixed(4)}</div>
+                <div className="text-xs text-zinc-600">${aiUsage.costPerRunUsd}/run</div>
+              </div>
+              <div className="bg-zinc-800/60 rounded-lg p-3">
+                <div className="text-xs text-zinc-500 mb-1">Avg Duration</div>
+                <div className="text-lg font-mono font-medium text-zinc-300">
+                  {aiUsage.avgDurationMs > 0 ? `${(aiUsage.avgDurationMs / 1000).toFixed(1)}s` : '—'}
+                </div>
+                {aiUsage.failedRuns > 0 && <div className="text-xs text-red-400">{aiUsage.failedRuns} failed</div>}
+              </div>
+            </div>
+            {aiUsage.history && aiUsage.history.length > 0 && (
+              <div className="space-y-1">
+                <div className="text-xs text-zinc-600 mb-1">Last {aiUsage.history.length} runs</div>
+                {[...aiUsage.history].reverse().map((r: any, i: number) => (
+                  <div key={i} className="flex items-center gap-2 text-xs font-mono">
+                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${r.success ? 'bg-emerald-400' : 'bg-red-400'}`}></span>
+                    <span className="text-zinc-500">{new Date(r.timestamp).toLocaleTimeString()}</span>
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] ${r.provider === 'claude' ? 'bg-violet-900/60 text-violet-300' : r.provider === 'gemini' ? 'bg-blue-900/60 text-blue-300' : 'bg-red-900/60 text-red-300'}`}>
+                      {r.provider}
+                    </span>
+                    <span className="text-zinc-500">{(r.durationMs / 1000).toFixed(1)}s</span>
+                    <span className={r.success ? 'text-emerald-500' : 'text-red-500'}>{r.success ? 'OK' : 'FAIL'}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

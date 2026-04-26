@@ -1,12 +1,21 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 
-import type { PaperPosition, PaperWallet, PaperHistory } from './src/paper-engine/types';
+import type { PaperPosition, PaperWallet, PaperHistory, SupervisorAnnotation } from './src/paper-engine/types';
 import { calculateMarginUsed, computeMRProjectedAfterAdd } from './src/paper-engine/valuation';
 import { isParityV2Mode, evaluateParityPaper } from './src/paper-engine/parity_runtime';
 import { executeParityPaperDecision } from './src/paper-engine/parity_execute';
 import { withFirestoreFailSoft, jsonDegraded, markFirestoreUnavailable, getFirestoreFailsoftStatus } from './src/paper-engine/firestore_failsoft';
+import { loadAllFromDisk, syncWalletToDisk, syncPositionsToDisk, syncHistoryToDisk, syncJournalToDisk, upsertJournalEntry, resetDisk, newPosId, loadAiRunHistory, syncAiRunHistoryToDisk, loadLeverageConfig, syncLeverageConfigToDisk, LeverageConfig, loadPendingOrders, syncPendingOrdersToDisk, PendingOrder } from './src/paper-engine/localStore';
+import { randomUUID } from 'crypto';
+import { normalizeDecision, RawPaperDecision } from './src/paper-engine/decisionNormalizer';
+import { fetchPaperTrendBatch, getTrendCacheSnapshot } from './src/paper-engine/paperTrendFetcher';
+import { evaluateLockExitUrgency } from './src/paper-engine/lockExitUrgency';
+import { collectExitDecisions } from './src/paper-engine/exitEvaluator';
+import { formatDecisionCard } from './src/telegram/decisionCardFormatter';
+import { DecisionOutput } from './src/paper-engine/types';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import ccxt from 'ccxt';
 import cors from 'cors';
@@ -110,27 +119,20 @@ let lastDbSyncTime = 0;
 import { onSnapshot } from 'firebase/firestore';
 
 async function loadPaperTradingData() {
-  if (!db) return;
-  try {
-    const walletSnap = await getDoc(doc(db, 'paper_wallet', 'main'));
-    if (walletSnap.exists()) {
-      cachedPaperWallet = walletSnap.data() as PaperWallet;
-    } else {
-      cachedPaperWallet = { balance: 10000, equity: 10000, freeMargin: 10000, marginRatio: 0, updatedAt: new Date().toISOString() };
-    }
+  // [LOCAL-STORE] Load dari local JSON files — tidak butuh Firestore/Firebase
+  const stored = loadAllFromDisk();
+  cachedPaperWallet    = stored.wallet    as PaperWallet;
+  cachedPaperPositions = stored.positions as PaperPosition[];
+  cachedPaperHistory   = stored.history   as PaperHistory[];
+  cachedTradingJournal = stored.journal;
+  console.log('[PAPER] Loaded initial paper trading data from local JSON store.');
+  auditPaperPositions(cachedPaperPositions); // BFX-2C: detect anomali saat startup
 
-    const posSnap = await getDocs(collection(db, 'paper_positions'));
-    cachedPaperPositions = posSnap.docs.map(doc => ({ ...doc.data(), id: doc.id } as PaperPosition));
-
-    const historyQuery = query(collection(db, 'paper_history'), orderBy('closedAt', 'desc'), limit(200));
-    const histSnap = await getDocs(historyQuery);
-    cachedPaperHistory = histSnap.docs.map(doc => ({ ...doc.data(), id: doc.id } as PaperHistory));
-    console.log("[PAPER] Loaded initial paper trading data from Firestore.");
-  } catch (error: any) {
-    console.error("[PAPER] Failed to load initial paper trading data from Firestore. Using empty/default cache.", error.message);
-    if (!cachedPaperWallet.balance) {
-      cachedPaperWallet = { balance: 10000, equity: 10000, freeMargin: 10000, marginRatio: 0, updatedAt: new Date().toISOString() };
-    }
+  // [BUG-GHOST] Restore pending orders dari disk (survive server restart)
+  const storedPending = loadPendingOrders();
+  storedPending.forEach(o => pendingOrders.set(o.clientOrderId, o));
+  if (storedPending.length > 0) {
+    console.log(`[BUG-GHOST] Restored ${storedPending.length} pending order(s) from disk.`);
   }
 }
 
@@ -523,8 +525,16 @@ console.log('-----------------------------------');
 
 // Initialize clients
 const binanceOptions = {
-  defaultType: 'future', // Assuming futures for long/short positions
-  warnOnFetchOpenOrdersWithoutSymbol: false, // Suppress strict rate limit warning
+  defaultType: 'future',
+  warnOnFetchOpenOrdersWithoutSymbol: false,
+  // Only load USDT-M linear futures (fapi.binance.com).
+  // Default ['spot', 'linear', 'inverse'] causes dapi.binance.com (Coin-M) to also load — times out.
+  fetchMarkets: ['linear'],
+  // Default fetchCurrencies=true triggers fetchCurrencies() → sapiGetCapitalConfigGetall (spot).
+  // Default fetchMargins=true triggers sapiGetMarginAllPairs (spot margin) — both time out.
+  // Not needed for a USDT-M futures-only bot.
+  fetchCurrencies: false,
+  fetchMargins: false,
 };
 
 const binance = new ccxt.binance({
@@ -619,11 +629,23 @@ function getAI() {
 // In-memory storage for signals
 let signals: any[] = [];
 let lastRawNewSignals: any = null;
+let lastRawNewSignalsTimestamp: string | null = null;
 let isBotRunning = false;
 let monitorInterval: NodeJS.Timeout | null = null;
+
+// AI Usage Tracker
+const AI_COST_PER_RUN_USD = 0.82; // Claude Sonnet 4.6 actual: ~114K input ($0.34) + 32K output ($0.48) = $0.82/run (31 pairs, observed 2026-04-13)
+interface AiRunRecord { timestamp: string; trigger: 'force-run' | 'auto'; success: boolean; provider: 'claude' | 'gemini' | 'claude-fallback' | 'gemini-fallback' | 'failed'; durationMs: number; }
+// [LOCAL-STORE] Load from disk — persists across server restarts
+const aiRunHistory: AiRunRecord[] = loadAiRunHistory() as AiRunRecord[];
+// [BUG-LEVERAGE] Leverage config per symbol — persists across restarts
+let cachedLeverageConfig: LeverageConfig = loadLeverageConfig();
+let aiRunSessionStart = new Date().toISOString();
 let isPaperTradingRunning = false;
 let paperTradingInterval: NodeJS.Timeout | null = null;
 let latestDecisionCards: any[] = [];
+const lastDecisionOutputs: Map<string, DecisionOutput> = new Map();
+const pendingOrders: Map<string, PendingOrder> = new Map(); // [BUG-GHOST] keyed by clientOrderId
 let paperTradingResetTime = 0;
 
 // Paper Trading Session Metadata
@@ -657,6 +679,30 @@ async function sendPowerAutomateWebhook(data: any) {
 // Extracted to src/services/GCSService.ts
 
 // Helper to fetch market data with technical indicators
+// [BUG-PROMISE] Chunked async executor — inspired by Freqtrade exchange/exchange.py chunks(100)
+// Replaces Promise.all (fail-fast + burst) with allSettled + delay between chunks
+async function fetchInChunks<T>(
+  tasks: (() => Promise<T>)[],
+  chunkSize = 5,
+  delayBetweenChunksMs = 200
+): Promise<(T | null)[]> {
+  const results: (T | null)[] = [];
+  for (let i = 0; i < tasks.length; i += chunkSize) {
+    const chunk = tasks.slice(i, i + chunkSize).map(fn => fn());
+    const settled = await Promise.allSettled(chunk);
+    for (const r of settled) {
+      results.push(r.status === 'fulfilled' ? r.value : null);
+      if (r.status === 'rejected') {
+        console.warn('[BUG-PROMISE] Chunk fetch failed:', r.reason?.message || r.reason);
+      }
+    }
+    if (i + chunkSize < tasks.length) {
+      await new Promise(resolve => setTimeout(resolve, delayBetweenChunksMs));
+    }
+  }
+  return results;
+}
+
 async function fetchMarketDataWithIndicators(symbols: string[]) {
   const startTime = Date.now();
   console.log(`[PERF] Starting fetchMarketDataWithIndicators for ${symbols.length} symbols...`);
@@ -671,8 +717,9 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
   
   const chunks = chunkArray(symbols, 5);
   
-  for (const chunk of chunks) {
-    await Promise.all(chunk.map(async (pair) => {
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const chunk = chunks[ci];
+    await Promise.allSettled(chunk.map(async (pair) => {
       try {
         const cacheKey = `market_data_${pair}`;
         const cachedData = marketCache.get(cacheKey);
@@ -681,12 +728,12 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
           return;
         }
 
-        const [ohlcv1d, ohlcv4h, ohlcv1h, ohlcv15m] = await Promise.all([
+        const [ohlcv1d, ohlcv4h, ohlcv1h, ohlcv15m] = await Promise.allSettled([
           binance.fetchOHLCV(pair, '1d', undefined, 100),
           binance.fetchOHLCV(pair, '4h', undefined, 500),
           binance.fetchOHLCV(pair, '1h', undefined, 200),
           binance.fetchOHLCV(pair, '15m', undefined, 200)
-        ]);
+        ]).then(results => results.map(r => r.status === 'fulfilled' ? r.value : null) as [any, any, any, any]);
         
         const ticker = await binance.fetchTicker(pair);
         const nowMs = Date.now();
@@ -806,8 +853,12 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
         console.error(`Error fetching data for ${pair}:`, e);
       }
     }));
+    // [BUG-PROMISE] 200ms delay between chunks — prevent Binance 429 / IP ban
+    if (ci < chunks.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
   }
-  
+
   const duration = (Date.now() - startTime) / 1000;
   console.log(`[PERF] fetchMarketDataWithIndicators completed in ${duration.toFixed(2)}s`);
   return marketData;
@@ -864,123 +915,119 @@ function calculateHedgingRecovery(positions: any[]) {
   return recoveryData;
 }
 
-// Helper to call Gemini API with retry logic
-async function generateWithRetry(prompt: string, modelName: string = 'gemini-3.1-pro-preview', maxRetries: number = 3, jsonMode: boolean = false, base64Image: string | null = null, enableSearch: boolean = false) {
+// LLM selector — baca dari env, default claude
+// Ganti LLM_PRIMARY di .env: 'claude' | 'gemini'
+const LLM_PRIMARY = (process.env.LLM_PRIMARY || 'claude').toLowerCase();
+const CLAUDE_MODEL = 'claude-sonnet-4-6';
+const GEMINI_MONITOR_MODEL = process.env.GEMINI_MONITOR_MODEL || 'gemini-2.5-flash-preview-05-20';
+console.log(`[LLM] Primary provider: ${LLM_PRIMARY} | Gemini model: ${GEMINI_MONITOR_MODEL}`);
+
+async function generateWithClaude(prompt: string, jsonMode: boolean = false, base64Image: string | null = null): Promise<string> {
+  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+  const content: Anthropic.MessageParam['content'] = [];
+
+  if (base64Image) {
+    // Auto-detect: PNG starts with iVBORw0K, JPEG starts with /9j/
+    const mimeType: 'image/png' | 'image/jpeg' = base64Image.startsWith('iVBORw0K') ? 'image/png' : 'image/jpeg';
+    content.push({
+      type: 'image',
+      source: { type: 'base64', media_type: mimeType, data: base64Image },
+    });
+  }
+
+  content.push({ type: 'text', text: jsonMode ? `${prompt}\n\nRespond with valid JSON only. No markdown, no explanation.` : prompt });
+
+  // Use streaming — required by Anthropic SDK when max_tokens is large enough that
+  // the request may exceed 10 minutes. stream.finalMessage() collects the full response.
+  const stream = anthropic.messages.stream({
+    model: CLAUDE_MODEL,
+    max_tokens: 32000,
+    messages: [{ role: 'user', content }],
+  });
+  const response = await stream.finalMessage();
+
+  const textBlock = response.content.find((b) => b.type === 'text');
+  if (!textBlock || textBlock.type !== 'text') throw new Error('Claude returned no text block');
+  return textBlock.text;
+}
+
+async function generateWithGemini(prompt: string, jsonMode: boolean = false, base64Image: string | null = null, model?: string): Promise<string> {
   const ai = getAI();
+  const resolvedModel = model || GEMINI_MONITOR_MODEL;
+  // NOTE: gemini-2.0-flash hard-caps output at 8192 tokens (~20K chars).
+  // For large position sets (20+ pairs), output WILL be truncated. Use Claude for production.
+  const config: any = { model: resolvedModel, contents: prompt, config: { maxOutputTokens: 8192 } };
+  if (base64Image) {
+    config.contents = { parts: [{ inlineData: { mimeType: 'image/jpeg', data: base64Image } }, { text: prompt }] };
+  }
+  if (jsonMode) config.config.responseMimeType = 'application/json';
+  const response = await ai.models.generateContent(config);
+  if (!response.text) throw new Error('Gemini returned empty response');
+  return response.text;
+}
+
+async function generateWithRetry(prompt: string, _modelName: string = 'claude-sonnet-4-6', maxRetries: number = 3, jsonMode: boolean = false, base64Image: string | null = null, _enableSearch: boolean = false): Promise<string> {
+  const t0 = Date.now();
+  const useClaude = LLM_PRIMARY !== 'gemini';
+
+  // ── Primary provider ──────────────────────────────────────────────────────
   let attempt = 0;
-  
-  // First try with the requested model (e.g. Pro)
   while (attempt < maxRetries) {
     try {
-      const config: any = {
-        model: modelName,
-      };
-      
-      if (base64Image) {
-        config.contents = {
-          parts: [
-            { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
-            { text: prompt }
-          ]
-        };
+      if (useClaude) {
+        console.log(`[LLM] Claude ${CLAUDE_MODEL} — attempt ${attempt + 1}/${maxRetries}`);
+        const result = await generateWithClaude(prompt, jsonMode, base64Image);
+        console.log(`[LLM] Claude response OK (length=${result?.length || 0})`);
+        aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: true, provider: 'claude', durationMs: Date.now() - t0 });
+        syncAiRunHistoryToDisk(aiRunHistory);
+        return result;
       } else {
-        config.contents = prompt;
+        console.log(`[LLM] Gemini ${GEMINI_MONITOR_MODEL} — attempt ${attempt + 1}/${maxRetries}`);
+        const result = await generateWithGemini(prompt, jsonMode, base64Image);
+        console.log(`[LLM] Gemini response OK (length=${result?.length || 0})`);
+        aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: true, provider: 'gemini', durationMs: Date.now() - t0 });
+        syncAiRunHistoryToDisk(aiRunHistory);
+        return result;
       }
-      
-      config.config = {};
-      if (modelName === 'gemini-3.1-pro-preview') {
-        config.config.thinkingConfig = { thinkingLevel: ThinkingLevel.HIGH };
-      }
-      if (jsonMode) {
-        config.config.responseMimeType = 'application/json';
-      }
-      if (enableSearch) {
-        config.config.tools = [{ googleSearch: {} }];
-      }
-
-      const response = await ai.models.generateContent(config);
-      return response.text;
     } catch (error: any) {
       attempt++;
-      console.error(`Gemini API Error (${modelName} - Attempt ${attempt}/${maxRetries}):`, error.message || error);
-      
-      // If it's the last attempt, break to try fallback
+      console.error(`[LLM] ${useClaude ? 'Claude' : 'Gemini'} error (attempt ${attempt}/${maxRetries}):`, error.message || error);
       if (attempt >= maxRetries) break;
-      
-      // Wait before retrying (exponential backoff: 2s, 4s, 8s)
       const delay = Math.pow(2, attempt) * 1000;
-      console.log(`Waiting ${delay}ms before retrying...`);
+      console.log(`[LLM] Retrying in ${delay}ms...`);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 
-  // If Pro model failed, try Flash model as fallback
-  if (modelName === 'gemini-3.1-pro-preview') {
-    console.log('Falling back to gemini-3-flash-preview...');
+  // ── Fallback ke provider lain ─────────────────────────────────────────────
+  if (useClaude) {
+    console.warn('[LLM] Claude failed — falling back to Gemini...');
     try {
-      const config: any = {
-        model: 'gemini-3-flash-preview',
-      };
-      
-      if (base64Image) {
-        config.contents = {
-          parts: [
-            { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
-            { text: prompt }
-          ]
-        };
-      } else {
-        config.contents = prompt;
-      }
-      
-      config.config = {};
-      if (jsonMode) {
-        config.config.responseMimeType = 'application/json';
-      }
-      if (enableSearch) {
-        config.config.tools = [{ googleSearch: {} }];
-      }
-
-      const response = await ai.models.generateContent(config);
-      return response.text;
-    } catch (error: any) {
-      console.error('Fallback model (gemini-3-flash-preview) also failed:', error.message || error);
-      
-      // Try one more fallback: gemini-3.1-flash-preview
-      console.log('Falling back to gemini-3.1-flash-preview...');
-      try {
-        const config: any = {
-          model: 'gemini-3.1-flash-preview',
-        };
-        
-        if (base64Image) {
-          config.contents = {
-            parts: [
-              { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
-              { text: prompt }
-            ]
-          };
-        } else {
-          config.contents = prompt;
-        }
-        
-        config.config = {};
-        if (jsonMode) {
-          config.config.responseMimeType = 'application/json';
-        }
-        if (enableSearch) {
-          config.config.tools = [{ googleSearch: {} }];
-        }
-
-        const response = await ai.models.generateContent(config);
-        return response.text;
-      } catch (error2: any) {
-        console.error('Second fallback model (gemini-3.1-flash-preview) also failed:', error2.message || error2);
-      }
+      const result = await generateWithGemini(prompt, jsonMode, base64Image);
+      console.log('[LLM] Gemini fallback OK');
+      aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: true, provider: 'gemini-fallback', durationMs: Date.now() - t0 });
+      syncAiRunHistoryToDisk(aiRunHistory);
+      return result;
+    } catch (geminiError: any) {
+      console.error('[LLM] Gemini fallback also failed:', geminiError.message || geminiError);
+    }
+  } else {
+    console.warn('[LLM] Gemini failed — falling back to Claude...');
+    try {
+      const result = await generateWithClaude(prompt, jsonMode, base64Image);
+      console.log('[LLM] Claude fallback OK');
+      aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: true, provider: 'claude-fallback', durationMs: Date.now() - t0 });
+      syncAiRunHistoryToDisk(aiRunHistory);
+      return result;
+    } catch (claudeError: any) {
+      console.error('[LLM] Claude fallback also failed:', claudeError.message || claudeError);
     }
   }
 
-  throw new Error(`Failed to get response from Gemini after all attempts.`);
+  aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: false, provider: 'failed', durationMs: Date.now() - t0 });
+  syncAiRunHistoryToDisk(aiRunHistory);
+  throw new Error('[LLM] All providers failed (Claude + Gemini). Check API keys and quota.');
 }
 
 // --- EXCEL ROWS BUILDER (A-D) ---
@@ -1019,6 +1066,30 @@ async function ensureAuth() {
       }
     }
   }
+}
+
+// Repair truncated JSON by closing unclosed brackets/braces
+function repairTruncatedJson(str: string): string {
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (escaped)       { escaped = false; continue; }
+    if (c === '\\' && inString) { escaped = true; continue; }
+    if (c === '"')     { inString = !inString; continue; }
+    if (inString)      continue;
+    if      (c === '{') stack.push('}');
+    else if (c === '[') stack.push(']');
+    else if (c === '}' || c === ']') {
+      if (stack.length > 0 && stack[stack.length - 1] === c) stack.pop();
+    }
+  }
+  // If we ended mid-string, close the string first
+  if (inString) str += '"';
+  // Close all open brackets in reverse
+  while (stack.length > 0) str += stack.pop();
+  return str;
 }
 
 // Core monitoring function
@@ -1166,39 +1237,59 @@ async function monitorMarkets(force = false) {
       chartSymbol,
     });
 
-    // Switched to gemini-3-flash-preview for better stability, with Search enabled
-    const analysisJson = await generateWithRetry(finalPrompt, 'gemini-3-flash-preview', 3, true, chartBase64, true);
-    
+    // Claude tidak perlu chart image — analisis dari JSON market data sudah cukup.
+    // chartBase64 hanya dipakai untuk Telegram visual, tidak dikirim ke LLM.
+    if (LLM_PRIMARY === 'gemini') {
+      console.warn(`[LLM] ⚠️ WARNING: LLM_PRIMARY=gemini with ${positionSymbols.length} position symbols. Gemini 2.0 Flash is hard-capped at 8192 output tokens (~20K chars). With 20+ pairs, output WILL be truncated and cards will be missing. Switch LLM_PRIMARY=claude for full coverage.`);
+    }
+    const analysisJson = await generateWithRetry(finalPrompt, 'claude-sonnet-4-6', 3, true, null, false);
+    console.log(`[LLM] Response received, length=${analysisJson?.length || 0}`);
+
     if (!analysisJson) {
       throw new Error('Failed to generate analysis');
     }
 
     let analysisData;
     try {
-        // Find the first '{' and last '}' to extract the JSON object
         const firstBrace = analysisJson.indexOf('{');
-        const lastBrace = analysisJson.lastIndexOf('}');
-        
-        if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-            const cleanJson = analysisJson.substring(firstBrace, lastBrace + 1);
-            try {
-                analysisData = JSON.parse(cleanJson);
-            } catch (parseErr: any) {
-                // If it fails with "Unexpected non-whitespace character after JSON at position X"
-                const match = parseErr.message.match(/at position (\d+)/);
-                if (match) {
-                    const pos = parseInt(match[1], 10);
-                    analysisData = JSON.parse(cleanJson.substring(0, pos));
-                } else {
-                    throw parseErr;
-                }
-            }
-        } else {
+        const lastBrace  = analysisJson.lastIndexOf('}');
+
+        if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
             throw new Error("Could not find valid JSON object in response");
         }
+
+        let cleanJson = analysisJson.substring(firstBrace, lastBrace + 1);
+
+        // Sanitize: replace unescaped control characters inside JSON strings
+        // (literal newlines/tabs in string values break JSON.parse)
+        cleanJson = cleanJson.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ');
+
+        // Attempt 1: direct parse
+        try {
+            analysisData = JSON.parse(cleanJson);
+            console.log(`[DC-DEBUG] JSON parsed successfully, decision_cards length=${analysisData.decision_cards?.length || 0}`);
+        } catch (parseErr: any) {
+            // Attempt 2: truncate at error position (handles trailing garbage)
+            const posMatch = parseErr.message.match(/at position (\d+)/);
+            if (posMatch) {
+                const pos = parseInt(posMatch[1], 10);
+                try {
+                    analysisData = JSON.parse(cleanJson.substring(0, pos));
+                    console.log(`[DC-DEBUG] JSON parsed after truncation at pos=${pos}, cards=${analysisData.decision_cards?.length || 0}`);
+                } catch {
+                    // Attempt 3: close unclosed brackets (handles truncated response)
+                    const repairedJson = repairTruncatedJson(cleanJson.substring(0, pos));
+                    analysisData = JSON.parse(repairedJson);
+                    console.log(`[DC-DEBUG] JSON parsed after repair, cards=${analysisData.decision_cards?.length || 0}`);
+                }
+            } else {
+                throw parseErr;
+            }
+        }
     } catch (e) {
-        console.error("Failed to parse JSON from Gemini:", e);
-        console.log("Raw response:", analysisJson);
+        console.error("[DC-DEBUG] Failed to parse AI JSON response:", e);
+        console.log("[DC-DEBUG] Raw response snippet (last 500 chars):", analysisJson.slice(-500));
+        console.log(`[DC-DEBUG] Parse ERROR - falling back to empty cards`);
         analysisData = {
             market_summary: "Error parsing analysis. Please check server logs.",
             decision_cards: []
@@ -1206,8 +1297,14 @@ async function monitorMarkets(force = false) {
     }
     
     let cards = analysisData.decision_cards || [];
+    console.log(`[DC-DEBUG] Cards extracted: length=${cards.length}`);
+    console.log(`[DC-DEBUG] lastDecisionOutputs.size=${lastDecisionOutputs.size}, keys=[${Array.from(lastDecisionOutputs.keys()).join(", ")}]`);
+    if (cards.length === 0) {
+        console.log(`[DC-DEBUG] WARNING: cards array is EMPTY - DC-TRACE will not execute`);
+    }
     lastRawNewSignals = analysisData.new_signals || null;
-    
+    lastRawNewSignalsTimestamp = new Date().toISOString();
+
     // Deduplicate cards by symbol to prevent spam
     const uniqueCards = [];
     const seenSymbols = new Set();
@@ -1219,6 +1316,145 @@ async function monitorMarkets(force = false) {
     }
     cards = uniqueCards;
     latestDecisionCards = cards;
+
+    // DC-PARITY PRE-POPULATE: Evaluasi parity dari live positions SEBELUM DC-TRACE loop
+    // Agar lastDecisionOutputs sudah terisi saat DC-TRACE & DC-2 berjalan
+    if (isParityV2Mode()) {
+      for (const card of cards) {
+        const symbol = card.symbol;
+        if (!symbol) continue;
+
+        // Normalisasi symbol — live positions bisa pakai format BTC/USDT:USDT atau BTC/USDT
+        const liveForSymbol = positions.filter((p: any) =>
+          p.symbol === symbol ||
+          p.symbol === symbol.replace(':USDT', '') ||
+          p.symbol.replace(':USDT', '') === symbol
+        );
+        const liveLong  = liveForSymbol.find((p: any) => p.side === 'long');
+        const liveShort = liveForSymbol.find((p: any) => p.side === 'short');
+
+        // Skip symbols tanpa live position — AI_ONLY_FALLBACK adalah correct behavior
+        if (!liveLong && !liveShort) continue;
+
+        // Adapter: Binance position → RuntimePos
+        const longPos = liveLong ? {
+          size:       liveLong.contracts,
+          currentPnl: liveLong.unrealizedPnl,
+          pnlPct:     liveLong.percentage,
+          entryPrice: liveLong.entryPrice,
+        } : null;
+
+        const shortPos = liveShort ? {
+          size:       liveShort.contracts,
+          currentPnl: liveShort.unrealizedPnl,
+          pnlPct:     liveShort.percentage,
+          entryPrice: liveShort.entryPrice,
+        } : null;
+
+        // currentPrice dari marketData (sudah di-fetch sebelumnya)
+        const mktEntry = marketData[symbol] ?? marketData[symbol.replace(':USDT', '')] ?? null;
+        const currentPrice: number =
+          mktEntry?.currentPrice ??
+          liveLong?.markPrice ??
+          liveShort?.markPrice ??
+          0;
+
+        // freshSignal dari signals cache (sama seperti paper engine)
+        const freshSignal = signals.find((s: any) =>
+          s.symbol === symbol &&
+          s.type === 'scanner_signal' &&
+          (Date.now() - new Date(s.timestamp).getTime() < 20 * 60 * 1000)
+        ) ?? null;
+
+        const currentStructure = classifyStructure(
+          longPos?.size ?? 0,
+          shortPos?.size ?? 0
+        );
+
+        // Wallet proxy dari accountRisk (live margin ratio)
+        const liveWallet = {
+          marginRatio: accountRisk?.marginRatio ?? 0,
+          isEmergencyDeRisking: false,
+        };
+
+        try {
+          const { inputState, parityResult } = await evaluateParityPaper({
+            symbol,
+            currentPrice,
+            freshSignal,
+            longPos,
+            shortPos,
+            wallet: liveWallet,
+            currentStructure,
+            stopHedgeHit:      false,
+            historyHasSignal:  false,
+            signalAlreadyActed: false,
+            mrProjected: (accountRisk?.marginRatio ?? 0) * 1.05,
+          });
+
+          handlePaperDecisionOutput(symbol, {
+            recommendedAction: parityResult.final_action,
+            whyBlocked:        parityResult.why_blocked  ?? null,
+            whyAllowed:        parityResult.why_allowed  ?? null,
+            structure:         inputState.position.Structure,
+            primaryTrend4H:    inputState.market.PrimaryTrend4H,
+            trendStatus:       inputState.market.TrendStatus,
+            contextMode:       inputState.position.ContextMode,
+            greenLeg:          inputState.position.GreenLeg,
+            redLeg:            inputState.position.RedLeg,
+            hedgeLegStatus:    inputState.position.HedgeLegStatus,
+            mrProjected:       inputState.risk?.MRProjected ?? null,
+          } as Record<string, unknown>, accountRisk?.marginRatio ?? 0);
+
+          console.log(`[DC-PARITY] ${symbol} | live parity evaluated | action=${parityResult.final_action}`);
+        } catch (e: any) {
+          console.error(`[DC-PARITY] evaluateParityPaper failed for ${symbol}:`, e?.message ?? e);
+        }
+      }
+    }
+
+    for (const card of cards) {
+      const symbol = card.symbol;
+      if (!symbol) continue; // safety check
+
+      // DC-1: Observability (read-only)
+      const geminiAction = card.action_now?.action;
+      const parityDecision = lastDecisionOutputs.get(symbol);
+      const parityAction = parityDecision?.recommendedAction ?? null;
+
+      const traceStatus = !parityAction ? 'AI_ONLY_FALLBACK'
+        : geminiAction === parityAction ? 'MATCH'
+        : 'MISMATCH';
+
+      console.log(`[DC-TRACE] ${symbol} | gemini=${geminiAction} | parity=${parityAction} | status=${traceStatus}`);
+
+      // DC-2: Soft Override
+      if (parityDecision && parityAction) {
+        // Override action
+        if (card.action_now) {
+          card.action_now.action = parityAction;
+
+          // Derive percentage from action
+          const percentage = parityAction.includes('0.5') ? 0.5 : 1.0;
+          card.action_now.percentage = percentage;
+
+          console.log(`[DC-2-OVERRIDE] ${symbol} | action: ${geminiAction} → ${parityAction}`);
+        }
+
+        // Override buttons (if structure exists)
+        if (card.buttons) {
+          // Sync blocked from whyBlocked
+          if (parityDecision.whyBlocked) {
+            card.buttons.block = parityDecision.whyBlocked ? [parityDecision.whyBlocked] : [];
+          }
+        }
+      } else {
+        console.log(`[DC-2-FALLBACK] ${symbol} | Using Gemini (parity unavailable)`);
+      }
+    }
+
+    // Baris 1234 — composeExcelRows tetap jalan dengan cards yang sudah di-trace/override
+
     const se = analysisData.server_enforce || { overrides:[], mr_projection:[], alerts:[] };
     const gg = analysisData.global_guard || { mode:"NORMAL" };
     const new_signals = analysisData.new_signals || null;
@@ -1258,12 +1494,23 @@ async function monitorMarkets(force = false) {
     // --- NEW: Save to Trading Journal (REMOVED - Now handled by Paper Trading Engine) ---
     // --- END NEW ---
 
-    const payloads = renderDecisionCardsToTelegram(cards, se, gg, new_signals, archiveUrl);
+    let payloads: any[] = [];
+    try {
+      payloads = renderDecisionCardsToTelegram(cards, se, gg, new_signals, archiveUrl);
+    } catch (renderErr: any) {
+      console.error('[TELEGRAM] renderDecisionCardsToTelegram failed, retrying without new_signals:', renderErr.message);
+      try {
+        payloads = renderDecisionCardsToTelegram(cards, se, gg, null, archiveUrl);
+      } catch (renderErr2: any) {
+        console.error('[TELEGRAM] renderDecisionCardsToTelegram failed even without new_signals:', renderErr2.message);
+      }
+    }
 
     // 1. Process Decision Cards (Monitoring)
     for (let i = 0; i < cards.length; i++) {
         const card = cards[i];
         const payload = payloads[i];
+        if (!payload) { console.warn(`[TELEGRAM] No payload for card[${i}] ${card.symbol}, skipping`); continue; }
         await sendTelegramMessage(payload.text, payload.reply_markup);
         
         const monitorSignal = {
@@ -1373,6 +1620,45 @@ function backgroundSyncFirestore(promise: Promise<any>) {
 // Helper to calculate margin used based on current notional value (Binance Hedge Mode logic)
 // Moved to src/paper-engine/valuation.ts
 
+// Decision Card Output handler — normalizes parityResult → DecisionOutput
+function handlePaperDecisionOutput(
+  symbol: string,
+  rawResult: Record<string, unknown>,
+  mrNow: number,
+): void {
+  if (process.env.PAPER_ENGINE_MODE !== 'parity_v2') return;
+  try {
+    const rawDecision: RawPaperDecision = {
+      symbol,
+      mrNow,
+      structure: rawResult.structure as string | undefined,
+      structureOrigin: rawResult.structureOrigin as string | undefined,
+      primaryTrend4H: rawResult.primaryTrend4H as string | undefined,
+      trendStatus: rawResult.trendStatus as string | undefined,
+      greenLeg: rawResult.greenLeg as string | undefined,
+      redLeg: rawResult.redLeg as string | undefined,
+      hedgeLegStatus: rawResult.hedgeLegStatus as string | undefined,
+      mrProjected: rawResult.mrProjected as number | null | undefined,
+      riskOverride: rawResult.riskOverride as string | undefined,
+      contextMode: rawResult.contextMode as string | undefined,
+      recommendedAction: rawResult.recommendedAction as string | undefined,
+      reasoning: rawResult.reasoning as string | undefined,
+      whyAllowed: rawResult.whyAllowed as string | null | undefined,
+      whyBlocked: rawResult.whyBlocked as string | null | undefined,
+      bepGrossPrice: rawResult.bepGrossPrice as number | null | undefined,
+      bepType: rawResult.bepType as string | undefined,
+      confidence: rawResult.confidence as string | undefined,
+    };
+    const { decision, warnings } = normalizeDecision(rawDecision);
+    lastDecisionOutputs.set(symbol, decision);
+    if (warnings.length > 0) {
+      console.log(`[DecisionCard] ${symbol} warnings:`, JSON.stringify(warnings));
+    }
+  } catch (err) {
+    console.error(`[DecisionCard] Normalization failed for ${symbol}:`, err);
+  }
+}
+
 // SOP Helper: Classify Structure with tolerance (SOP 2AB)
 function classifyStructure(longSize: number, shortSize: number): string {
   if (longSize === 0 && shortSize === 0) return 'NONE';
@@ -1446,12 +1732,47 @@ function reclassifyState(longPos: any, shortPos: any, currentPrice: number) {
 // Paper Trading Engine Logic
 let isPaperEngineRunning = false;
 
+// [Phase 2.4] Max Drawdown Guard — inspired by Freqtrade freqtradebot.py check_max_drawdown()
+const MAX_DRAWDOWN_PCT = parseFloat(process.env.MAX_DRAWDOWN_PCT || '20');
+
+function checkMaxDrawdown(wallet: PaperWallet): boolean {
+  const peakEquity = wallet.peakEquity ?? wallet.balance;
+  if (wallet.equity > peakEquity) {
+    wallet.peakEquity = wallet.equity;
+    syncWalletToDisk(wallet);
+  }
+  const drawdownPct = ((peakEquity - wallet.equity) / peakEquity) * 100;
+  const threshold = wallet.maxDrawdownPct ?? MAX_DRAWDOWN_PCT;
+  if (drawdownPct >= threshold) {
+    console.error(`[MAX-DRAWDOWN] TRIGGERED: ${drawdownPct.toFixed(1)}% drawdown (peak: $${peakEquity.toFixed(2)}, now: $${wallet.equity.toFixed(2)})`);
+    sendTelegramMessage(
+      `🚨 <b>MAX DRAWDOWN TRIGGERED</b>\n` +
+      `Drawdown: ${drawdownPct.toFixed(1)}% dari peak\n` +
+      `Peak: $${peakEquity.toFixed(2)} → Sekarang: $${wallet.equity.toFixed(2)}\n` +
+      `Paper engine DIHENTIKAN — restart manual untuk lanjutkan.`
+    ).catch(err => console.error('[MAX-DRAWDOWN] Telegram alert failed:', err));
+    return true;
+  }
+  return false;
+}
+
 async function runPaperTradingEngine() {
   if (isPaperEngineRunning) {
     console.log(`[PAPER] Engine is already running. Skipping this cycle.`);
     return;
   }
   isPaperEngineRunning = true;
+
+  // [Phase 2.4] Max drawdown check — stop engine before cycle runs
+  if (checkMaxDrawdown(cachedPaperWallet)) {
+    isPaperEngineRunning = false;
+    isPaperTradingRunning = false;
+    if (paperTradingInterval) {
+      clearInterval(paperTradingInterval);
+      paperTradingInterval = null;
+    }
+    return;
+  }
 
   await ensureAuth();
   if (!db) {
@@ -1462,8 +1783,7 @@ async function runPaperTradingEngine() {
   console.log(`[PAPER] Running Paper Trading Engine at ${new Date().toISOString()}`);
 
   try {
-    // 1. Ensure Paper Wallet exists
-    const walletRef = doc(db, 'paper_wallet', 'main');
+    // 1. Ensure Paper Wallet exists (local store)
     let wallet = cachedPaperWallet;
 
     // 2. Fetch Open Positions
@@ -1503,20 +1823,19 @@ async function runPaperTradingEngine() {
         if (mainPosIndex > -1) {
           openPositions[mainPosIndex].size = totalSize;
           openPositions[mainPosIndex].entryPrice = avgEntryPrice;
-          
-          backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', mainId), {
-            size: totalSize,
-            entryPrice: avgEntryPrice
-          }, { merge: true }));
+          const cMain = cachedPaperPositions.findIndex(p => p.id === mainId);
+          if (cMain > -1) { cachedPaperPositions[cMain].size = totalSize; cachedPaperPositions[cMain].entryPrice = avgEntryPrice; }
         }
 
         for (const p of group) {
           if (p.id !== mainId) {
             const idx = openPositions.findIndex(op => op.id === p.id);
             if (idx > -1) openPositions.splice(idx, 1);
-            backgroundSyncFirestore(deleteDoc(doc(db, 'paper_positions', p.id)));
+            const cIdx = cachedPaperPositions.findIndex(cp => cp.id === p.id);
+            if (cIdx > -1) cachedPaperPositions.splice(cIdx, 1);
           }
         }
+        syncPositionsToDisk(cachedPaperPositions);
       }
     }
 
@@ -1545,22 +1864,26 @@ async function runPaperTradingEngine() {
 
     paperLastSkipReason = null;
 
-    // Recalculate equity and free margin to fix any inconsistencies
+    // Recalculate equity and free margin using Binance cross-margin hedge mode formulas:
+    //   MR = totalMaintenanceMargin / equity (all legs independent, 1% MMR for altcoins)
+    //   freeMargin = equity - totalInitialMargin (hedge netted: max per symbol / leverage)
+    const MAINT_MARGIN_RATE = 0.01; // 1% — mid-cap altcoin standard (used by computeMRProjectedAfterAdd ref)
+    const EFFECTIVE_LEVERAGE = Math.round(1 / MAINT_MARGIN_RATE); // 100
     let totalUnrealized = 0;
-    let totalMarginUsed = 0;
-    const LEVERAGE = 20; // Default leverage for paper trading
-    
+
     for (const pos of openPositions) {
       if (pos.status === 'OPEN') {
         totalUnrealized += pos.unrealizedPnl || 0;
-        totalMarginUsed += calculateMarginUsed(pos, LEVERAGE);
       }
     }
-    
+
+    const totalMaintMargin = computeMaintenanceMargin(openPositions, cachedPaperWallet.effectiveMmr);
+    const totalInitialMargin = computeHedgeMarginUsed(openPositions, cachedPaperWallet.effectiveLeverage);
+
     wallet.equity = wallet.balance + totalUnrealized;
-    wallet.freeMargin = wallet.equity - totalMarginUsed;
-    wallet.marginRatio = wallet.equity > 0 ? (totalMarginUsed / wallet.equity) * 100 : 0;
-    
+    wallet.freeMargin = wallet.equity - totalInitialMargin;
+    wallet.marginRatio = wallet.equity > 0 ? (totalMaintMargin / wallet.equity) * 100 : 0;
+
     // Check if we need to start or stop emergency de-risk
     if (wallet.marginRatio > 25 && !wallet.isEmergencyDeRisking) {
       wallet.isEmergencyDeRisking = true;
@@ -1572,7 +1895,7 @@ async function runPaperTradingEngine() {
       await sendTelegramMessage(`[PAPER] ✅ <b>EMERGENCY DE-RISK RESOLVED</b>\nMargin Ratio is now safely below 15% (${wallet.marginRatio.toFixed(2)}%).\nNormal trading operations resumed.`);
     }
     
-    backgroundSyncFirestore(setDoc(walletRef, wallet));
+    syncWalletToDisk(wallet);
 
     // Liquidation Check
     if (wallet.equity <= 0 && openPositions.length > 0) {
@@ -1583,32 +1906,37 @@ async function runPaperTradingEngine() {
           const historyEntry = {
             ...pos, id: historyId, exitPrice: pos.currentPrice || pos.entryPrice, pnl: pos.unrealizedPnl, reason: 'LIQUIDATION', closedAt: new Date().toISOString(), status: 'CLOSED' as const
           } as PaperHistory;
-          
+
           cachedPaperHistory.unshift(historyEntry);
           if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
-          
-          backgroundSyncFirestore(setDoc(doc(db, 'paper_history', historyId), historyEntry));
-          
+
           if (pos.journalId) {
-            backgroundSyncFirestore(setDoc(doc(db, 'trading_journal', pos.journalId), {
+            cachedTradingJournal = upsertJournalEntry(cachedTradingJournal, pos.journalId, {
               exitPrice: pos.currentPrice || pos.entryPrice, pnl: pos.unrealizedPnl, status: 'CLOSED', closedAt: new Date().toISOString(), closeReason: 'LIQUIDATION'
-            }, { merge: true }));
+            });
           }
-          backgroundSyncFirestore(deleteDoc(doc(db, 'paper_positions', pos.id)));
         }
       }
-      
+      syncHistoryToDisk(cachedPaperHistory);
+      syncJournalToDisk(cachedTradingJournal);
+
       // Clear local positions
       cachedPaperPositions.length = 0;
-      
+      syncPositionsToDisk(cachedPaperPositions);
+
       wallet.balance = 0;
       wallet.equity = 0;
       wallet.freeMargin = 0;
       wallet.updatedAt = new Date().toISOString();
-      backgroundSyncFirestore(setDoc(walletRef, wallet));
+      syncWalletToDisk(wallet);
       await sendTelegramMessage(`[PAPER] 🚨 <b>LIQUIDATION ALERT</b>\nYour paper trading account has been liquidated due to negative equity.`);
       return; // Stop processing this cycle
     }
+
+    // RC-1: Fetch 4H trend data (OHLCV-based) for all active symbols — sequential, cached 4 min
+    const activeSymbols = [...new Set(cachedPaperPositions.map((p: any) => p.symbol))];
+    const trendMap = await fetchPaperTrendBatch(binance, activeSymbols);
+    console.log(`[RC-1] Trend data fetched for ${activeSymbols.length} symbols`);
 
     // 4. Process each symbol
     for (const symbol of symbolsToProcess) {
@@ -1630,12 +1958,35 @@ async function runPaperTradingEngine() {
         let shortPos = symbolPositions.find((p: any) => p.side === 'SHORT');
 
         // Find if there's a fresh signal from the main bot loop (monitorMarkets)
-        const freshSignal = signals.find(s => 
-          s.symbol === symbol && 
+        const freshSignal = signals.find(s =>
+          s.symbol === symbol &&
           s.type === 'scanner_signal' &&
           (Date.now() - new Date(s.timestamp).getTime() < 20 * 60 * 1000) &&
           new Date(s.timestamp).getTime() > paperTradingResetTime
         );
+
+        // RC-1: Enrich signal with OHLCV 4H trend — overrides UNCLEAR from freshSignal or fills when no signal
+        const rc1Trend = trendMap.get(symbol);
+        const enrichedSignal: typeof freshSignal = freshSignal
+          ? {
+              ...freshSignal,
+              trend: {
+                ...(freshSignal.trend ?? {}),
+                primary4H: rc1Trend?.primaryTrend4H ?? freshSignal.trend?.primary4H ?? 'UNCLEAR',
+                status: rc1Trend?.trendStatus ?? freshSignal.trend?.status ?? 'CHOP',
+              },
+            }
+          : rc1Trend
+            ? {
+                symbol,
+                type: 'scanner_signal' as const,
+                timestamp: rc1Trend.fetchedAt,
+                trend: {
+                  primary4H: rc1Trend.primaryTrend4H,
+                  status: rc1Trend.trendStatus,
+                },
+              } as any
+            : null;
 
         // Calculate PnL
         let totalUnrealizedPnl = 0;
@@ -1653,22 +2004,24 @@ async function runPaperTradingEngine() {
         }
 
         // Helper to update wallet state accurately
+        // MR = maintMargin / equity; freeMargin = equity - initialMargin (hedge netted)
         const updateWalletState = () => {
           let totalUnrealized = 0;
-          let totalMarginUsed = 0;
-          
+
           for (const p of openPositions) {
             if (p.status === 'OPEN') {
               totalUnrealized += p.currentPnl !== undefined ? p.currentPnl : (p.unrealizedPnl || 0);
-              totalMarginUsed += calculateMarginUsed(p, LEVERAGE);
             }
           }
-          
+
+          const totalMaintMargin = computeMaintenanceMargin(openPositions, cachedPaperWallet.effectiveMmr);
+          const totalInitialMargin = computeHedgeMarginUsed(openPositions, cachedPaperWallet.effectiveLeverage);
+
           wallet.equity = wallet.balance + totalUnrealized;
-          wallet.freeMargin = wallet.equity - totalMarginUsed;
-          wallet.marginRatio = wallet.equity > 0 ? (totalMarginUsed / wallet.equity) * 100 : 0;
+          wallet.freeMargin = wallet.equity - totalInitialMargin;
+          wallet.marginRatio = wallet.equity > 0 ? (totalMaintMargin / wallet.equity) * 100 : 0;
           wallet.updatedAt = new Date().toISOString();
-          backgroundSyncFirestore(setDoc(walletRef, wallet));
+          syncWalletToDisk(wallet);
         };
 
         // Helper to close position
@@ -1677,24 +2030,24 @@ async function runPaperTradingEngine() {
           const historyEntry = {
             ...pos, id: historyId, exitPrice: currentPrice, pnl: pos.currentPnl, reason, closedAt: new Date().toISOString(), status: 'CLOSED' as const
           } as PaperHistory;
-          
+
           cachedPaperHistory.unshift(historyEntry);
           if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
-          
-          backgroundSyncFirestore(setDoc(doc(db, 'paper_history', historyId), historyEntry));
-          
+          syncHistoryToDisk(cachedPaperHistory);
+
           if (pos.journalId) {
-            backgroundSyncFirestore(setDoc(doc(db, 'trading_journal', pos.journalId), {
+            cachedTradingJournal = upsertJournalEntry(cachedTradingJournal, pos.journalId, {
               exitPrice: currentPrice, pnl: pos.currentPnl, status: 'CLOSED', closedAt: new Date().toISOString(), closeReason: reason
-            }, { merge: true }));
+            });
+            syncJournalToDisk(cachedTradingJournal);
           }
-          backgroundSyncFirestore(deleteDoc(doc(db, 'paper_positions', pos.id)));
-          
+
           const index = openPositions.findIndex(p => p.id === pos.id);
-          if (index > -1) {
-            openPositions.splice(index, 1);
-          }
-          
+          if (index > -1) openPositions.splice(index, 1);
+          const cIdx = cachedPaperPositions.findIndex(p => p.id === pos.id);
+          if (cIdx > -1) cachedPaperPositions.splice(cIdx, 1);
+          syncPositionsToDisk(cachedPaperPositions);
+
           wallet.balance += pos.currentPnl;
           updateWalletState();
           await sendTelegramMessage(`[PAPER] 💰 <b>Closed ${pos.side} ${symbol}</b>\nReason: ${reason}\nPnL: $${pos.currentPnl.toFixed(2)}`);
@@ -1704,27 +2057,31 @@ async function runPaperTradingEngine() {
         const partialClosePos = async (pos: any, sizeToClose: number, reason: string) => {
           const proportion = sizeToClose / pos.size;
           const realizedPnl = pos.currentPnl * proportion;
-          
+
           const historyId = `${pos.id}_partial_${Date.now()}`;
           const historyEntry = {
             ...pos, id: historyId, size: sizeToClose, exitPrice: currentPrice, pnl: realizedPnl, reason, closedAt: new Date().toISOString(), status: 'CLOSED' as const
           } as PaperHistory;
-          
+
           cachedPaperHistory.unshift(historyEntry);
           if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
-          
-          backgroundSyncFirestore(setDoc(doc(db, 'paper_history', historyId), historyEntry));
-          
+          syncHistoryToDisk(cachedPaperHistory);
+
           pos.size -= sizeToClose;
           pos.currentPnl -= realizedPnl;
-          backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', pos.id), { size: pos.size, unrealizedPnl: pos.currentPnl }, { merge: true }));
-          
+
           const index = openPositions.findIndex(p => p.id === pos.id);
           if (index > -1) {
             openPositions[index].size = pos.size;
             openPositions[index].currentPnl = pos.currentPnl;
           }
-          
+          const cIdx = cachedPaperPositions.findIndex(p => p.id === pos.id);
+          if (cIdx > -1) {
+            cachedPaperPositions[cIdx].size = pos.size;
+            cachedPaperPositions[cIdx].unrealizedPnl = pos.currentPnl;
+          }
+          syncPositionsToDisk(cachedPaperPositions);
+
           wallet.balance += realizedPnl;
           updateWalletState();
           await sendTelegramMessage(`[PAPER] 💰 <b>Partial Close ${pos.side} ${symbol}</b>\nReason: ${reason}\nPnL: $${realizedPnl.toFixed(2)}`);
@@ -1732,19 +2089,18 @@ async function runPaperTradingEngine() {
 
         // Helper to open position
         const openPos = async (side: string, size: number, reason: string, signalId: string = '', signalData: any = null) => {
-          const newPosRef = doc(collection(db, 'paper_positions'));
+          const posId = newPosId();
           const journalId = `journal_${Date.now()}_${symbol.replace('/', '')}`;
-          
+
           // Use signal targets if available, otherwise fallback to percentage (for safety)
           let tpPrice = 0;
           let slPrice = 0;
-          
+
           if (signalData && signalData.targets) {
-            // Use T2 as final Take Profit, T1 can be used for partials/locks
             tpPrice = parseFloat(String(signalData.targets.t2)) || parseFloat(String(signalData.targets.t1)) || 0;
             slPrice = parseFloat(String(signalData.stop_loss)) || 0;
           }
-          
+
           if (tpPrice === 0) {
             tpPrice = side === 'LONG' ? currentPrice * (1 + takeProfitPct/100) : currentPrice * (1 - takeProfitPct/100);
           }
@@ -1753,46 +2109,55 @@ async function runPaperTradingEngine() {
             id: journalId, timestamp: new Date().toISOString(), symbol, side, entryPrice: currentPrice,
             stopLoss: slPrice, target1: signalData?.targets?.t1 ? (parseFloat(String(signalData.targets.t1)) || 0) : 0, target2: tpPrice, reason, sentiment: signalData?.sentiment || 'NEUTRAL', status: 'OPEN', source: 'PAPER_BOT', pnl: 0
           };
-          backgroundSyncFirestore(setDoc(doc(db, 'trading_journal', journalId), journalEntry));
+          cachedTradingJournal = upsertJournalEntry(cachedTradingJournal, journalId, journalEntry);
+          syncJournalToDisk(cachedTradingJournal);
 
           const newPos: PaperPosition = {
-            id: newPosRef.id, symbol, side: side as 'LONG' | 'SHORT', entryPrice: currentPrice, size, unrealizedPnl: 0,
+            id: posId, symbol, side: side as 'LONG' | 'SHORT', entryPrice: currentPrice, size, unrealizedPnl: 0,
             takeProfit: tpPrice,
-            stopLoss: slPrice, 
+            stopLoss: slPrice,
             target1: signalData?.targets?.t1 || 0,
+            leverage: getLeverageForSymbol(symbol),
             status: 'OPEN', openedAt: new Date().toISOString(), signalId, journalId,
             isHedge: reason.includes('Lock') || reason.includes('Hedge'),
             realizedHedgeProfit: 0
           };
-          backgroundSyncFirestore(setDoc(newPosRef, newPos));
-          
-          const posWithPnl = { ...newPos, currentPnl: 0, pnlPct: 0 };
-          openPositions.push(posWithPnl);
+          // BFX-2A: ID uniqueness guard — abort insert jika ID sudah ada
+          if (!insertPaperPosition(cachedPaperPositions, newPos)) return null as any;
+          syncPositionsToDisk(cachedPaperPositions);
+
+          // openPositions === cachedPaperPositions (same reference) — jangan push lagi!
+          // Ambil referensi langsung ke object yang sudah diinsert agar mutasi propagate ke array.
+          const insertedPos = cachedPaperPositions.find(p => p.id === newPos.id)!;
+          insertedPos.currentPnl = 0;
+          insertedPos.pnlPct = 0;
           updateWalletState();
-          
+
           await sendTelegramMessage(`[PAPER] 🟢 <b>Opened ${side} ${symbol}</b>\nReason: ${reason}\nEntry: $${currentPrice.toFixed(4)}\nTP: $${tpPrice.toFixed(4)}\nSL: $${slPrice.toFixed(4)}`);
-          return posWithPnl;
+          return insertedPos;
         };
 
         // Helper to add size to position
         const addSize = async (pos: any, additionalSize: number, reason: string, signalId: string) => {
           const newTotalSize = pos.size + additionalSize;
           const newAvgEntry = ((pos.size * pos.entryPrice) + (additionalSize * currentPrice)) / newTotalSize;
-          
-          backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', pos.id), {
-            size: newTotalSize, entryPrice: newAvgEntry, lastSignalId: signalId
-          }, { merge: true }));
 
           pos.size = newTotalSize;
           pos.entryPrice = newAvgEntry;
           pos.lastSignalId = signalId;
-          
+
           const index = openPositions.findIndex(p => p.id === pos.id);
           if (index > -1) {
             openPositions[index].size = newTotalSize;
             openPositions[index].entryPrice = newAvgEntry;
           }
-          
+          const cIdx = cachedPaperPositions.findIndex(p => p.id === pos.id);
+          if (cIdx > -1) {
+            cachedPaperPositions[cIdx].size = newTotalSize;
+            cachedPaperPositions[cIdx].entryPrice = newAvgEntry;
+          }
+          syncPositionsToDisk(cachedPaperPositions);
+
           updateWalletState();
           await sendTelegramMessage(`[PAPER] ➕ <b>Added to ${pos.side} ${symbol}</b>\nReason: ${reason}\nNew Avg Entry: $${newAvgEntry.toFixed(4)}\nNew Size: ${newTotalSize.toFixed(4)}`);
         };
@@ -1806,155 +2171,165 @@ async function runPaperTradingEngine() {
         const decisions: TradeDecision[] = [];
 
         if (wallet.isEmergencyDeRisking && wallet.marginRatio > 15) {
-          if (longPos && shortPos) {
-            // Hedged position: Unlock or Reduce the profitable leg
-            if (longPos.currentPnl > 0) {
-              if (longPos.size > shortPos.size) {
-                const excessSize = longPos.size - shortPos.size;
-                decisions.push({ action: 'PARTIAL_CLOSE', targetPositionId: longPos.id, size: excessSize, reason: 'Emergency De-Risk (Reduce Long to 1:1)' });
-              } else {
-                decisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Emergency De-Risk (Unlock Long)' });
+          // === BFX-1: Emergency De-Risk Cooldown Guard ===
+          const DERISK_COOLDOWN_MS = 300_000; // 5 menit
+          const nowMs = Date.now();
+          const lastDeRisk = Math.max(
+            longPos?.lastEmergencyDeRiskAt ?? 0,
+            shortPos?.lastEmergencyDeRiskAt ?? 0
+          );
+          if (nowMs - lastDeRisk < DERISK_COOLDOWN_MS) {
+            const remSec = Math.round((DERISK_COOLDOWN_MS - (nowMs - lastDeRisk)) / 1000);
+            console.log(`[DERISK-COOLDOWN] ${symbol} | cooldown aktif, sisa ${remSec}s`);
+          } else {
+            // Cooldown habis — jalankan aksi Emergency De-Risk
+            if (longPos && shortPos) {
+              // Hedged position: Unlock or Reduce the profitable leg
+              if ((longPos.currentPnl ?? 0) > 0) {
+                if (longPos.size > shortPos.size) {
+                  const excessSize = longPos.size - shortPos.size;
+                  decisions.push({ action: 'PARTIAL_CLOSE', targetPositionId: longPos.id, size: excessSize, reason: 'Emergency De-Risk (Reduce Long to 1:1)' });
+                } else {
+                  // === BFX-5: Guard sebelum Unlock Long ===
+                  const unlockCheck = isPartnerLegSafeToUnlock(cachedPaperPositions, symbol, 'LONG');
+                  if (!unlockCheck.safe) {
+                    console.warn(unlockCheck.reason);
+                  } else {
+                    console.log(`[BFX-5] UNLOCK OK: ${symbol} LONG — ${unlockCheck.reason}`);
+                    decisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Emergency De-Risk (Unlock Long)' });
+                    longPos = undefined;
+                    if (shortPos) {
+                      const newSl = (currentPrice ?? 0) * (1 + (setting.lockTriggerPct || 2.0) / 100);
+                      decisions.push({ action: 'MODIFY_POSITION', targetPositionId: shortPos.id, newSl, reason: 'Emergency De-Risk (Update SL)' });
+                    }
+                  }
+                  // === END BFX-5 ===
+                }
+              } else if ((shortPos.currentPnl ?? 0) > 0) {
+                if (shortPos.size > longPos.size) {
+                  const excessSize = shortPos.size - longPos.size;
+                  decisions.push({ action: 'PARTIAL_CLOSE', targetPositionId: shortPos.id, size: excessSize, reason: 'Emergency De-Risk (Reduce Short to 1:1)' });
+                } else {
+                  // === BFX-5: Guard sebelum Unlock Short ===
+                  const unlockCheck = isPartnerLegSafeToUnlock(cachedPaperPositions, symbol, 'SHORT');
+                  if (!unlockCheck.safe) {
+                    console.warn(unlockCheck.reason);
+                  } else {
+                    console.log(`[BFX-5] UNLOCK OK: ${symbol} SHORT — ${unlockCheck.reason}`);
+                    decisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Emergency De-Risk (Unlock Short)' });
+                    shortPos = undefined;
+                    if (longPos) {
+                      const newSl = (currentPrice ?? 0) * (1 - (setting.lockTriggerPct || 2.0) / 100);
+                      decisions.push({ action: 'MODIFY_POSITION', targetPositionId: longPos.id, newSl, reason: 'Emergency De-Risk (Update SL)' });
+                    }
+                  }
+                  // === END BFX-5 ===
+                }
+              }
+            } else if (longPos && !shortPos) {
+              if ((longPos.currentPnl ?? 0) > 0) {
+                decisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Emergency De-Risk (Take Profit Long)' });
                 longPos = undefined;
-                // Update shortPos SL to prevent immediate re-hedge
-                if (shortPos) {
-                  const newSl = currentPrice * (1 + (setting.lockTriggerPct || 2.0) / 100);
-                  decisions.push({ action: 'MODIFY_POSITION', targetPositionId: shortPos.id, newSl, reason: 'Emergency De-Risk (Update SL)' });
-                }
               }
-            } else if (shortPos.currentPnl > 0) {
-              if (shortPos.size > longPos.size) {
-                const excessSize = shortPos.size - longPos.size;
-                decisions.push({ action: 'PARTIAL_CLOSE', targetPositionId: shortPos.id, size: excessSize, reason: 'Emergency De-Risk (Reduce Short to 1:1)' });
-              } else {
-                decisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Emergency De-Risk (Unlock Short)' });
+            } else if (shortPos && !longPos) {
+              if ((shortPos.currentPnl ?? 0) > 0) {
+                decisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Emergency De-Risk (Take Profit Short)' });
                 shortPos = undefined;
-                // Update longPos SL to prevent immediate re-hedge
-                if (longPos) {
-                  const newSl = currentPrice * (1 - (setting.lockTriggerPct || 2.0) / 100);
-                  decisions.push({ action: 'MODIFY_POSITION', targetPositionId: longPos.id, newSl, reason: 'Emergency De-Risk (Update SL)' });
-                }
               }
             }
-          } else if (longPos && !shortPos) {
-            // Single leg: Close if profitable
-            if (longPos.currentPnl > 0) {
-              decisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Emergency De-Risk (Take Profit Long)' });
-              longPos = undefined;
-            }
-          } else if (shortPos && !longPos) {
-            // Single leg: Close if profitable
-            if (shortPos.currentPnl > 0) {
-              decisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Emergency De-Risk (Take Profit Short)' });
-              shortPos = undefined;
-            }
-          }
+          } // end else (cooldown habis)
         }
 
         // --- EXECUTION LOOP FOR 1C-1a ---
         for (const decision of decisions) {
           if (decision.action === 'CLOSE_POSITION') {
             const pos = openPositions.find(p => p.id === decision.targetPositionId);
-            if (pos) await closePos(pos, decision.reason);
+            if (pos) {
+              console.log(`[BFX-4] CLOSE: ${symbol} ${pos.side} size=${pos.size} — reason: ${decision.reason}`);
+              await closePos(pos, decision.reason);
+            }
           } else if (decision.action === 'PARTIAL_CLOSE') {
             const pos = openPositions.find(p => p.id === decision.targetPositionId);
-            if (pos) await partialClosePos(pos, decision.size, decision.reason);
+            if (pos) {
+              console.log(`[BFX-4] REDUCE: ${symbol} ${pos.side} close ${decision.size} dari total ${pos.size} — target 1:1`);
+              await partialClosePos(pos, decision.size, decision.reason);
+            }
           } else if (decision.action === 'MODIFY_POSITION') {
             const pos = openPositions.find(p => p.id === decision.targetPositionId);
             if (pos) pos.stopLoss = decision.newSl;
-            backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', decision.targetPositionId), { stopLoss: decision.newSl }, { merge: true }));
+            const cIdx = cachedPaperPositions.findIndex(p => p.id === decision.targetPositionId);
+            if (cIdx > -1) cachedPaperPositions[cIdx].stopLoss = decision.newSl;
+            syncPositionsToDisk(cachedPaperPositions);
           }
         }
 
-        // --- 1. EXIT LOGIC (Sentinel Targets) ---
-        const exitDecisions: TradeDecision[] = [];
-
-        if (longPos && shortPos) {
-          // TODO: Implement BEP_NET_PRICE calculation to account for fees and realized hedge profit
-          
-          // Calculate Structural BEP_GROSS_PRICE
-          const currentStructure = classifyStructure(longPos.size, shortPos.size);
-          if (currentStructure !== 'LOCK_1TO1') {
-            const bepGross = ((longPos.size * longPos.entryPrice) - (shortPos.size * shortPos.entryPrice)) / (longPos.size - shortPos.size);
-            
-            let isAtBep = false;
-            if (longPos.size > shortPos.size) {
-              // Net LONG
-              isAtBep = currentPrice >= bepGross;
-            } else {
-              // Net SHORT
-              isAtBep = currentPrice <= bepGross;
+        // BFX-1: Setelah execution loop — set cooldown timestamp jika ada aksi de-risk
+        if (decisions.length > 0) {
+          const tsNow = Date.now();
+          for (const pos of cachedPaperPositions) {
+            if (pos.symbol === symbol && pos.status === 'OPEN') {
+              pos.lastEmergencyDeRiskAt = tsNow;
             }
-
-            if (isAtBep) {
-              exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Structural BEP Gross Reached (Hedge Resolved)' });
-              exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Structural BEP Gross Reached (Hedge Resolved)' });
-              longPos = undefined; shortPos = undefined;
-              const reclass = reclassifyState(longPos, shortPos, currentPrice);
-              console.log(`[PAPER] Post-Action Reclass (Hedge Resolved) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
-            }
-          } else {
-            // LOCK_1TO1 (toleransi 0.95–1.05): skip BEP, tunggu perubahan struktur
-            console.log(`[PAPER] LOCK_1TO1 detected for ${symbol}, skip BEP calculation.`);
           }
-        } else {
-          if (longPos) {
-            const isAtTP = currentPrice >= longPos.takeProfit;
-            // Only exit on SL if lock11Mode is disabled. If enabled, we hedge instead.
-            const isAtSL = !setting.lock11Mode && longPos.stopLoss > 0 && currentPrice <= longPos.stopLoss;
-            
-            if (isAtTP) {
-              if (longPos.currentPnl >= 0) {
-                exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Take Profit (Sentinel Target)' });
-                longPos = undefined;
-                const reclass = reclassifyState(longPos, shortPos, currentPrice);
-                console.log(`[PAPER] Post-Action Reclass (TP) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
-              } else {
-                console.log(`[PAPER] SKIP TP for ${symbol} LONG: Position is RED (currentPnl < 0). Golden Rule enforced.`);
+          syncPositionsToDisk(cachedPaperPositions);
+          console.log(`[DERISK-COOLDOWN] ${symbol} | cooldown dimulai`);
+        }
+
+        // === Step 1C-1b: Collect exit decisions via exitEvaluator ===
+        const symbolPositionsForExit = openPositions.filter(p => p.symbol === symbol && p.status === 'OPEN');
+        const exitDecisions1C1b = collectExitDecisions(symbolPositionsForExit);
+        if (exitDecisions1C1b.length > 0) {
+          console.log(`[1C-1b] ${exitDecisions1C1b.length} exit decision(s) collected for ${symbol}`);
+        }
+
+        // === Step 1C-1b: Execute exit decisions ===
+        for (const ed of exitDecisions1C1b) {
+          try {
+            console.log(
+              `[1C-1b] EXECUTING: ${ed.type} | ${ed.symbol} | ` +
+              `reason="${ed.reason}" | expectedPnl=${ed.expectedPnl.toFixed(2)}`
+            );
+            for (const posToClose of ed.positionsToClose) {
+              const pos = openPositions.find(p => p.id === posToClose.id && p.status === 'OPEN');
+              if (pos) {
+                await closePos(pos, ed.reason);
+                // Sync local refs agar parity evaluator tidak act on closed position
+                if (longPos?.id === posToClose.id) longPos = undefined;
+                if (shortPos?.id === posToClose.id) shortPos = undefined;
               }
-            } else if (isAtSL) {
-              exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Stop Loss (Sentinel Target)' });
-              longPos = undefined;
-              const reclass = reclassifyState(longPos, shortPos, currentPrice);
-              console.log(`[PAPER] Post-Action Reclass (SL) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
             }
-          }
-          if (shortPos) {
-            const isAtTP = currentPrice <= shortPos.takeProfit;
-            // Only exit on SL if lock11Mode is disabled. If enabled, we hedge instead.
-            const isAtSL = !setting.lock11Mode && shortPos.stopLoss > 0 && currentPrice >= shortPos.stopLoss;
-            
-            if (isAtTP) {
-              if (shortPos.currentPnl >= 0) {
-                exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Take Profit (Sentinel Target)' });
-                shortPos = undefined;
-                const reclass = reclassifyState(longPos, shortPos, currentPrice);
-                console.log(`[PAPER] Post-Action Reclass (TP) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
-              } else {
-                console.log(`[PAPER] SKIP TP for ${symbol} SHORT: Position is RED (currentPnl < 0). Golden Rule enforced.`);
-              }
-            } else if (isAtSL) {
-              exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Stop Loss (Sentinel Target)' });
-              shortPos = undefined;
+            if (exitDecisions1C1b.length > 0) {
               const reclass = reclassifyState(longPos, shortPos, currentPrice);
-              console.log(`[PAPER] Post-Action Reclass (SL) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+              console.log(`[1C-1b] Post-exit reclass: ${symbol} | Structure=${reclass.structure} GreenLeg=${reclass.greenLeg}`);
             }
+          } catch (err) {
+            console.error(`[1C-1b] Exit execution failed for ${ed.symbol}:`, err);
           }
         }
+        // === END Step 1C-1b ===
 
-        // --- EXECUTION LOOP FOR HF Exit Logic ---
-        for (const decision of exitDecisions) {
-          if (decision.action === 'CLOSE_POSITION') {
-            const pos = openPositions.find(p => p.id === decision.targetPositionId);
-            if (pos) await closePos(pos, decision.reason);
-          } else if (decision.action === 'PARTIAL_CLOSE') {
-            const pos = openPositions.find(p => p.id === decision.targetPositionId);
-            if (pos) await partialClosePos(pos, decision.size, decision.reason);
-          } else if (decision.action === 'MODIFY_POSITION') {
-            const pos = openPositions.find(p => p.id === decision.targetPositionId);
-            if (pos) pos.stopLoss = decision.newSl;
-            backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', decision.targetPositionId), { stopLoss: decision.newSl }, { merge: true }));
-          }
-        }
+        // === DEPRECATED by Step 1C-1b — akan dihapus setelah validasi selesai ===
+        // --- 1. EXIT LOGIC (Sentinel Targets) — lama, diganti exitEvaluator ---
+        // const exitDecisions: TradeDecision[] = [];
+        // if (longPos && shortPos) {
+        //   const currentStructure = classifyStructure(longPos.size, shortPos.size);
+        //   if (currentStructure !== 'LOCK_1TO1') {
+        //     const bepGross = ((longPos.size * longPos.entryPrice) - (shortPos.size * shortPos.entryPrice)) / (longPos.size - shortPos.size);
+        //     let isAtBep = longPos.size > shortPos.size ? currentPrice >= bepGross : currentPrice <= bepGross;
+        //     if (isAtBep) {
+        //       exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: longPos.id, reason: 'Structural BEP Gross Reached (Hedge Resolved)' });
+        //       exitDecisions.push({ action: 'CLOSE_POSITION', targetPositionId: shortPos.id, reason: 'Structural BEP Gross Reached (Hedge Resolved)' });
+        //       longPos = undefined; shortPos = undefined;
+        //     }
+        //   } else { console.log(`[PAPER] LOCK_1TO1 detected for ${symbol}, skip BEP.`); }
+        // } else {
+        //   if (longPos) { /* TP + SL long */ }
+        //   if (shortPos) { /* TP + SL short */ }
+        // }
+        // for (const decision of exitDecisions) {
+        //   if (decision.action === 'CLOSE_POSITION') { const pos = openPositions.find(p => p.id === decision.targetPositionId); if (pos) await closePos(pos, decision.reason); }
+        // }
+        // === END DEPRECATED ===
 
         // --- 2. HEDGE LOGIC (LOCK 1:1 - Based on Sentinel SL/Structure) ---
         // --- PAPER TRADING EVALUATOR SWITCH ONLY ---
@@ -1994,11 +2369,12 @@ async function runPaperTradingEngine() {
 
           console.log(`[PARITY DEBUG] Symbol: ${symbol}`);
           console.log(`[PARITY DEBUG] freshSignal.smc:`, freshSignal ? JSON.stringify(freshSignal.smc) : 'No freshSignal');
+          console.log(`[RC-1] ${symbol}: enrichedSignal.trend=`, enrichedSignal ? JSON.stringify(enrichedSignal.trend) : 'null');
 
           const { inputState, parityResult } = await evaluateParityPaper({
             symbol,
             currentPrice,
-            freshSignal,
+            freshSignal: enrichedSignal,
             longPos,
             shortPos,
             wallet,
@@ -2009,6 +2385,19 @@ async function runPaperTradingEngine() {
             mrProjected: wallet.marginRatio * 1.05,
           });
           currentParityResult = parityResult;
+          handlePaperDecisionOutput(symbol, {
+            recommendedAction: parityResult.final_action,
+            whyBlocked:        parityResult.why_blocked ?? null,
+            whyAllowed:        parityResult.why_allowed ?? null,
+            structure:         inputState.position.Structure,
+            primaryTrend4H:    inputState.market.PrimaryTrend4H,
+            trendStatus:       inputState.market.TrendStatus,
+            contextMode:       inputState.position.ContextMode,
+            greenLeg:          inputState.position.GreenLeg,
+            redLeg:            inputState.position.RedLeg,
+            hedgeLegStatus:    inputState.position.HedgeLegStatus,
+            mrProjected:       inputState.risk?.MRProjected ?? null,
+          } as Record<string, unknown>, wallet.marginRatio ?? 0);
 
           addLog(
             `[PARITY_V2] ${symbol} input=${JSON.stringify(inputState)} output=${JSON.stringify({
@@ -2053,6 +2442,11 @@ async function runPaperTradingEngine() {
             shortPos,
             parityResult,
             openPos: async (side, signal, sizeOverride) => {
+              // === BFX-4: Block all new positions during Emergency De-Risk ===
+              if (wallet.isEmergencyDeRisking) {
+                console.warn(`[BFX-4] BLOCK openPos: isEmergencyDeRisking=true — ${symbol} ${side} BLOCKED (action: ${parityResult?.final_action})`);
+                return;
+              }
               const entryMultiplier = setting.structure21Mode ? 2.0 : 1.0;
               let size = sizeOverride || ((wallet.balance / currentPrice) * entryMultiplier);
               const maxAllowedSize = (wallet.balance * ((setting.maxMrPct || 25.0) / 100)) / currentPrice;
@@ -2070,24 +2464,37 @@ async function runPaperTradingEngine() {
               await closePos(pos, reason);
             },
             addLog,
+            // BFX-5: pass unlock guard to parity execute
+            isUnlockAllowed: (hedgeSide) => isPartnerLegSafeToUnlock(cachedPaperPositions, symbol, hedgeSide),
           });
 
         } else {
-          if (setting.lock11Mode) {
+          if (setting.lock11Mode && !wallet.isEmergencyDeRisking) {
+            // BFX-4: Lock 1:1 trigger BLOCKED during Emergency De-Risk — opening new position increases margin
             // Trigger hedge if price hits Stop Loss level instead of fixed %
             if (longPos && !shortPos) {
               const triggerHedge = longPos.stopLoss > 0 ? (currentPrice <= longPos.stopLoss) : (longPos.pnlPct <= -2.0);
               if (triggerHedge) {
-                shortPos = await openPos('SHORT', longPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
-                const reclass = reclassifyState(longPos, shortPos, currentPrice);
-                console.log(`[PAPER] Post-Action Reclass (Hedge Trigger) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                // === Import Annotation: Guard HEDGE_TRIGGER_HIT ===
+                if (isHedgeTriggerSuppressed(cachedPaperPositions, symbol)) {
+                  // Supervisor annotation active — skip re-lock, keep as SINGLE
+                } else {
+                  shortPos = await openPos('SHORT', longPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
+                  const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                  console.log(`[PAPER] Post-Action Reclass (Hedge Trigger) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                }
               }
             } else if (shortPos && !longPos) {
               const triggerHedge = shortPos.stopLoss > 0 ? (currentPrice >= shortPos.stopLoss) : (shortPos.pnlPct <= -2.0);
               if (triggerHedge) {
-                longPos = await openPos('LONG', shortPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
-                const reclass = reclassifyState(longPos, shortPos, currentPrice);
-                console.log(`[PAPER] Post-Action Reclass (Hedge Trigger) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                // === Import Annotation: Guard HEDGE_TRIGGER_HIT ===
+                if (isHedgeTriggerSuppressed(cachedPaperPositions, symbol)) {
+                  // Supervisor annotation active — skip re-lock, keep as SINGLE
+                } else {
+                  longPos = await openPos('LONG', shortPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
+                  const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                  console.log(`[PAPER] Post-Action Reclass (Hedge Trigger) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                }
               }
             }
           }
@@ -2128,35 +2535,49 @@ async function runPaperTradingEngine() {
                   // A. Unlocking Logic (Close hedge if in profit and signal aligns)
                   // HANYA BOLEH UNLOCK (Tutup posisi hedge) JIKA POSISI HEDGE TERSEBUT SEDANG PROFIT.
                   if (signalSide === 'LONG' && shortPos.currentPnl > 0) {
-                    const realized = shortPos.currentPnl;
-                    await closePos(shortPos, 'Unlock (Hedge in Profit)');
-                    shortPos = undefined;
-                    if (longPos) {
-                      longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + realized;
-                      longPos.lastSignalId = freshSignal.id;
-                      backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { 
-                        realizedHedgeProfit: longPos.realizedHedgeProfit,
-                        lastSignalId: freshSignal.id
-                      }, { merge: true }));
+                    // === BFX-5: Guard sebelum Unlock Short ===
+                    const unlockCheck = isPartnerLegSafeToUnlock(cachedPaperPositions, symbol, 'SHORT');
+                    if (!unlockCheck.safe) {
+                      console.warn(unlockCheck.reason);
+                    } else {
+                      console.log(`[BFX-5] UNLOCK OK: ${symbol} SHORT — ${unlockCheck.reason}`);
+                      const realized = shortPos.currentPnl;
+                      await closePos(shortPos, 'Unlock (Hedge in Profit)');
+                      shortPos = undefined;
+                      if (longPos) {
+                        longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + realized;
+                        longPos.lastSignalId = freshSignal.id;
+                        const cIdx = cachedPaperPositions.findIndex(p => p.id === longPos!.id);
+                        if (cIdx > -1) { (cachedPaperPositions[cIdx] as any).realizedHedgeProfit = longPos.realizedHedgeProfit; (cachedPaperPositions[cIdx] as any).lastSignalId = freshSignal.id; }
+                        syncPositionsToDisk(cachedPaperPositions);
+                      }
+                      const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                      console.log(`[PAPER] Post-Action Reclass (Unlock Short) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                      (freshSignal as any).reclass = reclass;
                     }
-                    const reclass = reclassifyState(longPos, shortPos, currentPrice);
-                    console.log(`[PAPER] Post-Action Reclass (Unlock Short) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
-                    (freshSignal as any).reclass = reclass;
+                    // === END BFX-5 ===
                   } else if (signalSide === 'SHORT' && longPos.currentPnl > 0) {
-                    const realized = longPos.currentPnl;
-                    await closePos(longPos, 'Unlock (Hedge in Profit)');
-                    longPos = undefined;
-                    if (shortPos) {
-                      shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + realized;
-                      shortPos.lastSignalId = freshSignal.id;
-                      backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { 
-                        realizedHedgeProfit: shortPos.realizedHedgeProfit,
-                        lastSignalId: freshSignal.id
-                      }, { merge: true }));
+                    // === BFX-5: Guard sebelum Unlock Long ===
+                    const unlockCheck = isPartnerLegSafeToUnlock(cachedPaperPositions, symbol, 'LONG');
+                    if (!unlockCheck.safe) {
+                      console.warn(unlockCheck.reason);
+                    } else {
+                      console.log(`[BFX-5] UNLOCK OK: ${symbol} LONG — ${unlockCheck.reason}`);
+                      const realized = longPos.currentPnl;
+                      await closePos(longPos, 'Unlock (Hedge in Profit)');
+                      longPos = undefined;
+                      if (shortPos) {
+                        shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + realized;
+                        shortPos.lastSignalId = freshSignal.id;
+                        const cIdx = cachedPaperPositions.findIndex(p => p.id === shortPos!.id);
+                        if (cIdx > -1) { (cachedPaperPositions[cIdx] as any).realizedHedgeProfit = shortPos.realizedHedgeProfit; (cachedPaperPositions[cIdx] as any).lastSignalId = freshSignal.id; }
+                        syncPositionsToDisk(cachedPaperPositions);
+                      }
+                      const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                      console.log(`[PAPER] Post-Action Reclass (Unlock Long) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                      (freshSignal as any).reclass = reclass;
                     }
-                    const reclass = reclassifyState(longPos, shortPos, currentPrice);
-                    console.log(`[PAPER] Post-Action Reclass (Unlock Long) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
-                    (freshSignal as any).reclass = reclass;
+                    // === END BFX-5 ===
                   }
                   
                   if (longPos && shortPos) {
@@ -2197,10 +2618,9 @@ async function runPaperTradingEngine() {
                           await partialClosePos(longPos, excessSize, 'Reduce Long (Trend Reversed DOWN)');
                           longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + excessPnl;
                           longPos.lastSignalId = freshSignal.id;
-                          backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { 
-                            realizedHedgeProfit: longPos.realizedHedgeProfit,
-                            lastSignalId: freshSignal.id
-                          }, { merge: true }));
+                          const cIdxL = cachedPaperPositions.findIndex(p => p.id === longPos.id);
+                          if (cIdxL > -1) { (cachedPaperPositions[cIdxL] as any).realizedHedgeProfit = longPos.realizedHedgeProfit; (cachedPaperPositions[cIdxL] as any).lastSignalId = freshSignal.id; }
+                          syncPositionsToDisk(cachedPaperPositions);
                           longPos.size -= excessSize; // Post-action reclass
                           actionTaken = true;
                         }
@@ -2223,7 +2643,7 @@ async function runPaperTradingEngine() {
                           riskOverride = 'ADVERSE_MOVE_BLOCK';
                           console.log(`[PAPER] Expansion blocked due to adverse spot move > 4% for ${symbol}`);
                         } else if (setting.structure21Mode || isLockExitUrgencyShort) {
-                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, shortPos.id, additionalSize, currentPrice, LEVERAGE);
+                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, shortPos.id, additionalSize, currentPrice, EFFECTIVE_LEVERAGE);
                           if (projectedMr < 25 && shortPos.size < baseSize * 2 && wallet.freeMargin > 0) {
                             const reason = isLockExitUrgencyShort ? 'LOCK_EXIT_URGENCY (Margin-Aware Override)' : 'Add 0.5x to Short (Trend Continuation DOWN)';
                             await addSize(shortPos, additionalSize, reason, freshSignal.id);
@@ -2244,10 +2664,9 @@ async function runPaperTradingEngine() {
                           await partialClosePos(shortPos, excessSize, 'Reduce Short (Trend Reversed UP)');
                           shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + excessPnl;
                           shortPos.lastSignalId = freshSignal.id;
-                          backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { 
-                            realizedHedgeProfit: shortPos.realizedHedgeProfit,
-                            lastSignalId: freshSignal.id
-                          }, { merge: true }));
+                          const cIdxS = cachedPaperPositions.findIndex(p => p.id === shortPos.id);
+                          if (cIdxS > -1) { (cachedPaperPositions[cIdxS] as any).realizedHedgeProfit = shortPos.realizedHedgeProfit; (cachedPaperPositions[cIdxS] as any).lastSignalId = freshSignal.id; }
+                          syncPositionsToDisk(cachedPaperPositions);
                           shortPos.size -= excessSize; // Post-action reclass
                           actionTaken = true;
                         }
@@ -2271,7 +2690,7 @@ async function runPaperTradingEngine() {
                           console.log(`[PAPER] Expansion blocked due to adverse spot move > 4% for ${symbol}`);
                         } else if (setting.structure21Mode || isLockExitUrgencyLong) {
                           // Trend UP, LONG profit. ADD_LONG untuk struktur 2:1 (LONG 2, SHORT 1).
-                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, longPos.id, additionalSize, currentPrice, LEVERAGE);
+                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, longPos.id, additionalSize, currentPrice, EFFECTIVE_LEVERAGE);
                           if (projectedMr < 25 && longPos.size < baseSize * 2 && wallet.freeMargin > 0) {
                             const reason = isLockExitUrgencyLong ? 'LOCK_EXIT_URGENCY (Margin-Aware Override)' : 'Add 0.5x to Long (Trend Continuation UP)';
                             await addSize(longPos, additionalSize, reason, freshSignal.id);
@@ -2295,7 +2714,7 @@ async function runPaperTradingEngine() {
                         console.log(`[PAPER] Recovery expansion blocked due to adverse spot move > 4% for ${symbol}`);
                       } else {
                         if (signalSide === 'LONG' && longPos.size < baseSize * 2) {
-                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, longPos.id, additionalSize, currentPrice, LEVERAGE);
+                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, longPos.id, additionalSize, currentPrice, EFFECTIVE_LEVERAGE);
                           if (projectedMr < 25) {
                             await addSize(longPos, additionalSize, `Add 0.5x to Long (Recovery Mode)`, freshSignal.id);
                             longPos.size += additionalSize;
@@ -2304,7 +2723,7 @@ async function runPaperTradingEngine() {
                             riskOverride = 'MR_BLOCK';
                           }
                         } else if (signalSide === 'SHORT' && shortPos.size < baseSize * 2) {
-                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, shortPos.id, additionalSize, currentPrice, LEVERAGE);
+                          const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, shortPos.id, additionalSize, currentPrice, EFFECTIVE_LEVERAGE);
                           if (projectedMr < 25) {
                             await addSize(shortPos, additionalSize, `Add 0.5x to Short (Recovery Mode)`, freshSignal.id);
                             shortPos.size += additionalSize;
@@ -2356,20 +2775,17 @@ async function runPaperTradingEngine() {
             nextAction: parityV2 ? (currentParityResult?.operational_action || 'HOLD') : 'NONE',
             updatedAt: new Date().toISOString()
           };
-          backgroundSyncFirestore(setDoc(monitoringRef, monitoringData));
-          
+          // [LOCAL-STORE] monitoring tidak dipersist ke disk (in-memory only)
+
           if (longPos) {
-            backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', longPos.id), { 
-              unrealizedPnl: longPos.currentPnl, 
-              currentPrice: currentPrice 
-            }, { merge: true }));
+            const cL = cachedPaperPositions.findIndex(p => p.id === longPos!.id);
+            if (cL > -1) { cachedPaperPositions[cL].unrealizedPnl = longPos.currentPnl; (cachedPaperPositions[cL] as any).currentPrice = currentPrice; }
           }
           if (shortPos) {
-            backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', shortPos.id), { 
-              unrealizedPnl: shortPos.currentPnl, 
-              currentPrice: currentPrice 
-            }, { merge: true }));
+            const cS = cachedPaperPositions.findIndex(p => p.id === shortPos!.id);
+            if (cS > -1) { cachedPaperPositions[cS].unrealizedPnl = shortPos.currentPnl; (cachedPaperPositions[cS] as any).currentPrice = currentPrice; }
           }
+          syncPositionsToDisk(cachedPaperPositions);
           updateWalletState();
         }
 
@@ -2411,6 +2827,55 @@ async function runPaperTradingEngine() {
       }
     }
 
+    // === HF-3: Standalone LOCK_EXIT_URGENCY check ===
+    // Berjalan setiap siklus, TIDAK bergantung freshSignal (RC-3 fix)
+    if (!cachedPaperWallet.isEmergencyDeRisking) {
+      const hf3MrNow = cachedPaperWallet.marginRatio ?? 0;
+      const hf3Equity = cachedPaperWallet.equity ?? 0;
+
+      const hf3BySymbol = new Map<string, PaperPosition[]>();
+      for (const pos of cachedPaperPositions) {
+        if (pos.status !== 'OPEN') continue;
+        const group = hf3BySymbol.get(pos.symbol) ?? [];
+        group.push(pos);
+        hf3BySymbol.set(pos.symbol, group);
+      }
+
+      for (const [sym, group] of hf3BySymbol.entries()) {
+        const lp = group.find(p => p.side === 'LONG');
+        const sp = group.find(p => p.side === 'SHORT');
+        if (!lp || !sp) continue;
+
+        const hf3Trend = trendMap.get(sym);
+        if (!hf3Trend) continue;
+
+        const urgency = evaluateLockExitUrgency(lp, sp, hf3Trend, hf3MrNow, hf3Equity);
+
+        if (urgency.eligible) {
+          // Tambahkan rekomendasi ke monitoring feed — supervisor yang eksekusi (semi-auto)
+          const monIdx = cachedPaperMonitoring.findIndex(m => m.id === sym.replace('/', '_'));
+          if (monIdx >= 0) {
+            cachedPaperMonitoring[monIdx] = {
+              ...cachedPaperMonitoring[monIdx],
+              hf3Recommendation: {
+                action: 'ADD_0.5_LONG',
+                reason: urgency.reason,
+                suggestedQty: urgency.suggestedAddQty,
+                mrAfterAdd: urgency.mrProjectedAfterAdd,
+                evaluatedAt: new Date().toISOString(),
+              },
+            };
+          }
+          console.log(
+            `[HF-3] Decision ADD_LONG_0.5 untuk ${sym} ditambahkan ke monitoring feed ` +
+            `(suggestedQty=${urgency.suggestedAddQty?.toFixed(4)}, ` +
+            `MRafter=${urgency.mrProjectedAfterAdd?.toFixed(2)}%)`
+          );
+        }
+      }
+    }
+    // === END HF-3 ===
+
     // Clean up monitoring cache for symbols no longer being processed
     cachedPaperMonitoring = cachedPaperMonitoring.filter(m => symbolsToProcess.includes(m.symbol));
 
@@ -2422,16 +2887,259 @@ async function runPaperTradingEngine() {
 }
 
 // API Routes
+// ─── BFX-2A: ID Uniqueness Guard ─────────────────────────────────────────────
+function insertPaperPosition(positions: PaperPosition[], newPos: PaperPosition): boolean {
+  const existing = positions.find(p => p.id === newPos.id);
+  if (existing) {
+    console.error(
+      `[BFX-2-ID-COLLISION] ABORT: id=${newPos.id} sudah ada untuk ` +
+      `${existing.symbol} ${existing.side}. Mencoba insert ${newPos.symbol} ${newPos.side}.`
+    );
+    return false;
+  }
+  positions.push(newPos);
+  return true;
+}
+
+// ─── BFX-2B: Hedge Sizing Guard ──────────────────────────────────────────────
+const MAX_HEDGE_SIZE_RATIO = 1.05;
+function validateHedgeSize(hedgeSize: number, partnerLegSize: number, symbol: string, hedgeSide: string): boolean {
+  if (partnerLegSize > 0 && hedgeSize > partnerLegSize * MAX_HEDGE_SIZE_RATIO) {
+    console.error(
+      `[BFX-2-SIZING-ANOMALY] BLOK: ${symbol} ${hedgeSide} ` +
+      `hedgeSize=${hedgeSize.toFixed(6)} > partnerLeg=${partnerLegSize.toFixed(6)} × 1.05. ` +
+      `Aksi dibatalkan.`
+    );
+    return false;
+  }
+  return true;
+}
+
+// ─── BFX-2C: Startup Audit ───────────────────────────────────────────────────
+function auditPaperPositions(positions: PaperPosition[]): void {
+  const idCounts = new Map<string, number>();
+  for (const pos of positions) {
+    idCounts.set(pos.id, (idCounts.get(pos.id) ?? 0) + 1);
+  }
+  for (const [id, count] of idCounts.entries()) {
+    if (count > 1) console.warn(`[BFX-2-AUDIT] DUPLIKAT ID terdeteksi: ${id} muncul ${count}×`);
+  }
+  const bySymbol = new Map<string, PaperPosition[]>();
+  for (const pos of positions) {
+    if (!bySymbol.has(pos.symbol)) bySymbol.set(pos.symbol, []);
+    bySymbol.get(pos.symbol)!.push(pos);
+  }
+  for (const [symbol, posGroup] of bySymbol.entries()) {
+    if (posGroup.length < 2) continue;
+    const long = posGroup.find(p => p.side === 'LONG');
+    const short = posGroup.find(p => p.side === 'SHORT');
+    if (long && short) {
+      const ratio = Math.max(long.size, short.size) / Math.min(long.size, short.size);
+      if (ratio > 3.0) {
+        console.warn(
+          `[BFX-2-AUDIT] SIZING ANOMALI: ${symbol} ` +
+          `LONG=${long.size.toFixed(4)} SHORT=${short.size.toFixed(4)} ratio=${ratio.toFixed(1)}×`
+        );
+      }
+    }
+  }
+}
+
+// ─── BFX-5: Unlock Guard ─────────────────────────────────────────────────────
+const UNLOCK_ADVERSE_THRESHOLD_PCT = 4.0;
+
+/**
+ * Cek apakah aman untuk unlock hedge leg.
+ * BLOK jika partner leg (sisi berlawanan) masih adverse >4% — SOP Section 6.4.
+ */
+function isPartnerLegSafeToUnlock(
+  positions: PaperPosition[],
+  symbol: string,
+  hedgeSide: 'LONG' | 'SHORT'
+): { safe: boolean; reason: string } {
+  const partnerSide = hedgeSide === 'LONG' ? 'SHORT' : 'LONG';
+  const partnerLeg = positions.find(
+    p => p.symbol === symbol && p.side === partnerSide && p.status === 'OPEN'
+  );
+
+  if (!partnerLeg) {
+    return { safe: true, reason: `Tidak ada partner leg ${partnerSide} — posisi tunggal, unlock diizinkan` };
+  }
+
+  const partnerAdversePct = Math.abs((partnerLeg as any).pnlPct ?? 0);
+
+  if (partnerAdversePct > UNLOCK_ADVERSE_THRESHOLD_PCT) {
+    return {
+      safe: false,
+      reason:
+        `[BFX-5] BLOK unlock ${hedgeSide}: partner leg ${partnerSide} ` +
+        `adverse ${partnerAdversePct.toFixed(1)}% > ${UNLOCK_ADVERSE_THRESHOLD_PCT}% threshold. ` +
+        `SOP: tidak boleh meninggalkan partner leg naked saat masih merah berat.`,
+    };
+  }
+
+  return {
+    safe: true,
+    reason: `Partner leg ${partnerSide} adverse ${partnerAdversePct.toFixed(1)}% — dalam toleransi, unlock diizinkan`,
+  };
+}
+// ─── END BFX-5 ───────────────────────────────────────────────────────────────
+
+// ─── BFX-3: Post-Import Adverse Check ────────────────────────────────────────
+// === Import Annotation: Hedge trigger suppression guard ===
+/**
+ * Returns true jika posisi di symbol ini punya supervisorAnnotation.hedgeIntentionallyClosed=true.
+ * Default behavior (tanpa annotation) tidak berubah — returns false.
+ */
+function isHedgeTriggerSuppressed(positions: PaperPosition[], symbol: string): boolean {
+  const pos = positions.find(
+    p => p.symbol === symbol && p.supervisorAnnotation?.hedgeIntentionallyClosed === true
+  );
+  if (pos) {
+    console.log(
+      `[IMPORT-ANNOTATION] HEDGE_TRIGGER_HIT suppressed for ${symbol} — ` +
+      `supervisor annotation: "${pos.supervisorAnnotation?.reason ?? 'tidak ada'}"`
+    );
+    return true;
+  }
+  return false;
+}
+// === END Import Annotation guard ===
+
+interface AdverseAlert {
+  symbol: string;
+  side: string;
+  adversePct: number;
+  hasHedge: boolean;
+  supervisorOverride?: boolean; // Import Annotation — hedge intentionally closed
+}
+
+function runPostImportAdverseCheck(positions: PaperPosition[]): AdverseAlert[] {
+  const ADVERSE_THRESHOLD_PCT = 4.0;
+  const alerts: AdverseAlert[] = [];
+
+  for (const pos of positions) {
+    if (!pos.isLiveImport) continue;
+    if (pos.status !== 'OPEN') continue;
+
+    const entryNotional = pos.size * pos.entryPrice;
+    const pnlPct = entryNotional > 0 ? ((pos.unrealizedPnl || 0) / entryNotional) * 100 : 0;
+    const adversePct = Math.abs(pnlPct);
+    if (adversePct <= ADVERSE_THRESHOLD_PCT) continue;
+
+    const hasHedge = positions.some(
+      p => p.symbol === pos.symbol && p.side !== pos.side && p.status === 'OPEN'
+    );
+    const supervisorOverride = pos.supervisorAnnotation?.hedgeIntentionallyClosed === true;
+    alerts.push({ symbol: pos.symbol, side: pos.side, adversePct, hasHedge, supervisorOverride });
+  }
+
+  alerts.sort((a, b) => {
+    if (a.hasHedge !== b.hasHedge) return a.hasHedge ? 1 : -1;
+    return b.adversePct - a.adversePct;
+  });
+  return alerts;
+}
+
+function formatAdverseAlert(alerts: AdverseAlert[]): string {
+  const noHedge = alerts.filter(a => !a.hasHedge);
+  const withHedge = alerts.filter(a => a.hasHedge);
+
+  let msg = '🚨 <b>POST-IMPORT ADVERSE ALERT</b>\n';
+  msg += `Ditemukan ${alerts.length} pair adverse &gt;4% setelah import.\n\n`;
+
+  if (noHedge.length > 0) {
+    msg += '⛔ <b>TANPA HEDGE (perlu segera di-lock):</b>\n';
+    for (const a of noHedge) {
+      const overrideNote = a.supervisorOverride ? ' ⚡ supervisor override aktif' : '';
+      msg += `• ${a.symbol} ${a.side} | adverse <b>${a.adversePct.toFixed(1)}%</b>${overrideNote}\n`;
+    }
+    msg += '\n';
+  }
+  if (withHedge.length > 0) {
+    msg += '⚠️ <b>SUDAH ADA HEDGE (monitor):</b>\n';
+    for (const a of withHedge) {
+      const overrideNote = a.supervisorOverride ? ' ⚡ supervisor override aktif' : '';
+      msg += `• ${a.symbol} ${a.side} | adverse <b>${a.adversePct.toFixed(1)}%</b>${overrideNote}\n`;
+    }
+    msg += '\n';
+  }
+  msg += '<i>SOP: Pair &gt;4% adverse — ekspansi DILARANG. Hanya HOLD/LOCK/REDUCE leg hijau.</i>';
+  return msg;
+}
+
+/**
+ * Computes MAINTENANCE MARGIN for Margin Ratio calculation.
+ * Binance cross-margin hedge mode: maintenance margin is calculated INDEPENDENTLY for each position
+ * (both long AND short legs count — no netting for MM).
+ * MMR default = 1% (standard rate for mid-cap altcoins; BTC/ETH = 0.5% but altcoins = 1–2%).
+ * MR = totalMaintenanceMargin / equity × 100%
+ */
+function computeMaintenanceMargin(positions: PaperPosition[], overrideMmr?: number): number {
+  const DEFAULT_MMR = overrideMmr || 0.0117; // 1.17% — calibrated average for mid-cap altcoin portfolio
+  let total = 0;
+  for (const pos of positions) {
+    if (pos.status === 'OPEN') {
+      // Binance uses mark/current price for maintenance margin (not entry price)
+      const price = (pos as any).currentPrice || pos.entryPrice;
+      const notional = Math.max(0, pos.size * price);
+      const mmr = (pos as any).maintenanceMarginRate || DEFAULT_MMR;
+      total += notional * mmr;
+    }
+  }
+  return total;
+}
+
+/**
+ * Baca leverage untuk symbol dari cachedLeverageConfig.
+ * Priority: symbols[symbol] → symbols[baseSymbol] → default
+ */
+function getLeverageForSymbol(symbol: string): number {
+  const base = symbol.split(':')[0];
+  return cachedLeverageConfig.symbols[symbol]
+    ?? cachedLeverageConfig.symbols[base]
+    ?? cachedLeverageConfig.default;
+}
+
+/**
+ * Computes INITIAL MARGIN for Free Margin calculation.
+ * Binance cross-margin hedge mode: for INITIAL MARGIN, only the larger leg per symbol counts
+ * (hedge netting reduces initial margin requirement for balanced hedge pairs).
+ * freeMargin = equity − totalInitialMargin
+ */
+function computeHedgeMarginUsed(positions: PaperPosition[], overrideLeverage?: number): number {
+  // Binance cross-margin hedge mode: initial margin = max(long_notional, short_notional) / leverage
+  // Uses current mark price (not entry price) — Binance calculates IM on current price
+  // overrideLeverage: effective average leverage calibrated from actual Binance data at import time
+  const symbolNotionals: Record<string, { long: number; short: number; leverage: number }> = {};
+  for (const pos of positions) {
+    if (pos.status === 'OPEN') {
+      const baseSymbol = pos.symbol.split(':')[0];
+      if (!symbolNotionals[baseSymbol]) {
+        symbolNotionals[baseSymbol] = { long: 0, short: 0, leverage: overrideLeverage || pos.leverage || getLeverageForSymbol(baseSymbol) };
+      }
+      // Use currentPrice if available (updated by syncPaperPrices), fallback to entryPrice
+      const price = (pos as any).currentPrice || pos.entryPrice;
+      const notional = Math.max(0, pos.size * price);
+      if (pos.side === 'LONG') symbolNotionals[baseSymbol].long += notional;
+      else symbolNotionals[baseSymbol].short += notional;
+    }
+  }
+  let total = 0;
+  for (const { long, short, leverage } of Object.values(symbolNotionals)) {
+    total += Math.max(long, short) / leverage;
+  }
+  return total;
+}
+
 async function syncPaperPrices() {
   if (cachedPaperPositions.length === 0) return;
-  
+
   try {
     const symbols = Array.from(new Set(cachedPaperPositions.map(p => p.symbol)));
     const tickers = await binance.fetchTickers(symbols);
-    
+
     let totalUnrealized = 0;
-    let totalMarginUsed = 0;
-    const LEVERAGE = 20;
 
     for (const pos of cachedPaperPositions) {
       const ticker = tickers[pos.symbol] || tickers[`${pos.symbol}:USDT`];
@@ -2443,13 +3151,17 @@ async function syncPaperPrices() {
           pos.unrealizedPnl = priceDiff * pos.size;
         }
         totalUnrealized += (pos.unrealizedPnl || 0);
-        totalMarginUsed += calculateMarginUsed(pos, LEVERAGE);
       }
     }
 
+    // MR uses maintenance margin (both legs counted independently)
+    const totalMaintMargin = computeMaintenanceMargin(cachedPaperPositions, cachedPaperWallet.effectiveMmr);
+    // Free margin uses initial margin with hedge netting (max per symbol / leverage)
+    const totalInitialMargin = computeHedgeMarginUsed(cachedPaperPositions, cachedPaperWallet.effectiveLeverage);
+
     cachedPaperWallet.equity = cachedPaperWallet.balance + totalUnrealized;
-    cachedPaperWallet.freeMargin = cachedPaperWallet.equity - totalMarginUsed;
-    cachedPaperWallet.marginRatio = cachedPaperWallet.equity > 0 ? (totalMarginUsed / cachedPaperWallet.equity) * 100 : 0;
+    cachedPaperWallet.freeMargin = cachedPaperWallet.equity - totalInitialMargin;
+    cachedPaperWallet.marginRatio = cachedPaperWallet.equity > 0 ? (totalMaintMargin / cachedPaperWallet.equity) * 100 : 0;
     cachedPaperWallet.updatedAt = new Date().toISOString();
 
   } catch (err) {
@@ -2917,6 +3629,63 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+// [BUG-LEVERAGE] Leverage config endpoints
+app.get('/api/paper/leverage-config', (req, res) => {
+  res.json(cachedLeverageConfig);
+});
+
+app.put('/api/paper/leverage-config', (req, res) => {
+  try {
+    const body = req.body as Partial<LeverageConfig>;
+    if (body.default !== undefined) {
+      if (typeof body.default !== 'number' || body.default <= 0) {
+        return res.status(400).json({ error: 'default leverage harus number > 0' });
+      }
+      cachedLeverageConfig.default = body.default;
+    }
+    if (body.symbols !== undefined) {
+      if (typeof body.symbols !== 'object') {
+        return res.status(400).json({ error: 'symbols harus object' });
+      }
+      cachedLeverageConfig.symbols = { ...cachedLeverageConfig.symbols, ...body.symbols };
+    }
+    syncLeverageConfigToDisk(cachedLeverageConfig);
+    console.log('[BUG-LEVERAGE] Leverage config updated via API:', JSON.stringify(cachedLeverageConfig));
+    res.json({ ok: true, config: cachedLeverageConfig });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/ai-usage', (req, res) => {
+  const totalRuns    = aiRunHistory.length;
+  const successRuns  = aiRunHistory.filter(r => r.success).length;
+  const claudeRuns   = aiRunHistory.filter(r => r.provider === 'claude' || r.provider === 'claude-fallback').length;
+  const geminiRuns   = aiRunHistory.filter(r => r.provider === 'gemini' || r.provider === 'gemini-fallback').length;
+  const failedRuns   = aiRunHistory.filter(r => !r.success).length;
+  const estimatedCostUsd = claudeRuns * AI_COST_PER_RUN_USD;
+  // Session runs = entries since current server start
+  const sessionRuns = aiRunHistory.filter(r => r.timestamp >= aiRunSessionStart).length;
+  const avgDurationMs = totalRuns > 0
+    ? Math.round(aiRunHistory.reduce((s, r) => s + r.durationMs, 0) / totalRuns)
+    : 0;
+  res.json({
+    sessionStart: aiRunSessionStart,
+    sessionRuns,       // runs since last restart
+    totalRuns,         // all-time (persisted)
+    successRuns,
+    failedRuns,
+    claudeRuns,
+    geminiRuns,
+    estimatedCostUsd: parseFloat(estimatedCostUsd.toFixed(4)),
+    costPerRunUsd: AI_COST_PER_RUN_USD,
+    avgDurationMs,
+    model: CLAUDE_MODEL,
+    mode: 'MANUAL_ONLY',
+    history: aiRunHistory.slice(-10), // last 10 runs
+  });
+});
+
 app.get('/api/debug/state', (req, res) => {
   try {
     const registryState = PolicySelectors.getAllApprovedSettings();
@@ -2936,8 +3705,8 @@ app.get('/api/debug/db-check', async (req, res) => {
     const snap = await getDocs(collection(db, 'approved_settings'));
     const dbSettings = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     
-    const snapPos = await getDocs(collection(db, 'paper_positions'));
-    const dbPositions = snapPos.docs.map(d => ({ id: d.id, ...d.data() }));
+    // [LOCAL-STORE] paper_positions dibaca dari local JSON
+    const { positions: diskPositions, wallet: diskWallet } = loadAllFromDisk();
 
     res.json({
       cache: {
@@ -2945,11 +3714,14 @@ app.get('/api/debug/db-check', async (req, res) => {
         paperPositions: typeof cachedPaperPositions !== 'undefined' ? cachedPaperPositions : 'undefined',
         paperWallet: typeof cachedPaperWallet !== 'undefined' ? cachedPaperWallet : 'undefined'
       },
+      localStore: {
+        paperPositionsCount: diskPositions.length,
+        paperPositions: diskPositions,
+        paperWallet: diskWallet
+      },
       database: {
         approvedSettingsCount: dbSettings.length,
         approvedSettings: dbSettings,
-        paperPositionsCount: dbPositions.length,
-        paperPositions: dbPositions
       }
     });
   } catch (err: any) {
@@ -2966,23 +3738,18 @@ function addLog(msg: string) {
 
 
 async function archivePaperTradingData() {
-  if (!db) return { error: 'Firestore not initialized' };
-  
   try {
     addLog("📦 Starting Paper Trading Archiving...");
-    
-    // 1. Fetch data to archive
-    const historySnap = await getDocs(collection(db, 'paper_history'));
-    const journalSnap = await getDocs(collection(db, 'trading_journal'));
-    
-    const history = historySnap.docs.map(doc => ({ ...doc.data(), id: doc.id }));
-    const journal = journalSnap.docs.map(doc => ({ ...doc.data(), id: doc.id }));
-    
+
+    // 1. Fetch data dari local JSON store
+    const history = cachedPaperHistory;
+    const journal = cachedTradingJournal;
+
     if (history.length === 0 && journal.length === 0) {
       addLog("ℹ️ No paper trading data found to archive.");
       return { message: 'No data to archive' };
     }
-    
+
     const archiveData = {
       timestamp: new Date().toISOString(),
       paper_history: history,
@@ -3012,13 +3779,9 @@ async function archivePaperTradingData() {
       addLog("📱 Archive notification sent to Telegram.");
     }
     
-    // 5. Clear Firestore collections to save reads/space
+    // 5. [LOCAL-STORE] Data sudah diarchive ke GCS — local files tetap sebagai fallback
     if (gcsResult) {
-      const batch = writeBatch(db);
-      historySnap.docs.forEach(doc => batch.delete(doc.ref));
-      journalSnap.docs.forEach(doc => batch.delete(doc.ref));
-      await batch.commit();
-      addLog(`✅ Archived and cleared ${history.length + journal.length} records from Firestore.`);
+      addLog(`✅ Archived ${history.length + journal.length} records to GCS (local files preserved).`);
     }
     
     return { 
@@ -3155,6 +3918,14 @@ app.post('/api/journal/sync', async (req, res) => {
   }
 });
 
+app.post('/api/paper/reset-drawdown-peak', (_req, res) => {
+  const prevPeak = cachedPaperWallet.peakEquity ?? cachedPaperWallet.equity;
+  cachedPaperWallet.peakEquity = cachedPaperWallet.equity;
+  syncWalletToDisk(cachedPaperWallet);
+  console.log(`[MAX-DRAWDOWN] Peak reset: $${prevPeak.toFixed(2)} → $${cachedPaperWallet.equity.toFixed(2)}`);
+  res.json({ ok: true, prevPeak, newPeak: cachedPaperWallet.equity });
+});
+
 app.post('/api/paper/reset', async (req, res) => {
   try {
     // Stop engine if running
@@ -3163,38 +3934,15 @@ app.post('/api/paper/reset', async (req, res) => {
       isPaperTradingRunning = false;
     }
 
-    // 1. Reset Wallet
-    const walletRef = doc(db, 'paper_wallet', 'main');
-    await setDoc(walletRef, {
-      balance: 10000,
-      equity: 10000,
-      freeMargin: 10000,
-      updatedAt: new Date().toISOString()
-    });
-
-    // 2. Delete all paper_positions
-    const posSnapshot = await getDocs(collection(db, 'paper_positions'));
-    const posBatch = writeBatch(db);
-    posSnapshot.docs.forEach(d => posBatch.delete(d.ref));
-    await posBatch.commit();
-
-    // 3. Delete all paper_history
-    const histSnapshot = await getDocs(collection(db, 'paper_history'));
-    const histBatch = writeBatch(db);
-    histSnapshot.docs.forEach(d => histBatch.delete(d.ref));
-    await histBatch.commit();
-
-    // 4. Delete all trading_journal from PAPER_BOT
-    const journalSnapshot = await getDocs(query(collection(db, 'trading_journal'), where('source', '==', 'PAPER_BOT')));
-    const journalBatch = writeBatch(db);
-    journalSnapshot.docs.forEach(d => journalBatch.delete(d.ref));
-    await journalBatch.commit();
+    // [LOCAL-STORE] Reset semua file JSON dan cache in-memory
+    resetDisk(cachedTradingJournal);
 
     // Clear caches
     cachedPaperPositions = [];
     cachedPaperHistory = [];
     cachedPaperMonitoring = [];
-    cachedPaperWallet = { balance: 10000, equity: 10000, freeMargin: 10000, updatedAt: new Date().toISOString() };
+    cachedTradingJournal = cachedTradingJournal.filter((j: any) => j.source !== 'PAPER_BOT');
+    cachedPaperWallet = { balance: 10000, equity: 10000, freeMargin: 10000, marginRatio: 0, updatedAt: new Date().toISOString() };
     paperTradingResetTime = Date.now();
 
     await sendTelegramMessage(`[PAPER] 🔄 <b>Account Reset</b>\nPaper trading account has been reset to $10,000.`);
@@ -3202,6 +3950,176 @@ app.post('/api/paper/reset', async (req, res) => {
     res.json({ success: true, message: 'Paper trading account reset to $10,000' });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to reset paper trading' });
+  }
+});
+
+// ─── Import Live Binance Data into Paper Trading ──────────────────────────────
+app.post('/api/paper/import-live', async (req, res) => {
+  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
+    return res.status(400).json({ error: 'Binance API keys not configured' });
+  }
+  try {
+    // === Import Annotation: Parse supervisorOverrides dari request body ===
+    const body = req.body as { supervisorOverrides?: SupervisorAnnotation[] };
+    const supervisorOverrides = body.supervisorOverrides ?? [];
+    const overrideMap = new Map<string, SupervisorAnnotation>();
+    for (const override of supervisorOverrides) {
+      overrideMap.set(override.symbol, { ...override, annotatedAt: new Date().toISOString() });
+      console.log(
+        `[IMPORT-ANNOTATION] ${override.symbol}: ` +
+        `hedgeIntentionallyClosed=${override.hedgeIntentionallyClosed} | ` +
+        `reason="${override.reason ?? 'tidak ada'}"`
+      );
+    }
+    // === END parse supervisorOverrides ===
+
+    // 1. Fetch live positions
+    const allPositions = await binance.fetchPositions();
+    const livePositions = allPositions.filter((p: any) => Math.abs(p.contracts || 0) > 0);
+
+    // 2. Fetch live wallet
+    const accountRisk = await fetchAccountRisk();
+    if (!accountRisk) throw new Error('Failed to fetch account risk from Binance');
+
+    // 3. Convert live positions → PaperPosition format
+    const importedPositions: any[] = livePositions.map((p: any) => {
+      // Normalize symbol: BTC/USDT:USDT → BTC/USDT
+      const symbol = (p.symbol || '').split(':')[0];
+      const side = (p.side === 'long' ? 'LONG' : 'SHORT') as 'LONG' | 'SHORT';
+      const size = Math.abs(p.contracts || 0);
+
+      // Read leverage from CCXT parsed field first, fallback to raw Binance info
+      // p.leverage may be 0/undefined from CCXT when called without symbol filter
+      const leverage = (p.leverage && p.leverage > 0 ? p.leverage : null)
+        || parseInt(p.info?.leverage || '0')
+        || getLeverageForSymbol(symbol);
+
+      const notional = Math.abs(p.notional || p.entryPrice * size || 0);
+      const margin = leverage > 0 ? notional / leverage : notional;
+
+      // Store per-position maintenance margin rate from Binance (for accurate MR calculation)
+      // p.maintenanceMarginPercentage = maintMargin / notional computed by CCXT
+      const mmr = (p.maintenanceMarginPercentage && p.maintenanceMarginPercentage > 0)
+        ? p.maintenanceMarginPercentage
+        : null; // null → will use default 1% in computeMaintenanceMargin
+
+      return {
+        id: newPosId(),
+        symbol,
+        side,
+        entryPrice: p.entryPrice || 0,
+        size,
+        leverage,
+        margin,
+        ...(mmr !== null ? { maintenanceMarginRate: mmr } : {}),
+        unrealizedPnl: p.unrealizedPnl || 0,
+        currentPnl: p.unrealizedPnl || 0,
+        currentPrice: p.markPrice || p.entryPrice || 0,
+        takeProfit: 0,
+        stopLoss: 0,
+        status: 'OPEN' as const,
+        openedAt: new Date().toISOString(),
+        isHedge: false,
+        isLiveImport: true,
+        importedAt: new Date().toISOString(),
+      };
+    });
+
+    // [BUG-LEVERAGE] Auto-update leverage config dari actual Binance data saat import
+    for (const pos of importedPositions) {
+      if (pos.leverage && pos.leverage > 0) {
+        cachedLeverageConfig.symbols[pos.symbol] = pos.leverage;
+      }
+    }
+    syncLeverageConfigToDisk(cachedLeverageConfig);
+    console.log('[BUG-LEVERAGE] Leverage config updated from Import Live:', JSON.stringify(cachedLeverageConfig.symbols));
+
+    // === Import Annotation: Inject supervisorAnnotation ke posisi yang relevan ===
+    for (const pos of importedPositions) {
+      const override = overrideMap.get(pos.symbol);
+      if (override?.hedgeIntentionallyClosed) {
+        pos.supervisorAnnotation = override;
+        console.log(
+          `[IMPORT-ANNOTATION] Annotated: ${pos.symbol} ${pos.side} — ` +
+          `hedge intentionally closed by supervisor`
+        );
+      }
+    }
+    // === END inject annotation ===
+
+    // 4. Calibrate effective leverage and MMR from actual Binance data
+    // effectiveLeverage: derived so that our IM formula matches Binance's freeMargin
+    // effectiveMmr: derived so that our MM formula matches Binance's MR
+    const equityAtImport = accountRisk.totalMarginBalance;
+    const totalIMAtImport = equityAtImport - accountRisk.marginAvailable;
+    const importSymbolNotionals: Record<string, { long: number; short: number }> = {};
+    for (const pos of importedPositions) {
+      if (!importSymbolNotionals[pos.symbol]) importSymbolNotionals[pos.symbol] = { long: 0, short: 0 };
+      const n = pos.size * (pos.entryPrice || 0);
+      if (pos.side === 'LONG') importSymbolNotionals[pos.symbol].long += n;
+      else importSymbolNotionals[pos.symbol].short += n;
+    }
+    let totalNettedNotional = 0;
+    let totalEntryNotional = 0;
+    for (const pos of importedPositions) {
+      totalEntryNotional += pos.size * (pos.entryPrice || 0);
+    }
+    for (const { long, short } of Object.values(importSymbolNotionals)) {
+      totalNettedNotional += Math.max(long, short);
+    }
+    const effectiveLeverage = totalIMAtImport > 0 && totalNettedNotional > 0
+      ? totalNettedNotional / totalIMAtImport : 20;
+    const effectiveMmr = totalEntryNotional > 0
+      ? accountRisk.totalMaintMargin / totalEntryNotional : 0.0117;
+    console.log(`[IMPORT-LIVE] Calibration — effectiveLeverage: ${effectiveLeverage.toFixed(2)}x, effectiveMmr: ${(effectiveMmr * 100).toFixed(3)}%`);
+
+    // 5. Build paper wallet from live account
+    const newWallet = {
+      balance: accountRisk.walletBalance,
+      equity: accountRisk.walletBalance + accountRisk.unrealizedPnl,
+      freeMargin: accountRisk.marginAvailable,
+      marginRatio: accountRisk.marginRatio,
+      effectiveLeverage,
+      effectiveMmr,
+      updatedAt: new Date().toISOString(),
+    };
+
+    // 6. Update in-memory caches
+    cachedPaperPositions = importedPositions;
+    cachedPaperWallet = newWallet;
+
+    // 7. Persist to disk (atomic write)
+    syncPositionsToDisk(cachedPaperPositions);
+    syncWalletToDisk(cachedPaperWallet);
+
+    const summary = {
+      positionsImported: importedPositions.length,
+      walletBalance: newWallet.balance,
+      equity: newWallet.equity,
+      freeMargin: newWallet.freeMargin,
+      marginRatio: newWallet.marginRatio,
+      pairs: [...new Set(importedPositions.map(p => p.symbol))],
+    };
+
+    console.log(`[IMPORT-LIVE] Imported ${importedPositions.length} positions from Binance. Balance: $${newWallet.balance.toFixed(2)}`);
+    await sendTelegramMessage(`[PAPER] 📥 <b>Live Import</b>\nImported <b>${importedPositions.length} positions</b> from Binance into Paper Trading.\nWallet: <b>$${newWallet.balance.toFixed(2)}</b> | Equity: <b>$${newWallet.equity.toFixed(2)}</b>`);
+
+    // === BFX-3: Post-import adverse check ===
+    const adverseAlerts = runPostImportAdverseCheck(cachedPaperPositions);
+    if (adverseAlerts.length > 0) {
+      const alertMsg = formatAdverseAlert(adverseAlerts);
+      console.log(`[BFX-3-ALERT] ${adverseAlerts.length} pair adverse >4% ditemukan setelah import`);
+      sendTelegramMessage(alertMsg).catch((err: any) =>
+        console.error('[BFX-3-ALERT] Gagal kirim alert:', err)
+      );
+    } else {
+      console.log('[BFX-3-ALERT] Semua pair dalam batas aman — tidak ada alert.');
+    }
+
+    res.json({ success: true, ...summary });
+  } catch (error: any) {
+    console.error('[IMPORT-LIVE] Error:', error.message);
+    res.status(500).json({ error: error.message || 'Failed to import live data' });
   }
 });
 
@@ -3366,16 +4284,10 @@ app.post('/api/bot/toggle', async (req, res) => {
     isBotRunning = false;
     res.json({ isBotRunning });
   } else {
-    try {
-      await monitorMarkets(true);
-      monitorInterval = setInterval(() => {
-        monitorMarkets().catch(console.error);
-      }, 3600000); // 1 hour
-      isBotRunning = true;
-      res.json({ isBotRunning });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message || 'Failed to start bot' });
-    }
+    // [MANUAL-ONLY MODE] Auto-interval dinonaktifkan.
+    // AI hanya berjalan saat user klik Force Run (/api/bot/force-run).
+    isBotRunning = true;
+    res.json({ isBotRunning });
   }
 });
 
@@ -3410,8 +4322,36 @@ app.get('/api/signals', async (_req, res) => {
   return res.status(200).json(currentSignals);
 });
 
-app.get('/api/debug/last-signals-raw', (req, res) => {
-  res.json({ raw: lastRawNewSignals });
+app.get('/api/debug/last-signals-raw', (_req, res) => {
+  res.json({
+    signals: lastRawNewSignals,
+    count: Array.isArray(lastRawNewSignals) ? lastRawNewSignals.length : (lastRawNewSignals ? 1 : 0),
+    capturedAt: lastRawNewSignalsTimestamp,
+    note: 'Captured BEFORE guardrail filter. For PRE-HF-3E payload verification only.',
+  });
+});
+
+app.get('/api/debug/last-decision-outputs', (_req, res) => {
+  const entries: Record<string, unknown> = {};
+  for (const [symbol, decision] of lastDecisionOutputs.entries()) {
+    entries[symbol] = decision;
+  }
+  res.json({
+    count: lastDecisionOutputs.size,
+    symbols: Array.from(lastDecisionOutputs.keys()),
+    decisions: entries,
+    note: 'lastDecisionOutputs Map — populated by handlePaperDecisionOutput after evaluateParityPaper. For DC-1/DC-2 parity verification.',
+  });
+});
+
+app.get('/api/debug/paper-trend-cache', (_req, res) => {
+  const snapshot = getTrendCacheSnapshot();
+  res.json({
+    count: Object.keys(snapshot).length,
+    symbols: Object.keys(snapshot),
+    trends: snapshot,
+    note: 'RC-1 trend cache — OHLCV 4H Range Filter, TTL 4 min. source=BINANCE_OHLCV or FALLBACK_UNCLEAR.',
+  });
 });
 
 app.get('/api/chats', async (req, res) => {
@@ -3472,7 +4412,9 @@ async function fetchAccountRisk() {
       marginAvailable,
       walletBalance,
       unrealizedPnl,
-      dailyRealizedPnl
+      dailyRealizedPnl,
+      totalMaintMargin,   // actual Binance maintenance margin total
+      totalMarginBalance, // = equity
     };
   } catch (e) {
     console.error('Error fetching account risk:', e);
@@ -3933,21 +4875,21 @@ async function startServer() {
         }
 
         // --- Execute in Paper Memory ---
-        // Helper to update wallet (simplified)
+        // Helper to update wallet — MR uses MM (all legs); freeMargin uses IM (hedge netted)
         const updateWallet = () => {
            let totalUnrealized = 0;
-           let totalMarginUsed = 0;
            for (const p of cachedPaperPositions) {
              if (p.status === 'OPEN') {
                totalUnrealized += p.currentPnl !== undefined ? p.currentPnl : (p.unrealizedPnl || 0);
-               totalMarginUsed += calculateMarginUsed(p, 20); // Assuming 20x leverage
              }
            }
+           const totalMaintMargin = computeMaintenanceMargin(cachedPaperPositions, cachedPaperWallet.effectiveMmr);
+           const totalInitialMargin = computeHedgeMarginUsed(cachedPaperPositions, cachedPaperWallet.effectiveLeverage);
            cachedPaperWallet.equity = cachedPaperWallet.balance + totalUnrealized;
-           cachedPaperWallet.freeMargin = cachedPaperWallet.equity - totalMarginUsed;
-           cachedPaperWallet.marginRatio = cachedPaperWallet.equity > 0 ? (totalMarginUsed / cachedPaperWallet.equity) * 100 : 0;
+           cachedPaperWallet.freeMargin = cachedPaperWallet.equity - totalInitialMargin;
+           cachedPaperWallet.marginRatio = cachedPaperWallet.equity > 0 ? (totalMaintMargin / cachedPaperWallet.equity) * 100 : 0;
            cachedPaperWallet.updatedAt = new Date().toISOString();
-           if (db) setDoc(doc(db, 'paper_wallet', 'main'), cachedPaperWallet).catch(console.error);
+           syncWalletToDisk(cachedPaperWallet);
         };
 
         const notional = quantity * currentPrice;
@@ -3969,19 +4911,20 @@ async function startServer() {
                     posToReduce.status = 'CLOSED';
                     const idx = cachedPaperPositions.findIndex(p => p.id === posToReduce.id);
                     if (idx > -1) cachedPaperPositions.splice(idx, 1);
-                    if (db) deleteDoc(doc(db, 'paper_positions', posToReduce.id)).catch(console.error);
                 } else {
-                    if (db) setDoc(doc(db, 'paper_positions', posToReduce.id), { size: posToReduce.size, unrealizedPnl: posToReduce.unrealizedPnl }, { merge: true }).catch(console.error);
+                    const cIdx = cachedPaperPositions.findIndex(p => p.id === posToReduce.id);
+                    if (cIdx > -1) { cachedPaperPositions[cIdx].size = posToReduce.size; cachedPaperPositions[cIdx].unrealizedPnl = posToReduce.unrealizedPnl; }
                 }
-                
+                syncPositionsToDisk(cachedPaperPositions);
+
                 const historyEntry: PaperHistory = {
                     id: `${posToReduce.id}_partial_${Date.now()}`,
                     symbol, side: targetLeg as 'LONG' | 'SHORT', size: quantity, entryPrice: posToReduce.entryPrice, exitPrice: currentPrice, pnl: realizedPnl, reason: `Manual ${action}`, closedAt: new Date().toISOString(), status: 'CLOSED' as const
                 };
                 cachedPaperHistory.unshift(historyEntry);
                 if (cachedPaperHistory.length > 200) cachedPaperHistory.pop();
-                if (db) setDoc(doc(db, 'paper_history', historyEntry.id), historyEntry).catch(console.error);
-                
+                syncHistoryToDisk(cachedPaperHistory);
+
                 updateWallet();
             }
         } else {
@@ -3993,19 +4936,32 @@ async function startServer() {
                 const newAvgEntry = ((existingPos.size * existingPos.entryPrice) + (quantity * currentPrice)) / newTotalSize;
                 existingPos.size = newTotalSize;
                 existingPos.entryPrice = newAvgEntry;
-                if (db) setDoc(doc(db, 'paper_positions', existingPos.id), { size: newTotalSize, entryPrice: newAvgEntry }, { merge: true }).catch(console.error);
+                const cIdx = cachedPaperPositions.findIndex(p => p.id === existingPos.id);
+                if (cIdx > -1) { cachedPaperPositions[cIdx].size = newTotalSize; cachedPaperPositions[cIdx].entryPrice = newAvgEntry; }
+                syncPositionsToDisk(cachedPaperPositions);
                 updateWallet();
             } else {
                 // Open New
-                const newPosRefId = `paper_pos_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+                const isHedgeAction = action.includes('LOCK') || action.includes('HEDGE');
+                // BFX-2B: Validate hedge sizing before opening
+                if (isHedgeAction) {
+                  const partnerLeg = targetLeg === 'LONG' ? shortPos : longPos;
+                  if (partnerLeg && !validateHedgeSize(quantity, partnerLeg.size, symbol, targetLeg!)) {
+                    return `❌ [PAPER] BFX-2 BLOK: Hedge size anomali untuk ${symbol}. Cek log server.`;
+                  }
+                }
                 const newPos: PaperPosition = {
-                    id: newPosRefId, symbol, side: targetLeg as 'LONG' | 'SHORT', entryPrice: currentPrice, size: quantity, unrealizedPnl: 0, currentPnl: 0,
-                    takeProfit: targetPrice || (targetLeg === 'LONG' ? currentPrice * 1.04 : currentPrice * 0.96), // Default 4% TP if not provided
+                    id: newPosId(), symbol, side: targetLeg as 'LONG' | 'SHORT', entryPrice: currentPrice, size: quantity, unrealizedPnl: 0, currentPnl: 0,
+                    takeProfit: targetPrice || (targetLeg === 'LONG' ? currentPrice * 1.04 : currentPrice * 0.96),
                     stopLoss: stopHedgePrice || 0,
-                    status: 'OPEN' as const, openedAt: new Date().toISOString(), isHedge: action.includes('LOCK') || action.includes('HEDGE')
+                    leverage: getLeverageForSymbol(symbol),
+                    status: 'OPEN' as const, openedAt: new Date().toISOString(), isHedge: isHedgeAction
                 };
-                cachedPaperPositions.push(newPos);
-                if (db) setDoc(doc(db, 'paper_positions', newPosRefId), newPos).catch(console.error);
+                // BFX-2A: ID uniqueness guard
+                if (!insertPaperPosition(cachedPaperPositions, newPos)) {
+                  return `❌ [PAPER] BFX-2 BLOK: ID collision untuk ${symbol}. Cek log server.`;
+                }
+                syncPositionsToDisk(cachedPaperPositions);
                 updateWallet();
             }
         }
@@ -4397,9 +5353,10 @@ async function startServer() {
         return orderType;
       };
 
-      const placeOrderWithClient = async (useHedgeMode: boolean) => {
+      const placeOrderWithClient = async (useHedgeMode: boolean, clientOrderId?: string) => {
         const orderType = determineOrderType();
         const params = buildParams(useHedgeMode, orderType);
+        if (clientOrderId) params.clientOrderId = clientOrderId;
         
         addLog(
           `[EXEC_TRY] [${VALIDATION_MODE}] ${fullSymbol} action=${action} ${side} qty=${qty} ` +
@@ -4481,9 +5438,12 @@ async function startServer() {
         }
       }
 
+      // [BUG-GHOST] Generate clientOrderId once — reused on retry (fixes BUG-IDEM)
+      const liveClientOrderId = randomUUID();
+
       try {
         let order: any;
-        
+
         if (VALIDATION_MODE === "DEMO_TRADING") {
             if (!BINANCE_DEMO_API_KEY || !BINANCE_DEMO_API_SECRET) {
                 return `❌ <b>DEMO TRADING CONFIG ERROR</b>\n\nReason: BINANCE_DEMO_API_KEY/SECRET is missing in environment variables.`;
@@ -4491,8 +5451,25 @@ async function startServer() {
             console.log(`[DEMO_TRADING EXEC] Using Binance Demo Trading Client`);
         }
 
+        // [BUG-GHOST] Save to pending BEFORE order — survive NetworkError (non-blocking)
         try {
-          order = await placeOrderWithClient(hasHedgeMode);
+          const pending: PendingOrder = {
+            clientOrderId: liveClientOrderId,
+            symbol: fullSymbol,
+            side: side as 'buy' | 'sell',
+            qty,
+            price: targetPrice ?? null,
+            action,
+            createdAt: Date.now(),
+          };
+          pendingOrders.set(liveClientOrderId, pending);
+          syncPendingOrdersToDisk([...pendingOrders.values()]);
+        } catch (persistErr: any) {
+          console.warn('[BUG-GHOST] pre-order persist failed (non-blocking):', persistErr?.message);
+        }
+
+        try {
+          order = await placeOrderWithClient(hasHedgeMode, liveClientOrderId);
         } catch (err: any) {
           const msg = String(err?.message || err?.msg || "");
           addLog(`[EXEC_ERR] 1st try failed: ${msg}`);
@@ -4500,11 +5477,18 @@ async function startServer() {
             const modeResp2 = await activeClient.fapiPrivateGetPositionSideDual();
             const actualHedgeMode = modeResp2?.dualSidePosition === true || modeResp2?.dualSidePosition === "true";
             addLog(`[EXEC_RETRY] actualHedgeMode=${actualHedgeMode}`);
-            order = await placeOrderWithClient(actualHedgeMode);
+            order = await placeOrderWithClient(actualHedgeMode, liveClientOrderId); // reuse same ID
           } else {
+            // Non-network error (e.g. notional, validation) — order rejected by Binance
+            pendingOrders.delete(liveClientOrderId);
+            syncPendingOrdersToDisk([...pendingOrders.values()]);
             throw err;
           }
         }
+
+        // [BUG-GHOST] Order confirmed — remove from pending
+        pendingOrders.delete(liveClientOrderId);
+        syncPendingOrdersToDisk([...pendingOrders.values()]);
   
         const successLabel = VALIDATION_MODE === "DEMO_TRADING" ? "DEMO TRADING ORDER VALIDATED" : "ORDER SUCCESS!";
         const finalOrderType = determineOrderType();
@@ -5187,14 +6171,49 @@ async function generateAutoJournal() {
 }
 
 // Schedule Auto-Journaling at 07:30 and 19:30 WIB (Asia/Jakarta)
-function scheduleCronJobs() {
-  cron.schedule('30 7,19 * * *', generateAutoJournal, {
-    timezone: "Asia/Jakarta"
-  });
+// [BUG-GHOST] Read-only reconciliation — alert only, no auto-create/cancel
+const GHOST_TIMEOUT_MS = 5 * 60 * 1000; // 5 menit tanpa konfirmasi = suspected ghost
 
-  // Schedule Risk Manager every 10 minutes
-  cron.schedule('*/10 * * * *', checkRiskAndNotify);
-  console.log("✅ Cron jobs scheduled");
+async function reconcilePendingOrders() {
+  if (pendingOrders.size === 0) return;
+  const activeClient = VALIDATION_MODE === 'DEMO_TRADING' ? binanceDemo : binance;
+  for (const [clientOrderId, order] of pendingOrders) {
+    try {
+      const exchangeOrder = await activeClient.fetchOrder(clientOrderId, order.symbol);
+      if (exchangeOrder.status === 'closed' || exchangeOrder.status === 'filled') {
+        console.log(`[BUG-GHOST] Order confirmed on exchange: ${clientOrderId} ${order.symbol}`);
+        pendingOrders.delete(clientOrderId);
+        syncPendingOrdersToDisk([...pendingOrders.values()]);
+      } else if (Date.now() - order.createdAt > GHOST_TIMEOUT_MS) {
+        console.warn(`[BUG-GHOST] SUSPECTED GHOST: ${order.symbol} ${order.side} cid=${clientOrderId}`);
+        sendTelegramMessage(
+          `⚠️ <b>[BUG-GHOST] Suspected ghost position</b>\n` +
+          `Symbol: ${order.symbol} ${order.side.toUpperCase()}\n` +
+          `Action: ${order.action}\n` +
+          `ClientOrderId: <code>${clientOrderId}</code>\n` +
+          `Created: ${new Date(order.createdAt).toISOString()}\n` +
+          `Investigate manually on Binance.`
+        ).catch(err => console.error('[BUG-GHOST] Telegram alert failed:', err));
+        pendingOrders.delete(clientOrderId);
+        syncPendingOrdersToDisk([...pendingOrders.values()]);
+      }
+    } catch (err: any) {
+      console.warn(`[BUG-GHOST] reconcile fetchOrder failed for ${clientOrderId}:`, err?.message || err);
+    }
+  }
+}
+
+function scheduleCronJobs() {
+  // [MANUAL-ONLY MODE] Semua cron AI dinonaktifkan.
+  // AI hanya berjalan saat user klik Force Run.
+  // Aktifkan kembali dengan uncomment baris di bawah jika diperlukan:
+  // cron.schedule('30 7,19 * * *', generateAutoJournal, { timezone: "Asia/Jakarta" });
+  // cron.schedule('*/10 * * * *', checkRiskAndNotify);
+
+  // [BUG-GHOST] Reconciliation loop — tiap 30 detik, read-only, alert-only
+  setInterval(() => { reconcilePendingOrders().catch(e => console.warn('[BUG-GHOST] recon error:', e)); }, 30_000);
+
+  console.log("✅ Cron jobs scheduled (MANUAL-ONLY MODE — AI crons disabled, BUG-GHOST recon active)");
 }
 
 // --- PROACTIVE RISK MANAGER ---

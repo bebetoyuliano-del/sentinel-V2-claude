@@ -19,6 +19,11 @@ export default defineConfig(({mode}) => {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
+      watch: {
+        // Ignore data/ folder — paper trading JSON files change every minute
+        // and trigger unwanted full page reloads in the browser.
+        ignored: ['**/data/**'],
+      },
     },
     build: {
       chunkSizeWarningLimit: 2000,

@@ -229,6 +229,7 @@ function deriveRequestedAction(args: {
 
   if (!freshSignal) return 'HOLD';
   if (signalAlreadyActed || historyHasSignal) return 'HOLD';
+  if (!freshSignal.side) return 'HOLD'; // RC-1: synthetic trend-only signal — no entry action
 
   const signalSide = String(freshSignal.side || '').toUpperCase() === 'BUY' ? 'LONG' : 'SHORT';
 

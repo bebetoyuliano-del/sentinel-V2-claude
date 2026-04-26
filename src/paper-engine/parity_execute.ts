@@ -9,6 +9,8 @@ export interface ExecuteParityDeps {
   partialClosePos: (pos: any, fraction: number, reason: string) => Promise<void>;
   closePos: (pos: any, reason: string) => Promise<void>;
   addLog: (msg: string) => void;
+  /** BFX-5: optional — jika disediakan, dipanggil sebelum UNLOCK untuk cek partner leg adverse */
+  isUnlockAllowed?: (hedgeSide: 'LONG' | 'SHORT') => { safe: boolean; reason: string };
 }
 
 export async function executeParityPaperDecision(deps: ExecuteParityDeps): Promise<boolean> {
@@ -22,6 +24,7 @@ export async function executeParityPaperDecision(deps: ExecuteParityDeps): Promi
     partialClosePos,
     closePos,
     addLog,
+    isUnlockAllowed,
   } = deps;
 
   const action = String(parityResult?.final_action || 'HOLD');
@@ -88,11 +91,25 @@ export async function executeParityPaperDecision(deps: ExecuteParityDeps): Promi
 
     case 'UNLOCK':
       if (shortPos && (shortPos.currentPnl || 0) > 0) {
+        // === BFX-5: Guard sebelum Unlock Short ===
+        const checkShort = isUnlockAllowed ? isUnlockAllowed('SHORT') : { safe: true, reason: 'no guard' };
+        if (!checkShort.safe) {
+          addLog(`[BFX-5] BLOK Parity UNLOCK short ${symbol}: ${checkShort.reason}`);
+          return false;
+        }
+        addLog(`[BFX-5] UNLOCK OK: ${symbol} SHORT — ${checkShort.reason}`);
         await closePos(shortPos, 'Parity Unlock');
         addLog(`[PARITY_V2] ${symbol} -> UNLOCK short | ${reason}`);
         return true;
       }
       if (longPos && (longPos.currentPnl || 0) > 0) {
+        // === BFX-5: Guard sebelum Unlock Long ===
+        const checkLong = isUnlockAllowed ? isUnlockAllowed('LONG') : { safe: true, reason: 'no guard' };
+        if (!checkLong.safe) {
+          addLog(`[BFX-5] BLOK Parity UNLOCK long ${symbol}: ${checkLong.reason}`);
+          return false;
+        }
+        addLog(`[BFX-5] UNLOCK OK: ${symbol} LONG — ${checkLong.reason}`);
         await closePos(longPos, 'Parity Unlock');
         addLog(`[PARITY_V2] ${symbol} -> UNLOCK long | ${reason}`);
         return true;

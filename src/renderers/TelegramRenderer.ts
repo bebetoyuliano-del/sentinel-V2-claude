@@ -197,8 +197,14 @@ export function renderDecisionCardsToTelegram(cards: any[], server_enforce: any,
         signalMsg += `${sideIcon} <b>${escapeHtml(sig.symbol)} (${sideUpper})</b>\n`;
         signalMsg += `Entry: ${sig.entry}\n`;
         signalMsg += `SL: ${sig.stop_loss}\n`;
-        signalMsg += `TP1: ${sig.targets.t1} (RR: ${sig.rr.t1_rr})\n`;
-        signalMsg += `TP2: ${sig.targets.t2} (RR: ${sig.rr.t2_rr})\n`;
+        if (sig.targets) {
+          signalMsg += `TP1: ${sig.targets.t1 ?? '-'}`;
+          if (sig.rr?.t1_rr) signalMsg += ` (RR: ${sig.rr.t1_rr})`;
+          signalMsg += `\n`;
+          signalMsg += `TP2: ${sig.targets.t2 ?? '-'}`;
+          if (sig.rr?.t2_rr) signalMsg += ` (RR: ${sig.rr.t2_rr})`;
+          signalMsg += `\n`;
+        }
 
         if (sig.sentiment) {
           const sentIcon = sig.sentiment.status === 'BULLISH' ? '📈' : (sig.sentiment.status === 'BEARISH' ? '📉' : '⚖️');
