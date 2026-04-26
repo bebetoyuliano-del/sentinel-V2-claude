@@ -916,11 +916,13 @@ function calculateHedgingRecovery(positions: any[]) {
 }
 
 // LLM selector — baca dari env, default claude
-// Ganti LLM_PRIMARY di .env: 'claude' | 'gemini'
+// Ganti LLM_PRIMARY di .env: 'claude' | 'gemini' | 'nvidia'
 const LLM_PRIMARY = (process.env.LLM_PRIMARY || 'claude').toLowerCase();
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
 const GEMINI_MONITOR_MODEL = process.env.GEMINI_MONITOR_MODEL || 'gemini-2.5-flash-preview-05-20';
-console.log(`[LLM] Primary provider: ${LLM_PRIMARY} | Gemini model: ${GEMINI_MONITOR_MODEL}`);
+const NVIDIA_NIM_MODEL = process.env.NVIDIA_NIM_MODEL || 'nvidia/llama-3.1-nemotron-70b-instruct';
+const NVIDIA_NIM_BASE_URL = 'https://integrate.api.nvidia.com/v1';
+console.log(`[LLM] Primary provider: ${LLM_PRIMARY} | Gemini model: ${GEMINI_MONITOR_MODEL} | NIM model: ${NVIDIA_NIM_MODEL}`);
 
 async function generateWithClaude(prompt: string, jsonMode: boolean = false, base64Image: string | null = null): Promise<string> {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -967,32 +969,72 @@ async function generateWithGemini(prompt: string, jsonMode: boolean = false, bas
   return response.text;
 }
 
+// [NVIDIA NIM] OpenAI-compatible API — supports nemotron-70b and llama-405b
+async function generateWithNvidiaNim(prompt: string, jsonMode: boolean = false): Promise<string> {
+  const apiKey = process.env.NVIDIA_NIM_API_KEY;
+  if (!apiKey) throw new Error('[NVIDIA NIM] NVIDIA_NIM_API_KEY not set');
+
+  const messages = [
+    { role: 'system', content: 'You are a helpful AI assistant for trading analysis. Always respond with valid JSON when asked.' },
+    { role: 'user', content: jsonMode ? `${prompt}\n\nRespond with valid JSON only. No markdown, no explanation.` : prompt }
+  ];
+
+  const response = await axios.post(
+    `${NVIDIA_NIM_BASE_URL}/chat/completions`,
+    {
+      model: NVIDIA_NIM_MODEL,
+      messages,
+      max_tokens: 16000,
+      temperature: 0.2,
+      top_p: 0.7,
+      stream: false,
+    },
+    {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 300000,
+    }
+  );
+
+  const text = response.data?.choices?.[0]?.message?.content;
+  if (!text) throw new Error('[NVIDIA NIM] Empty response from API');
+  return text;
+}
+
 async function generateWithRetry(prompt: string, _modelName: string = 'claude-sonnet-4-6', maxRetries: number = 3, jsonMode: boolean = false, base64Image: string | null = null, _enableSearch: boolean = false): Promise<string> {
   const t0 = Date.now();
-  const useClaude = LLM_PRIMARY !== 'gemini';
+
+  type ProviderName = 'claude' | 'gemini' | 'nvidia';
+  const primary: ProviderName = (LLM_PRIMARY === 'gemini' ? 'gemini' : LLM_PRIMARY === 'nvidia' ? 'nvidia' : 'claude');
+  const fallbackOrder: ProviderName[] = (['claude', 'gemini', 'nvidia'] as ProviderName[]).filter(p => p !== primary);
+
+  async function callProvider(provider: ProviderName): Promise<string> {
+    if (provider === 'claude') {
+      console.log(`[LLM] Claude ${CLAUDE_MODEL}`);
+      return generateWithClaude(prompt, jsonMode, base64Image);
+    } else if (provider === 'gemini') {
+      console.log(`[LLM] Gemini ${GEMINI_MONITOR_MODEL}`);
+      return generateWithGemini(prompt, jsonMode, base64Image);
+    } else {
+      console.log(`[LLM] NVIDIA NIM ${NVIDIA_NIM_MODEL}`);
+      return generateWithNvidiaNim(prompt, jsonMode);
+    }
+  }
 
   // ── Primary provider ──────────────────────────────────────────────────────
   let attempt = 0;
   while (attempt < maxRetries) {
     try {
-      if (useClaude) {
-        console.log(`[LLM] Claude ${CLAUDE_MODEL} — attempt ${attempt + 1}/${maxRetries}`);
-        const result = await generateWithClaude(prompt, jsonMode, base64Image);
-        console.log(`[LLM] Claude response OK (length=${result?.length || 0})`);
-        aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: true, provider: 'claude', durationMs: Date.now() - t0 });
-        syncAiRunHistoryToDisk(aiRunHistory);
-        return result;
-      } else {
-        console.log(`[LLM] Gemini ${GEMINI_MONITOR_MODEL} — attempt ${attempt + 1}/${maxRetries}`);
-        const result = await generateWithGemini(prompt, jsonMode, base64Image);
-        console.log(`[LLM] Gemini response OK (length=${result?.length || 0})`);
-        aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: true, provider: 'gemini', durationMs: Date.now() - t0 });
-        syncAiRunHistoryToDisk(aiRunHistory);
-        return result;
-      }
+      const result = await callProvider(primary);
+      console.log(`[LLM] ${primary} response OK (length=${result?.length || 0})`);
+      aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: true, provider: primary as any, durationMs: Date.now() - t0 });
+      syncAiRunHistoryToDisk(aiRunHistory);
+      return result;
     } catch (error: any) {
       attempt++;
-      console.error(`[LLM] ${useClaude ? 'Claude' : 'Gemini'} error (attempt ${attempt}/${maxRetries}):`, error.message || error);
+      console.error(`[LLM] ${primary} error (attempt ${attempt}/${maxRetries}):`, error.message || error);
       if (attempt >= maxRetries) break;
       const delay = Math.pow(2, attempt) * 1000;
       console.log(`[LLM] Retrying in ${delay}ms...`);
@@ -1001,33 +1043,22 @@ async function generateWithRetry(prompt: string, _modelName: string = 'claude-so
   }
 
   // ── Fallback ke provider lain ─────────────────────────────────────────────
-  if (useClaude) {
-    console.warn('[LLM] Claude failed — falling back to Gemini...');
+  for (const fallback of fallbackOrder) {
+    console.warn(`[LLM] ${primary} failed — falling back to ${fallback}...`);
     try {
-      const result = await generateWithGemini(prompt, jsonMode, base64Image);
-      console.log('[LLM] Gemini fallback OK');
-      aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: true, provider: 'gemini-fallback', durationMs: Date.now() - t0 });
+      const result = await callProvider(fallback);
+      console.log(`[LLM] ${fallback} fallback OK`);
+      aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: true, provider: `${fallback}-fallback` as any, durationMs: Date.now() - t0 });
       syncAiRunHistoryToDisk(aiRunHistory);
       return result;
-    } catch (geminiError: any) {
-      console.error('[LLM] Gemini fallback also failed:', geminiError.message || geminiError);
-    }
-  } else {
-    console.warn('[LLM] Gemini failed — falling back to Claude...');
-    try {
-      const result = await generateWithClaude(prompt, jsonMode, base64Image);
-      console.log('[LLM] Claude fallback OK');
-      aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: true, provider: 'claude-fallback', durationMs: Date.now() - t0 });
-      syncAiRunHistoryToDisk(aiRunHistory);
-      return result;
-    } catch (claudeError: any) {
-      console.error('[LLM] Claude fallback also failed:', claudeError.message || claudeError);
+    } catch (fallbackError: any) {
+      console.error(`[LLM] ${fallback} fallback also failed:`, fallbackError.message || fallbackError);
     }
   }
 
   aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: false, provider: 'failed', durationMs: Date.now() - t0 });
   syncAiRunHistoryToDisk(aiRunHistory);
-  throw new Error('[LLM] All providers failed (Claude + Gemini). Check API keys and quota.');
+  throw new Error('[LLM] All providers failed (Claude + Gemini + NVIDIA NIM). Check API keys and quota.');
 }
 
 // --- EXCEL ROWS BUILDER (A-D) ---
@@ -1230,19 +1261,116 @@ async function monitorMarkets(force = false) {
       }
     }
 
-    const finalPrompt = buildMonitoringPrompt({
-      inputPayload,
-      openPositionSymbols: [...new Set(positions.map((p: any) => p.symbol))],
-      includeVisualAppendix: !!chartBase64,
-      chartSymbol,
-    });
+    const openPositionSymbols = [...new Set(positions.map((p: any) => p.symbol))] as string[];
 
-    // Claude tidak perlu chart image — analisis dari JSON market data sudah cukup.
-    // chartBase64 hanya dipakai untuk Telegram visual, tidak dikirim ke LLM.
-    if (LLM_PRIMARY === 'gemini') {
-      console.warn(`[LLM] ⚠️ WARNING: LLM_PRIMARY=gemini with ${positionSymbols.length} position symbols. Gemini 2.0 Flash is hard-capped at 8192 output tokens (~20K chars). With 20+ pairs, output WILL be truncated and cards will be missing. Switch LLM_PRIMARY=claude for full coverage.`);
+    // [NIM-CHUNK] NVIDIA NIM chunked strategy — split symbols into batches of NIM_CHUNK_SIZE
+    // to stay within free-tier output token limits (8192 per request).
+    // 45 pairs → 4 requests of ~12 pairs each — well within 40 req/min limit.
+    const NIM_CHUNK_SIZE = parseInt(process.env.NIM_CHUNK_SIZE || '12');
+    const useNimChunked = LLM_PRIMARY === 'nvidia';
+
+    let analysisJson: string;
+
+    if (useNimChunked) {
+      // [NIM-CHUNK] Strategy:
+      // Chunks 1..N  → openPositionSymbols only (DC cards with real position data)
+      // Last chunk   → scannerUniverse (symbols NOT in openPositions → scanner/signal format)
+      const scannerOnlySymbols = top20Symbols.filter((s: string) => !openPositionSymbols.includes(s));
+      const posChunks: string[][] = [];
+      for (let i = 0; i < openPositionSymbols.length; i += NIM_CHUNK_SIZE) {
+        posChunks.push(openPositionSymbols.slice(i, i + NIM_CHUNK_SIZE));
+      }
+      // Add scanner chunk at the end (if any scanner-only symbols exist)
+      const chunks: string[][] = scannerOnlySymbols.length > 0
+        ? [...posChunks, scannerOnlySymbols.slice(0, NIM_CHUNK_SIZE)]
+        : posChunks;
+
+      console.log(`[NIM-CHUNK] Positions: ${openPositionSymbols.length} symbols → ${posChunks.length} DC chunks | Scanner: ${scannerOnlySymbols.length} symbols → 1 scanner chunk`);
+
+      const mergedCards: any[] = [];
+      let mergedMarketSummary = '';
+
+      for (let ci = 0; ci < chunks.length; ci++) {
+        const chunk = chunks[ci];
+        console.log(`[NIM-CHUNK] Chunk ${ci + 1}/${chunks.length}: ${chunk.join(', ')}`);
+
+        // Build chunk-scoped payload
+        const isScannerChunk = ci === chunks.length - 1 && scannerOnlySymbols.length > 0;
+        const chunkPayload = {
+          ...inputPayload,
+          accountPositions: isScannerChunk
+            ? []  // scanner chunk: no positions — ask for signal scanner format
+            : inputPayload.accountPositions.filter((p: any) => chunk.includes(p.symbol)),
+          scannerUniverse: isScannerChunk
+            ? chunk  // scanner chunk: these ARE the scanner symbols
+            : (inputPayload.scannerUniverse as string[]).filter((s: string) => chunk.includes(s)),
+          openOrders: inputPayload.openOrders.filter((o: any) => chunk.includes(o.symbol)),
+        };
+        const chunkOpenSymbols = isScannerChunk ? [] : openPositionSymbols.filter(s => chunk.includes(s));
+
+        console.log(`[NIM-CHUNK] Chunk ${ci + 1} type: ${isScannerChunk ? 'SCANNER' : 'DC-POSITIONS'}`);
+
+        const chunkPrompt = buildMonitoringPrompt({
+          inputPayload: chunkPayload,
+          openPositionSymbols: chunkOpenSymbols,
+          includeVisualAppendix: false,
+          chartSymbol: '',
+        });
+
+        try {
+          const chunkResponse = await generateWithNvidiaNim(chunkPrompt, true);
+          console.log(`[NIM-CHUNK] Chunk ${ci + 1} response OK (length=${chunkResponse?.length || 0})`);
+          // Extract decision_cards from chunk response
+          const firstBrace = chunkResponse.indexOf('{');
+          const lastBrace  = chunkResponse.lastIndexOf('}');
+          if (firstBrace !== -1 && lastBrace > firstBrace) {
+            const cleaned = chunkResponse.substring(firstBrace, lastBrace + 1).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ');
+            let parsed: any = null;
+            try {
+              parsed = JSON.parse(cleaned);
+            } catch (e: any) {
+              // Try repair: truncate at error position then close brackets
+              const posMatch = e.message?.match(/at position (\d+)/);
+              const cutPos = posMatch ? parseInt(posMatch[1], 10) : cleaned.length;
+              try {
+                parsed = JSON.parse(repairTruncatedJson(cleaned.substring(0, cutPos)));
+                console.log(`[NIM-CHUNK] Chunk ${ci + 1} JSON repaired at pos=${cutPos}`);
+              } catch {
+                console.warn(`[NIM-CHUNK] Chunk ${ci + 1} JSON parse failed even after repair`);
+              }
+            }
+            if (parsed) {
+              const cards = parsed.decision_cards || [];
+              console.log(`[NIM-CHUNK] Chunk ${ci + 1} extracted ${cards.length} cards`);
+              mergedCards.push(...cards);
+              if (!mergedMarketSummary && parsed.market_summary) mergedMarketSummary = parsed.market_summary;
+            }
+          }
+        } catch (chunkErr: any) {
+          console.error(`[NIM-CHUNK] Chunk ${ci + 1} failed:`, chunkErr.message || chunkErr);
+        }
+
+        // 200ms delay between chunks to avoid rate limit
+        if (ci < chunks.length - 1) await new Promise(r => setTimeout(r, 200));
+      }
+
+      console.log(`[NIM-CHUNK] Merged total: ${mergedCards.length} cards from ${chunks.length} chunks`);
+      analysisJson = JSON.stringify({ decision_cards: mergedCards, market_summary: mergedMarketSummary });
+
+    } else {
+      const finalPrompt = buildMonitoringPrompt({
+        inputPayload,
+        openPositionSymbols,
+        includeVisualAppendix: !!chartBase64,
+        chartSymbol,
+      });
+
+      if (LLM_PRIMARY === 'gemini') {
+        console.warn(`[LLM] ⚠️ WARNING: LLM_PRIMARY=gemini with ${positionSymbols.length} position symbols. Gemini 2.0 Flash is hard-capped at 8192 output tokens (~20K chars). With 20+ pairs, output WILL be truncated and cards will be missing. Switch LLM_PRIMARY=claude for full coverage.`);
+      }
+      analysisJson = await generateWithRetry(finalPrompt, 'claude-sonnet-4-6', 3, true, null, false);
     }
-    const analysisJson = await generateWithRetry(finalPrompt, 'claude-sonnet-4-6', 3, true, null, false);
+
     console.log(`[LLM] Response received, length=${analysisJson?.length || 0}`);
 
     if (!analysisJson) {
@@ -1298,6 +1426,27 @@ async function monitorMarkets(force = false) {
     
     let cards = analysisData.decision_cards || [];
     console.log(`[DC-DEBUG] Cards extracted: length=${cards.length}`);
+
+    // [NIM-FILTER] Filter: hanya kirim DC cards yang punya live position di Binance.
+    // Cards dari scanner chunk (NO_POSITION) disimpan terpisah sebagai scanner signals.
+    if (useNimChunked && positions.length > 0) {
+      const liveSymbols = new Set(positions.map((p: any) =>
+        p.symbol.replace(':USDT', '').replace('/USDT', '')
+      ));
+      const beforeFilter = cards.length;
+      const scannerCards: any[] = [];
+      cards = cards.filter((c: any) => {
+        const sym = (c.symbol || '').replace(':USDT', '').replace('/USDT', '');
+        if (liveSymbols.has(sym)) return true;
+        scannerCards.push(c);
+        return false;
+      });
+      console.log(`[NIM-FILTER] DC cards: ${cards.length}/${beforeFilter} (live positions only) | Scanner cards: ${scannerCards.length}`);
+      // Store scanner cards for new_signals injection
+      if (scannerCards.length > 0 && !analysisData.new_signals) {
+        analysisData.new_signals = { scanner_cards: scannerCards };
+      }
+    }
     console.log(`[DC-DEBUG] lastDecisionOutputs.size=${lastDecisionOutputs.size}, keys=[${Array.from(lastDecisionOutputs.keys()).join(", ")}]`);
     if (cards.length === 0) {
         console.log(`[DC-DEBUG] WARNING: cards array is EMPTY - DC-TRACE will not execute`);
