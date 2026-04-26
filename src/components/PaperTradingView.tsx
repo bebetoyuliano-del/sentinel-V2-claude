@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Play, Square, Wallet, TrendingUp, History, AlertCircle, Target, Loader2, AlertTriangle } from 'lucide-react';
+import { Play, Square, Wallet, TrendingUp, History, AlertCircle, Target, Loader2, AlertTriangle, Download } from 'lucide-react';
 
 export default function PaperTradingView() {
   const [isRunning, setIsRunning] = useState(false);
@@ -13,6 +13,9 @@ export default function PaperTradingView() {
   const [error, setError] = useState<string | null>(null);
   const [isResetting, setIsResetting] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [isImportingLive, setIsImportingLive] = useState(false);
+  const [showImportConfirm, setShowImportConfirm] = useState(false);
+  const [importResult, setImportResult] = useState<any>(null);
 
   const fetchData = async () => {
     try {
@@ -93,6 +96,28 @@ export default function PaperTradingView() {
     }
   };
 
+  const handleImportLive = async () => {
+    if (!showImportConfirm) {
+      setShowImportConfirm(true);
+      setTimeout(() => setShowImportConfirm(false), 4000);
+      return;
+    }
+    setIsImportingLive(true);
+    setImportResult(null);
+    try {
+      const res = await fetch('/api/paper/import-live', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to import live data');
+      setImportResult(data);
+      await fetchData();
+      setShowImportConfirm(false);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setIsImportingLive(false);
+    }
+  };
+
   const [activeTab, setActiveTab] = useState<'overview' | 'decisions' | 'review'>('overview');
   const [selectedDecision, setSelectedDecision] = useState<any>(null);
 
@@ -109,11 +134,29 @@ export default function PaperTradingView() {
         </div>
         <div className="flex gap-2">
           <button
+            onClick={handleImportLive}
+            disabled={isImportingLive}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
+              showImportConfirm
+                ? 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30'
+                : 'bg-slate-700/50 text-slate-300 hover:bg-slate-700'
+            } ${isImportingLive ? 'opacity-50 cursor-not-allowed' : ''}`}
+            title="Import posisi dan wallet live Binance ke paper trading"
+          >
+            {isImportingLive ? (
+              <><Loader2 className="w-4 h-4 animate-spin" /> Importing...</>
+            ) : showImportConfirm ? (
+              <><AlertTriangle className="w-4 h-4" /> Confirm Import</>
+            ) : (
+              <><Download className="w-4 h-4" /> Import Live</>
+            )}
+          </button>
+          <button
             onClick={handleReset}
             disabled={isResetting}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
-              showResetConfirm 
-                ? 'bg-red-500/20 text-red-500 hover:bg-red-500/30' 
+              showResetConfirm
+                ? 'bg-red-500/20 text-red-500 hover:bg-red-500/30'
                 : 'bg-slate-700/50 text-slate-300 hover:bg-slate-700'
             } ${isResetting ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
@@ -146,6 +189,18 @@ export default function PaperTradingView() {
         <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-4 flex items-start gap-3">
           <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
           <p className="text-red-400 text-sm">{error}</p>
+        </div>
+      )}
+
+      {importResult && (
+        <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4">
+          <p className="text-blue-400 font-semibold mb-1">✅ Live Import Berhasil</p>
+          <p className="text-slate-300 text-sm">
+            <b>{importResult.positionsImported}</b> posisi diimport dari Binance &nbsp;|&nbsp;
+            Wallet: <b>${importResult.walletBalance?.toFixed(2)}</b> &nbsp;|&nbsp;
+            Equity: <b>${importResult.equity?.toFixed(2)}</b> &nbsp;|&nbsp;
+            Pairs: <b>{importResult.pairs?.length}</b>
+          </p>
         </div>
       )}
 
