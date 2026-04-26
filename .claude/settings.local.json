@@ -7,7 +7,9 @@
       "Bash(npm install:*)",
       "Bash(npx jest:*)",
       "Bash(PAPER_ENGINE_MODE=parity_v2 npx tsx tests/parity/RegressionBatchRunner.ts)",
-      "Bash(npx tsx:*)"
+      "Bash(npx tsx:*)",
+      "Bash(gcloud version:*)",
+      "WebFetch(domain:34.158.55.103)"
     ]
   }
 }
