@@ -6,7 +6,7 @@ import { calculateMarginUsed, computeMRProjectedAfterAdd } from './src/paper-eng
 import { isParityV2Mode, evaluateParityPaper } from './src/paper-engine/parity_runtime';
 import { executeParityPaperDecision } from './src/paper-engine/parity_execute';
 import { withFirestoreFailSoft, jsonDegraded, markFirestoreUnavailable, getFirestoreFailsoftStatus } from './src/paper-engine/firestore_failsoft';
-import { loadAllFromDisk, syncWalletToDisk, syncPositionsToDisk, syncHistoryToDisk, syncJournalToDisk, upsertJournalEntry, resetDisk, newPosId, loadAiRunHistory, syncAiRunHistoryToDisk, loadLeverageConfig, syncLeverageConfigToDisk, LeverageConfig, loadPendingOrders, syncPendingOrdersToDisk, PendingOrder } from './src/paper-engine/localStore';
+import { loadAllFromDisk, syncWalletToDisk, syncPositionsToDisk, syncHistoryToDisk, syncJournalToDisk, upsertJournalEntry, resetDisk, newPosId, loadAiRunHistory, syncAiRunHistoryToDisk, loadLeverageConfig, syncLeverageConfigToDisk, LeverageConfig, loadPendingOrders, syncPendingOrdersToDisk, PendingOrder, loadKillSwitch, syncKillSwitchToDisk, KillSwitchState } from './src/paper-engine/localStore';
 import { randomUUID } from 'crypto';
 import { normalizeDecision, RawPaperDecision } from './src/paper-engine/decisionNormalizer';
 import { fetchPaperTrendBatch, getTrendCacheSnapshot } from './src/paper-engine/paperTrendFetcher';
@@ -113,6 +113,13 @@ let cachedPaperMonitoring: any[] = [];
 let cachedPaperDecisions: any[] = [];
 let cachedTradingJournal: any[] = [];
 let cachedChats: any[] = [];
+// Global Kill-Switch state (in-memory, loaded from disk at startup)
+let cachedKillSwitch: KillSwitchState = {
+  enabled: false,
+  reason: '',
+  enabledAt: null,
+  enabledBy: '',
+};
 let isRealtimeListenersSetup = false;
 let lastDbSyncTime = 0;
 
@@ -133,6 +140,12 @@ async function loadPaperTradingData() {
   storedPending.forEach(o => pendingOrders.set(o.clientOrderId, o));
   if (storedPending.length > 0) {
     console.log(`[BUG-GHOST] Restored ${storedPending.length} pending order(s) from disk.`);
+  }
+
+  // [KILL-SWITCH] Load kill-switch state from disk (before scheduler/interval active)
+  cachedKillSwitch = loadKillSwitch();
+  if (cachedKillSwitch.enabled) {
+    console.warn(`[KILL-SWITCH] ⚠️ ACTIVE at startup — reason: "${cachedKillSwitch.reason}"`);
   }
 }
 
@@ -922,6 +935,8 @@ const CLAUDE_MODEL = 'claude-sonnet-4-6';
 const GEMINI_MONITOR_MODEL = process.env.GEMINI_MONITOR_MODEL || 'gemini-2.5-flash-preview-05-20';
 const NVIDIA_NIM_MODEL = process.env.NVIDIA_NIM_MODEL || 'nvidia/llama-3.1-nemotron-70b-instruct';
 const NVIDIA_NIM_BASE_URL = 'https://integrate.api.nvidia.com/v1';
+// Timeout untuk nemotron-3 yang lebih lambat (default 300s → 600s per chunk)
+// chunkSize dikurangi untuk payload besar dengan 16+ accountPositions
 console.log(`[LLM] Primary provider: ${LLM_PRIMARY} | Gemini model: ${GEMINI_MONITOR_MODEL} | NIM model: ${NVIDIA_NIM_MODEL}`);
 
 async function generateWithClaude(prompt: string, jsonMode: boolean = false, base64Image: string | null = null): Promise<string> {
@@ -969,32 +984,45 @@ async function generateWithGemini(prompt: string, jsonMode: boolean = false, bas
   return response.text;
 }
 
-// [NVIDIA NIM] OpenAI-compatible API — supports nemotron-70b and llama-405b
+// [NVIDIA NIM] OpenAI-compatible API — supports nemotron-70b, llama-405b, and DeepSeek
 async function generateWithNvidiaNim(prompt: string, jsonMode: boolean = false): Promise<string> {
   const apiKey = process.env.NVIDIA_NIM_API_KEY;
   if (!apiKey) throw new Error('[NVIDIA NIM] NVIDIA_NIM_API_KEY not set');
 
   const messages = [
-    { role: 'system', content: 'You are a helpful AI assistant for trading analysis. Always respond with valid JSON when asked.' },
+    {
+      role: 'system',
+      content: jsonMode
+        ? 'You are a trading AI that outputs STRICT JSON only. CRITICAL: When you receive a list of symbols in accountPositions, you MUST generate exactly ONE decision_card for EACH symbol — no more, no less. If the prompt says generate decision_card for X, Y, Z symbols, output exactly 3 cards. Do not skip any symbol. Do not add extra symbols. Output valid JSON only. No markdown, no explanation.'
+        : 'You are a helpful AI assistant for trading analysis.'
+    },
     { role: 'user', content: jsonMode ? `${prompt}\n\nRespond with valid JSON only. No markdown, no explanation.` : prompt }
   ];
 
+  // DeepSeek v4 requires extra_body parameter to disable thinking mode
+  const isDeepSeek = NVIDIA_NIM_MODEL.includes('deepseek');
+  const requestBody: any = {
+    model: NVIDIA_NIM_MODEL,
+    messages,
+    max_tokens: isDeepSeek ? 16384 : 32000, // DeepSeek cap: 16384
+    temperature: 0.1,
+    top_p: isDeepSeek ? 0.95 : 0.7, // DeepSeek recommended: 0.95
+    stream: false,
+  };
+
+  if (isDeepSeek) {
+    requestBody.extra_body = { chat_template_kwargs: { thinking: false } };
+  }
+
   const response = await axios.post(
     `${NVIDIA_NIM_BASE_URL}/chat/completions`,
-    {
-      model: NVIDIA_NIM_MODEL,
-      messages,
-      max_tokens: 16000,
-      temperature: 0.2,
-      top_p: 0.7,
-      stream: false,
-    },
+    requestBody,
     {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
-      timeout: 300000,
+      timeout: 600000,
     }
   );
 
@@ -1266,7 +1294,7 @@ async function monitorMarkets(force = false) {
     // [NIM-CHUNK] NVIDIA NIM chunked strategy — split symbols into batches of NIM_CHUNK_SIZE
     // to stay within free-tier output token limits (8192 per request).
     // 45 pairs → 4 requests of ~12 pairs each — well within 40 req/min limit.
-    const NIM_CHUNK_SIZE = parseInt(process.env.NIM_CHUNK_SIZE || '12');
+    const NIM_CHUNK_SIZE = parseInt(process.env.NIM_CHUNK_SIZE || '12'); // Stable config untuk llama-4-maverick
     const useNimChunked = LLM_PRIMARY === 'nvidia';
 
     let analysisJson: string;
@@ -1309,6 +1337,8 @@ async function monitorMarkets(force = false) {
         const chunkOpenSymbols = isScannerChunk ? [] : openPositionSymbols.filter(s => chunk.includes(s));
 
         console.log(`[NIM-CHUNK] Chunk ${ci + 1} type: ${isScannerChunk ? 'SCANNER' : 'DC-POSITIONS'}`);
+console.log(`[NIM-CHUNK] Chunk ${ci + 1} symbols: ${chunkOpenSymbols.join(', ')}`);
+console.log(`[NIM-CHUNK] Chunk ${ci + 1} accountPositions count: ${chunkPayload.accountPositions.length}`);
 
         const chunkPrompt = buildMonitoringPrompt({
           inputPayload: chunkPayload,
@@ -1911,6 +1941,13 @@ async function runPaperTradingEngine() {
     return;
   }
   isPaperEngineRunning = true;
+
+  // [KILL-SWITCH] Guard Point 1 — paper engine loop
+  if (cachedKillSwitch.enabled) {
+    console.log('[KILL-SWITCH] Paper engine skipped — kill switch active.');
+    isPaperEngineRunning = false;
+    return;
+  }
 
   // [Phase 2.4] Max drawdown check — stop engine before cycle runs
   if (checkMaxDrawdown(cachedPaperWallet)) {
@@ -4441,6 +4478,15 @@ app.post('/api/bot/toggle', async (req, res) => {
 });
 
 app.post('/api/bot/force-run', (req, res) => {
+  // [KILL-SWITCH] Guard Point 2 — AI Force Run
+  if (cachedKillSwitch.enabled) {
+    return res.status(503).json({
+      error: 'KILL_SWITCH_ACTIVE',
+      message: `Kill switch aktif: ${cachedKillSwitch.reason}`,
+      enabledAt: cachedKillSwitch.enabledAt,
+    });
+  }
+
   // Check if request comes from UI (has origin or referer)
   // Cron jobs typically don't send these headers
   const isUiRequest = !!(req.headers.origin || req.headers.referer);
@@ -4449,6 +4495,59 @@ app.post('/api/bot/force-run', (req, res) => {
   // Run in background to prevent browser timeout
   monitorMarkets(force).catch(err => console.error('Force run failed in background:', err));
   res.json({ success: true, message: `Bot run started in background (force: ${force})` });
+});
+
+// [KILL-SWITCH] GET /api/kill-switch — check status
+app.get('/api/kill-switch', (req, res) => {
+  res.json(cachedKillSwitch);
+});
+
+// [KILL-SWITCH] POST /api/kill-switch — enable/disable
+app.post('/api/kill-switch', async (req, res) => {
+  const { enabled, reason = '', enabledBy = 'manual' } = req.body as {
+    enabled: boolean;
+    reason?: string;
+    enabledBy?: string;
+  };
+
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'INVALID_KILL_SWITCH_PAYLOAD' });
+  }
+
+  const prev = cachedKillSwitch;
+
+  cachedKillSwitch = enabled
+    ? {
+        enabled: true,
+        reason: reason || 'Manual activation',
+        enabledAt: prev.enabled ? prev.enabledAt : new Date().toISOString(),
+        enabledBy,
+      }
+    : {
+        enabled: false,
+        reason: '',
+        enabledAt: null,
+        enabledBy: '',
+      };
+
+  syncKillSwitchToDisk(cachedKillSwitch);
+
+  // Telegram alert when activated
+  if (enabled && !prev.enabled) {
+    const safeReason = escapeHtml(String(cachedKillSwitch.reason));
+
+    const msg = `🚨 <b>KILL SWITCH ACTIVATED</b>\nReason: ${safeReason}\nTime: ${cachedKillSwitch.enabledAt}`;
+    await sendTelegramMessage(msg).catch(e => console.error('[KILL-SWITCH] Telegram alert failed:', e));
+    console.warn(`[KILL-SWITCH] ACTIVATED — reason: "${cachedKillSwitch.reason}"`);
+  }
+
+  if (!enabled && prev.enabled) {
+    const msg = `✅ <b>KILL SWITCH DEACTIVATED</b>\nTime: ${new Date().toISOString()}`;
+    await sendTelegramMessage(msg).catch(e => console.error('[KILL-SWITCH] Telegram alert failed:', e));
+    console.log('[KILL-SWITCH] Deactivated.');
+  }
+
+  res.json({ success: true, state: cachedKillSwitch });
 });
 
 app.get('/api/signals', async (_req, res) => {
@@ -5503,6 +5602,12 @@ async function startServer() {
       };
 
       const placeOrderWithClient = async (useHedgeMode: boolean, clientOrderId?: string) => {
+  // [KILL-SWITCH] Guard Point 3 � live order execution
+  if (cachedKillSwitch.enabled) {
+    console.error(`[KILL-SWITCH] ORDER BLOCKED — ${fullSymbol} ${side}. Reason: ${cachedKillSwitch.reason}`);
+    throw new Error(`KILL_SWITCH_ACTIVE: ${cachedKillSwitch.reason}`);
+  }
+
         const orderType = determineOrderType();
         const params = buildParams(useHedgeMode, orderType);
         if (clientOrderId) params.clientOrderId = clientOrderId;
@@ -6579,3 +6684,4 @@ const isMain = process.argv[1] && (
 if (isMain) {
   startServer();
 }
+
