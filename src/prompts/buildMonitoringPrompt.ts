@@ -474,9 +474,10 @@ Contoh:
          •	Reduce hanya pada leg hijau.
          •	Unlock hanya jika hedge leg profit.
          •	Jika ada rule lain yang bertentangan dengan Golden Rule, maka Golden Rule HARUS menang.
-      2. MR HARD GUARD
-         •	Jika MRProjected > 25%, maka ekspansi DILARANG.
-         •	Dalam kondisi ini, hanya boleh aksi defensif seperti HOLD, LOCK_NEUTRAL, TAKE_PROFIT defensif, atau REDUCE pada leg hijau bila valid.
+      2. MR WARNING (INFORMATIONAL)
+         •	Jika MRProjected > 25%, berikan signal terbaik sesuai analisis teknikal dan struktur posisi — JANGAN blokir atau kosongkan signal.
+         •	Tambahkan catatan peringatan MR di field reason/notes jika relevan, agar user mengetahui kondisi margin saat mempertimbangkan eksekusi.
+         •	Keputusan eksekusi ada di tangan user — tugas AI adalah menghasilkan analisis dan signal yang akurat.
       3.	NO EXPANSION IF AMBIGUOUS
          •	Jika trend utama, status trend, projected MR, hedge leg, atau struktur posisi tidak jelas, maka AI DILARANG melakukan ekspansi.
          •	Default jatuh ke HOLD / WAIT & SEE / LOCK_NEUTRAL / TAKE_PROFIT defensif.
@@ -558,10 +559,10 @@ Contoh:
       - MRGlobal 15–25% → zona waspada:
           • fokus pengurangan risiko, 
           • more reduce, less add.
-      - MRGlobal ≥ 25% → keadaan darurat:
-          • DILARANG ekspansi,
-          • hanya boleh: reduce, lock, take profit,
-          • tujuan utama: turunkan MR secepat mungkin.
+      - MRGlobal ≥ 25% → zona risiko tinggi (INFORMATIONAL):
+          • Berikan signal terbaik berdasarkan analisis teknikal — JANGAN kosongkan atau blokir signal.
+          • Tambahkan catatan di reason bahwa MR tinggi dan user perlu pertimbangkan risiko sebelum eksekusi.
+          • Prioritaskan signal yang menurunkan exposure jika kondisi teknikal mendukung, namun tetap hasilkan signal sesuai analisis.
           
       ============================================================
       SECTION 3B – LOCK_EXIT_URGENCY (MARGIN-AWARE OVERRIDE) (WAJIB)
@@ -583,11 +584,8 @@ Contoh:
      MRNow merepresentasikan beban margin berjalan terhadap equity akun,
      dan WAJIB diperiksa sebelum mempertimbangkan ADD, ekspansi recovery, atau perubahan struktur
       Setiap kali menggambar skenario:
-      - Jika MRProjected dari suatu aksi > 25% → JANGAN sarankan aksi ekspansi.
-      - Utamakan aksi yang:
-          • Menurunkan MR,
-          • Menyederhanakan struktur posisi,
-          • Mengurangi net exposure.
+      - Jika MRProjected dari suatu aksi > 25% → tetap hasilkan signal terbaik sesuai analisis; tambahkan peringatan MR di reason.
+      - User bertanggung jawab atas keputusan eksekusi — AI tidak membatasi signal berdasarkan MR.
 
       ============================================================
       SECTION 4 – WORKFLOW A: TRADE BARU (FRESH SIGNAL)
@@ -1220,7 +1218,7 @@ Contoh:
       SCOPE:
       - Sinyal yang difilter untuk dianalisa (new_signals) HARUS berasal dari 20 pair dengan volume harian (daily volume) terbesar di Binance Futures ('scannerUniverse').
       - Ambil HANYA SATU atau beberapa sinyal TERBAIK dari 20 pair tersebut.
-      - Sinyal HANYA BOLEH diberikan/dihasilkan JIKA Margin Ratio (MR) saat ini DI BAWAH 99%. Jika MR >= 99%, kosongkan array new_signals.
+      - Hasilkan signal terbaik berdasarkan analisis teknikal tanpa memandang kondisi MR saat ini. Jika MR tinggi, tambahkan catatan di field risk_warning — JANGAN kosongkan array new_signals berdasarkan MR.
       - SENTIMEN PASAR: Gunakan alat pencarian (Google Search) untuk mencari berita terbaru tentang koin yang akan direkomendasikan. Berikan skor sentimen 1-10, status (BULLISH/BEARISH/NEUTRAL), dan alasan singkat di field 'sentiment'.
 
       STRICT OUTPUT:

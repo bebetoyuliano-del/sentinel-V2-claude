@@ -643,6 +643,8 @@ function getAI() {
 let signals: any[] = [];
 let lastRawNewSignals: any = null;
 let lastRawNewSignalsTimestamp: string | null = null;
+let lastForceRunParityInput: any = null;
+let lastForceRunParityInputTimestamp: string | null = null;
 let isBotRunning = false;
 let monitorInterval: NodeJS.Timeout | null = null;
 
@@ -928,9 +930,11 @@ function calculateHedgingRecovery(positions: any[]) {
   return recoveryData;
 }
 
-// LLM selector — baca dari env, default claude
-// Ganti LLM_PRIMARY di .env: 'claude' | 'gemini' | 'nvidia'
-const LLM_PRIMARY = (process.env.LLM_PRIMARY || 'claude').toLowerCase();
+// LLM selector — baca dari env
+// LLM_PRIMARY=nvidia → primary=NIM, fallback=Gemini (default — Claude excluded)
+// LLM_PRIMARY=gemini → primary=Gemini, fallback=NIM
+// LLM_PRIMARY=claude → primary=Claude, fallback=Gemini
+const LLM_PRIMARY = (process.env.LLM_PRIMARY || 'nvidia').toLowerCase();
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
 const GEMINI_MONITOR_MODEL = process.env.GEMINI_MONITOR_MODEL || 'gemini-2.5-flash-preview-05-20';
 const NVIDIA_NIM_MODEL = process.env.NVIDIA_NIM_MODEL || 'nvidia/llama-3.1-nemotron-70b-instruct';
@@ -938,6 +942,72 @@ const NVIDIA_NIM_BASE_URL = 'https://integrate.api.nvidia.com/v1';
 // Timeout untuk nemotron-3 yang lebih lambat (default 300s → 600s per chunk)
 // chunkSize dikurangi untuk payload besar dengan 16+ accountPositions
 console.log(`[LLM] Primary provider: ${LLM_PRIMARY} | Gemini model: ${GEMINI_MONITOR_MODEL} | NIM model: ${NVIDIA_NIM_MODEL}`);
+
+// ── LLM Circuit Breaker (Phase 2.5) ───────────────────────────────────────────
+interface CircuitBreakerState {
+  failureCount: number;
+  lastFailureTs: number;
+  isOpen: boolean;
+  cooldownUntil: number;
+}
+
+const circuitBreakers: Map<string, CircuitBreakerState> = new Map();
+
+const CIRCUIT_CONFIG = {
+  FAILURE_THRESHOLD: 3,
+  COOLDOWN_MS: 5 * 60 * 1000,
+};
+
+function getCircuitState(provider: string): CircuitBreakerState {
+  if (!circuitBreakers.has(provider)) {
+    circuitBreakers.set(provider, { failureCount: 0, lastFailureTs: 0, isOpen: false, cooldownUntil: 0 });
+  }
+  return circuitBreakers.get(provider)!;
+}
+
+function recordCircuitSuccess(provider: string): void {
+  const state = getCircuitState(provider);
+  state.failureCount = 0;
+  state.isOpen = false;
+  state.cooldownUntil = 0;
+}
+
+function recordCircuitFailure(provider: string): void {
+  const state = getCircuitState(provider);
+  state.failureCount++;
+  state.lastFailureTs = Date.now();
+  if (state.failureCount >= CIRCUIT_CONFIG.FAILURE_THRESHOLD) {
+    state.isOpen = true;
+    state.cooldownUntil = Date.now() + CIRCUIT_CONFIG.COOLDOWN_MS;
+    console.warn(`[CIRCUIT-BREAKER] ${provider} CIRCUIT OPEN — ${CIRCUIT_CONFIG.COOLDOWN_MS / 1000}s cooldown`);
+  }
+}
+
+function isCircuitOpen(provider: string): boolean {
+  const state = getCircuitState(provider);
+  if (!state.isOpen) return false;
+  if (Date.now() >= state.cooldownUntil) {
+    state.isOpen = false;
+    return false;
+  }
+  return true;
+}
+
+function resetCircuitBreaker(provider: string): void {
+  circuitBreakers.set(provider, { failureCount: 0, lastFailureTs: 0, isOpen: false, cooldownUntil: 0 });
+  console.log(`[CIRCUIT-BREAKER] ${provider} circuit RESET`);
+}
+
+// Timeout helper — Promise.race untuk prevent hung calls
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`[TIMEOUT] ${label} timed out after ${ms}ms`)), ms)
+    )
+  ]);
+}
+// ──────────────────────────────────────────────────────────────────────────────
 
 async function generateWithClaude(prompt: string, jsonMode: boolean = false, base64Image: string | null = null): Promise<string> {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -1036,18 +1106,39 @@ async function generateWithRetry(prompt: string, _modelName: string = 'claude-so
 
   type ProviderName = 'claude' | 'gemini' | 'nvidia';
   const primary: ProviderName = (LLM_PRIMARY === 'gemini' ? 'gemini' : LLM_PRIMARY === 'nvidia' ? 'nvidia' : 'claude');
-  const fallbackOrder: ProviderName[] = (['claude', 'gemini', 'nvidia'] as ProviderName[]).filter(p => p !== primary);
+
+  // Fallback chain — Claude hanya dipakai jika user set LLM_PRIMARY=claude
+  // nvidia → gemini | gemini → nvidia | claude → gemini
+  const fallbackOrder: ProviderName[] = primary === 'nvidia' ? ['gemini']
+    : primary === 'gemini' ? ['nvidia']
+    : ['gemini'];
 
   async function callProvider(provider: ProviderName): Promise<string> {
-    if (provider === 'claude') {
-      console.log(`[LLM] Claude ${CLAUDE_MODEL}`);
-      return generateWithClaude(prompt, jsonMode, base64Image);
-    } else if (provider === 'gemini') {
-      console.log(`[LLM] Gemini ${GEMINI_MONITOR_MODEL}`);
-      return generateWithGemini(prompt, jsonMode, base64Image);
-    } else {
-      console.log(`[LLM] NVIDIA NIM ${NVIDIA_NIM_MODEL}`);
-      return generateWithNvidiaNim(prompt, jsonMode);
+    // Circuit breaker – skip if provider is in open state
+    if (isCircuitOpen(provider)) {
+      console.warn(`[CIRCUIT-BREAKER] ${provider} circuit is OPEN – skipping call`);
+      throw new Error(`[CIRCUIT-BREAKER] ${provider} circuit is open`);
+    }
+    try {
+      let result: string;
+      if (provider === 'claude') {
+        console.log(`[LLM] Claude ${CLAUDE_MODEL}`);
+        // 2‑minute timeout for Claude
+        result = await withTimeout(generateWithClaude(prompt, jsonMode, base64Image), 120000, 'Claude');
+      } else if (provider === 'gemini') {
+        console.log(`[LLM] Gemini ${GEMINI_MONITOR_MODEL}`);
+        // 2‑minute timeout for Gemini
+        result = await withTimeout(generateWithGemini(prompt, jsonMode, base64Image), 120000, 'Gemini');
+      } else {
+        console.log(`[LLM] NVIDIA NIM ${NVIDIA_NIM_MODEL}`);
+        // 10‑minute timeout already configured in axios, but wrap for safety
+        result = await withTimeout(generateWithNvidiaNim(prompt, jsonMode), 600000, 'NIM');
+      }
+      recordCircuitSuccess(provider);
+      return result;
+    } catch (err) {
+      recordCircuitFailure(provider);
+      throw err;
     }
   }
 
@@ -1086,7 +1177,7 @@ async function generateWithRetry(prompt: string, _modelName: string = 'claude-so
 
   aiRunHistory.push({ timestamp: new Date().toISOString(), trigger: 'force-run', success: false, provider: 'failed', durationMs: Date.now() - t0 });
   syncAiRunHistoryToDisk(aiRunHistory);
-  throw new Error('[LLM] All providers failed (Claude + Gemini + NVIDIA NIM). Check API keys and quota.');
+  throw new Error(`[LLM] All providers failed (${primary} + fallback: ${fallbackOrder.join(', ')}). Check API keys and quota.`);
 }
 
 // --- EXCEL ROWS BUILDER (A-D) ---
@@ -1316,7 +1407,32 @@ async function monitorMarkets(force = false) {
       console.log(`[NIM-CHUNK] Positions: ${openPositionSymbols.length} symbols → ${posChunks.length} DC chunks | Scanner: ${scannerOnlySymbols.length} symbols → 1 scanner chunk`);
 
       const mergedCards: any[] = [];
+      const mergedScannerSignals: any[] = [];
       let mergedMarketSummary = '';
+      const toArray = (value: any): any[] => {
+        if (Array.isArray(value)) return value;
+        if (value) return [value];
+        return [];
+      };
+      const extractScannerSignalsFromParsed = (parsed: any): any[] => {
+        const ns = parsed?.new_signals;
+        const sources = {
+          ns_array:        toArray(Array.isArray(ns) ? ns : null),
+          ns_signals:      toArray(ns?.signals),
+          ns_scanner_cards: toArray(ns?.scanner_cards),
+          scanner_cards:   toArray(parsed?.scanner_cards),
+          scanner_signals: toArray(parsed?.scanner_signals),
+          signals:         toArray(parsed?.signals),
+          decision_cards:  toArray(parsed?.decision_cards),
+        };
+        const nonEmpty = Object.entries(sources).filter(([, v]) => v.length > 0).map(([k, v]) => `${k}:${v.length}`);
+        if (nonEmpty.length > 0) {
+          console.log(`[NIM-SCANNER-DEBUG] extractScannerSignals found: ${nonEmpty.join(', ')}`);
+        } else {
+          console.log(`[NIM-SCANNER-DEBUG] extractScannerSignals: all fields empty. parsed keys=${Object.keys(parsed ?? {}).join(',')}`);
+        }
+        return Object.values(sources).flat().filter(Boolean);
+      };
 
       for (let ci = 0; ci < chunks.length; ci++) {
         const chunk = chunks[ci];
@@ -1335,10 +1451,11 @@ async function monitorMarkets(force = false) {
           openOrders: inputPayload.openOrders.filter((o: any) => chunk.includes(o.symbol)),
         };
         const chunkOpenSymbols = isScannerChunk ? [] : openPositionSymbols.filter(s => chunk.includes(s));
+        const chunkDisplaySymbols = isScannerChunk ? chunk : chunkOpenSymbols;
 
         console.log(`[NIM-CHUNK] Chunk ${ci + 1} type: ${isScannerChunk ? 'SCANNER' : 'DC-POSITIONS'}`);
-console.log(`[NIM-CHUNK] Chunk ${ci + 1} symbols: ${chunkOpenSymbols.join(', ')}`);
-console.log(`[NIM-CHUNK] Chunk ${ci + 1} accountPositions count: ${chunkPayload.accountPositions.length}`);
+        console.log(`[NIM-CHUNK] Chunk ${ci + 1} symbols: ${chunkDisplaySymbols.join(', ')}`);
+        console.log(`[NIM-CHUNK] Chunk ${ci + 1} accountPositions count: ${chunkPayload.accountPositions.length}`);
 
         const chunkPrompt = buildMonitoringPrompt({
           inputPayload: chunkPayload,
@@ -1350,6 +1467,9 @@ console.log(`[NIM-CHUNK] Chunk ${ci + 1} accountPositions count: ${chunkPayload.
         try {
           const chunkResponse = await generateWithNvidiaNim(chunkPrompt, true);
           console.log(`[NIM-CHUNK] Chunk ${ci + 1} response OK (length=${chunkResponse?.length || 0})`);
+          if (isScannerChunk) {
+            console.log(`[NIM-SCANNER-DEBUG] response snippet: ${chunkResponse.slice(0, 1000)}`);
+          }
           // Extract decision_cards from chunk response
           const firstBrace = chunkResponse.indexOf('{');
           const lastBrace  = chunkResponse.lastIndexOf('}');
@@ -1370,14 +1490,53 @@ console.log(`[NIM-CHUNK] Chunk ${ci + 1} accountPositions count: ${chunkPayload.
               }
             }
             if (parsed) {
-              const cards = parsed.decision_cards || [];
-              console.log(`[NIM-CHUNK] Chunk ${ci + 1} extracted ${cards.length} cards`);
-              mergedCards.push(...cards);
+              const cards = Array.isArray(parsed.decision_cards) ? parsed.decision_cards : [];
+              if (isScannerChunk) {
+                const scannerSignals = extractScannerSignalsFromParsed(parsed);
+                console.log(`[NIM-CHUNK] Chunk ${ci + 1} extracted ${cards.length} cards`);
+                console.log(`[NIM-CHUNK] Chunk ${ci + 1} extracted ${scannerSignals.length} scanner signals`);
+                if (scannerSignals.length > 0) {
+                  mergedScannerSignals.push(...scannerSignals);
+                }
+              } else {
+                console.log(`[NIM-CHUNK] Chunk ${ci + 1} extracted ${cards.length} cards`);
+                mergedCards.push(...cards);
+              }
               if (!mergedMarketSummary && parsed.market_summary) mergedMarketSummary = parsed.market_summary;
             }
           }
         } catch (chunkErr: any) {
           console.error(`[NIM-CHUNK] Chunk ${ci + 1} failed:`, chunkErr.message || chunkErr);
+          // [NIM-FALLBACK] Chunk gagal 504 → fallback ke Claude agar symbols tidak hilang
+          try {
+            console.log(`[NIM-FALLBACK] Chunk ${ci + 1} → fallback to Gemini`);
+            const fallbackResponse = await generateWithGemini(chunkPrompt, true, null);
+            console.log(`[NIM-FALLBACK] Chunk ${ci + 1} Gemini OK (length=${fallbackResponse?.length || 0})`);
+            const fb = fallbackResponse.indexOf('{');
+            const lb = fallbackResponse.lastIndexOf('}');
+            if (fb !== -1 && lb > fb) {
+              const cleaned = fallbackResponse.substring(fb, lb + 1).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ');
+              let parsed: any = null;
+              try { parsed = JSON.parse(cleaned); } catch { /* ignore */ }
+              if (parsed) {
+                const cards = Array.isArray(parsed.decision_cards) ? parsed.decision_cards : [];
+                if (isScannerChunk) {
+                  const scannerSignals = extractScannerSignalsFromParsed(parsed);
+                  console.log(`[NIM-FALLBACK] Chunk ${ci + 1} extracted ${cards.length} cards via fallback`);
+                  console.log(`[NIM-FALLBACK] Chunk ${ci + 1} extracted ${scannerSignals.length} scanner signals via fallback`);
+                  if (scannerSignals.length > 0) {
+                    mergedScannerSignals.push(...scannerSignals);
+                  }
+                } else {
+                  console.log(`[NIM-FALLBACK] Chunk ${ci + 1} extracted ${cards.length} cards via fallback`);
+                  mergedCards.push(...cards);
+                }
+                if (!mergedMarketSummary && parsed.market_summary) mergedMarketSummary = parsed.market_summary;
+              }
+            }
+          } catch (fallbackErr: any) {
+            console.error(`[NIM-FALLBACK] Chunk ${ci + 1} Claude fallback also failed:`, fallbackErr.message || fallbackErr);
+          }
         }
 
         // 200ms delay between chunks to avoid rate limit
@@ -1385,7 +1544,20 @@ console.log(`[NIM-CHUNK] Chunk ${ci + 1} accountPositions count: ${chunkPayload.
       }
 
       console.log(`[NIM-CHUNK] Merged total: ${mergedCards.length} cards from ${chunks.length} chunks`);
-      analysisJson = JSON.stringify({ decision_cards: mergedCards, market_summary: mergedMarketSummary });
+      console.log(`[NIM-CHUNK] Merged scanner signals: ${mergedScannerSignals.length}`);
+      analysisJson = JSON.stringify({
+        decision_cards: mergedCards,
+        market_summary: mergedMarketSummary,
+        ...(mergedScannerSignals.length > 0
+          ? {
+              new_signals: {
+                signals: mergedScannerSignals,
+                scanner_cards: mergedScannerSignals,
+                source: 'NIM_SCANNER_CHUNK',
+              },
+            }
+          : {}),
+      });
 
     } else {
       const finalPrompt = buildMonitoringPrompt({
@@ -1456,6 +1628,10 @@ console.log(`[NIM-CHUNK] Chunk ${ci + 1} accountPositions count: ${chunkPayload.
     
     let cards = analysisData.decision_cards || [];
     console.log(`[DC-DEBUG] Cards extracted: length=${cards.length}`);
+    const decisionCardsBeforeNimFilter = Array.isArray(analysisData.decision_cards)
+      ? [...analysisData.decision_cards]
+      : [];
+    let scannerCardsForDebug: any[] = [];
 
     // [NIM-FILTER] Filter: hanya kirim DC cards yang punya live position di Binance.
     // Cards dari scanner chunk (NO_POSITION) disimpan terpisah sebagai scanner signals.
@@ -1472,6 +1648,7 @@ console.log(`[NIM-CHUNK] Chunk ${ci + 1} accountPositions count: ${chunkPayload.
         return false;
       });
       console.log(`[NIM-FILTER] DC cards: ${cards.length}/${beforeFilter} (live positions only) | Scanner cards: ${scannerCards.length}`);
+      scannerCardsForDebug = scannerCards;
       // Store scanner cards for new_signals injection
       if (scannerCards.length > 0 && !analysisData.new_signals) {
         analysisData.new_signals = { scanner_cards: scannerCards };
@@ -1483,6 +1660,23 @@ console.log(`[NIM-CHUNK] Chunk ${ci + 1} accountPositions count: ${chunkPayload.
     }
     lastRawNewSignals = analysisData.new_signals || null;
     lastRawNewSignalsTimestamp = new Date().toISOString();
+    lastForceRunParityInput = {
+      source: 'force_run_analysisData',
+      capturedAfterNimLivePositionFilter: true,
+      capturedBeforeDcTrace: true,
+      decisionCardsBeforeNimFilterCount: decisionCardsBeforeNimFilter.length,
+      decisionCardsBeforeNimFilter,
+      decisionCardsAfterNimFilterCount: Array.isArray(cards) ? cards.length : 0,
+      decisionCardsAfterNimFilter: cards,
+      newSignals: analysisData.new_signals || null,
+      scannerCardsCount: scannerCardsForDebug.length,
+      scannerCards: scannerCardsForDebug,
+      positionsCount: Array.isArray(positions) ? positions.length : 0,
+      livePositionSymbols: Array.isArray(positions)
+        ? Array.from(new Set(positions.map((p: any) => p.symbol)))
+        : [],
+    };
+    lastForceRunParityInputTimestamp = new Date().toISOString();
 
     // Deduplicate cards by symbol to prevent spam
     const uniqueCards = [];
@@ -1571,8 +1765,13 @@ console.log(`[NIM-CHUNK] Chunk ${ci + 1} accountPositions count: ${chunkPayload.
             mrProjected: (accountRisk?.marginRatio ?? 0) * 1.05,
           });
 
+          const parityReasoning =
+            parityResult.why_blocked ||
+            parityResult.why_allowed ||
+            `${parityResult.final_action} — Konteks: ${inputState.position.ContextMode}, struktur: ${inputState.position.Structure}, trend: ${inputState.market.TrendStatus} (4H: ${inputState.market.PrimaryTrend4H}).`;
           handlePaperDecisionOutput(symbol, {
             recommendedAction: parityResult.final_action,
+            reasoning:         parityReasoning,
             whyBlocked:        parityResult.why_blocked  ?? null,
             whyAllowed:        parityResult.why_allowed  ?? null,
             structure:         inputState.position.Structure,
@@ -1616,6 +1815,36 @@ console.log(`[NIM-CHUNK] Chunk ${ci + 1} accountPositions count: ${chunkPayload.
           // Derive percentage from action
           const percentage = parityAction.includes('0.5') ? 0.5 : 1.0;
           card.action_now.percentage = percentage;
+
+          // [DC-2-REASON] Sync reason ke parity decision agar tidak kontradiksi
+          if (geminiAction !== parityAction) {
+            const parityReason =
+              parityDecision.whyBlocked ||
+              parityDecision.whyAllowed ||
+              parityDecision.reasoning ||
+              `Parity override: ${parityAction} selected by evaluateParityPaper for ${parityDecision.contextMode ?? 'UNKNOWN'} context, structure=${parityDecision.structure ?? 'UNKNOWN'}, trend=${parityDecision.trendStatus ?? 'UNKNOWN'}.`;
+            const parityReasonText = String(parityReason);
+            card.action_now.reason = parityReasonText;
+            card.action_now.reasoning = parityReasonText;
+            console.log(`[DC-2-REASON] ${symbol} | synced reason from parity | reason=${parityReasonText.slice(0, 160)}`);
+
+            // [DC-2-SUMMARY] Sync summary/info line agar tidak kontradiksi dengan final action
+            const _ctx  = parityDecision.contextMode  ?? '';
+            const _str  = parityDecision.structure    ?? '';
+            const _trnd = parityDecision.trendStatus  ?? '';
+            const _ctx_str = [_ctx, _str, _trnd].filter(Boolean).join(', ');
+            const paritySummaryText =
+              parityAction === 'HOLD'
+                ? `Override parity: HOLD${_ctx_str ? ` — ${_ctx_str}` : ''}. Pertahankan struktur saat ini.`
+                : `Override parity: ${parityAction}${_ctx_str ? ` — ${_ctx_str}` : ''}. Ikuti aksi final parity engine.`;
+            card.parity_summary = paritySummaryText;
+            if (typeof card.summary === 'string') card.summary = paritySummaryText;
+            if (typeof card.note === 'string') card.note = paritySummaryText;
+            if (card.action_now) {
+              card.action_now.summary = paritySummaryText;
+              card.action_now.note = paritySummaryText;
+            }
+          }
 
           console.log(`[DC-2-OVERRIDE] ${symbol} | action: ${geminiAction} → ${parityAction}`);
         }
@@ -1821,7 +2050,7 @@ function handlePaperDecisionOutput(
       riskOverride: rawResult.riskOverride as string | undefined,
       contextMode: rawResult.contextMode as string | undefined,
       recommendedAction: rawResult.recommendedAction as string | undefined,
-      reasoning: rawResult.reasoning as string | undefined,
+      reasoning: String(rawResult.reasoning ?? rawResult.whyBlocked ?? rawResult.whyAllowed ?? '') || undefined,
       whyAllowed: rawResult.whyAllowed as string | null | undefined,
       whyBlocked: rawResult.whyBlocked as string | null | undefined,
       bepGrossPrice: rawResult.bepGrossPrice as number | null | undefined,
@@ -2571,8 +2800,13 @@ async function runPaperTradingEngine() {
             mrProjected: wallet.marginRatio * 1.05,
           });
           currentParityResult = parityResult;
+          const parityReasoning =
+            parityResult.why_blocked ||
+            parityResult.why_allowed ||
+            `${parityResult.final_action} — Konteks: ${inputState.position.ContextMode}, struktur: ${inputState.position.Structure}, trend: ${inputState.market.TrendStatus} (4H: ${inputState.market.PrimaryTrend4H}).`;
           handlePaperDecisionOutput(symbol, {
             recommendedAction: parityResult.final_action,
+            reasoning:         parityReasoning,
             whyBlocked:        parityResult.why_blocked ?? null,
             whyAllowed:        parityResult.why_allowed ?? null,
             structure:         inputState.position.Structure,
@@ -4589,6 +4823,17 @@ app.get('/api/debug/last-decision-outputs', (_req, res) => {
     symbols: Array.from(lastDecisionOutputs.keys()),
     decisions: entries,
     note: 'lastDecisionOutputs Map — populated by handlePaperDecisionOutput after evaluateParityPaper. For DC-1/DC-2 parity verification.',
+  });
+});
+
+app.get('/api/debug/last-force-run-parity-input', (_req, res) => {
+  const decisionCards =
+    lastForceRunParityInput?.decisionCardsAfterNimFilter ?? null;
+  res.json({
+    data: lastForceRunParityInput,
+    count: Array.isArray(decisionCards) ? decisionCards.length : 0,
+    capturedAt: lastForceRunParityInputTimestamp,
+    note: 'Captured from Force Run analysisData after NIM live-position filter and before DC-TRACE/parity verification. Use for Force Run parity/PRE-HF-3E-adjacent validation.',
   });
 });
 
@@ -6685,3 +6930,25 @@ if (isMain) {
   startServer();
 }
 
+
+
+// LLM Circuit Breaker status endpoint
+app.get('/api/circuit-status', (_req, res) => {
+  const status: Record<string, unknown> = {};
+  const now = Date.now();
+  for (const [provider, state] of circuitBreakers) {
+    const lastFailureAgo = state.lastFailureTs
+      ? `${Math.round((now - state.lastFailureTs) / 1000)}s`
+      : null;
+    const cooldownRemaining = state.isOpen && state.cooldownUntil
+      ? `${Math.max(0, Math.round((state.cooldownUntil - now) / 1000))}s`
+      : null;
+    status[provider] = {
+      isOpen: state.isOpen,
+      failureCount: state.failureCount,
+      lastFailureAgo,
+      cooldownRemaining,
+    };
+  }
+  res.json(status);
+});

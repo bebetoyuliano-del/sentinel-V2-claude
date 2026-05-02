@@ -161,3 +161,42 @@ export function syncAiRunHistoryToDisk(history: any[]): void {
     console.error('[LOCAL-STORE] ai_run_history write error:', e.message);
   }
 }
+
+// ─── GLOBAL KILL-SWITCH ────────────────────────────────────────────────────
+// File: data/kill_switch.json
+// Survive server restart. Atomic write pattern sama seperti file lain.
+
+export interface KillSwitchState {
+  enabled: boolean;
+  reason: string;
+  enabledAt: string | null; // ISO timestamp atau null
+  enabledBy: string; // 'manual' | 'auto_drawdown' | dll
+}
+
+const KILL_SWITCH_FILE = path.join(DATA_DIR, 'kill_switch.json');
+
+const KILL_SWITCH_DEFAULT: KillSwitchState = {
+  enabled: false,
+  reason: '',
+  enabledAt: null,
+  enabledBy: '',
+};
+
+export function loadKillSwitch(): KillSwitchState {
+  try {
+    if (!fs.existsSync(KILL_SWITCH_FILE)) return { ...KILL_SWITCH_DEFAULT };
+    const raw = fs.readFileSync(KILL_SWITCH_FILE, 'utf-8');
+    return { ...KILL_SWITCH_DEFAULT, ...JSON.parse(raw) };
+  } catch {
+    console.warn('[KILL-SWITCH] Failed to load, defaulting to disabled.');
+    return { ...KILL_SWITCH_DEFAULT };
+  }
+}
+
+export function syncKillSwitchToDisk(state: KillSwitchState): void {
+  try {
+    atomicWrite(KILL_SWITCH_FILE, state);
+  } catch (err) {
+    console.error('[KILL-SWITCH] Failed to sync to disk:', err);
+  }
+}
